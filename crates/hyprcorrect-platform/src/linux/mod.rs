@@ -7,3 +7,5 @@
 //! - Tray: `ksni`.
 //!
 //! Implemented from milestone M1. See `DESIGN.md`.
+
+pub mod capture;
