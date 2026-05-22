@@ -65,10 +65,10 @@ fn run_daemon() {
         }
     };
 
-    let trigger = std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| "Pause".to_string());
+    let letter = std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| "F".to_string());
     println!(
-        "hyprcorrect {} — capturing. Type a word, then press {trigger} to \
-         correct it; Ctrl+C to quit.",
+        "hyprcorrect {} — capturing. Type a word, then press \
+         Super+Ctrl+Shift+Alt+{letter} to correct it; Ctrl+C to quit.",
         hyprcorrect_core::version(),
     );
 
