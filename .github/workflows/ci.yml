@@ -52,9 +52,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The platform layer gains native dependencies (Wayland,
-      # libxkbcommon, …) at milestone M1 — add the apt-get / brew step
-      # back here then. The M0 scaffold builds with pure-Rust crates.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        # The xkbcommon crate links the system libxkbcommon.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: cargo test
