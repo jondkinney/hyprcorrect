@@ -83,7 +83,7 @@ hyprcorrect/
   crates/
     hyprcorrect-core/         # config, keystroke buffer, replacement
                               #   planning, CorrectionProvider trait +
-                              #   Harper / LLM / LanguageTool impls
+                              #   spellbook / LLM / LanguageTool impls
     hyprcorrect-platform/     # per-OS capture, synthetic input, hotkeys,
                               #   frontmost-app, tray
                               #   (src/linux/ src/macos/ src/windows/)
@@ -199,17 +199,17 @@ Shipped implementations:
 
 | Provider | Locality | Use | Notes |
 |---|---|---|---|
-| **Harper** | in-process, offline | bundled default | Pure-Rust spell/grammar checker; instant; English-focused. Great at obvious typos, not at context. |
+| **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
 | **LLM** (Claude/OpenAI) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. |
 | **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL. Off until a URL is set — for when you run your own server. No bundled Java. |
 
-**Routing:** "fix last word" → Harper (instant, local). "fix last
+**Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key
-is set, else Harper). Harper-first-then-LLM-on-demand is a config
-option. This Harper+LLM split is deliberate: Harper kills obvious typos
-with zero latency and zero network; the LLM handles genuinely ambiguous
-corrections that need context — the cases the Google-search prototype
-was really being used for.
+is set, else spellbook). Offline-first-then-LLM-on-demand is a config
+option. This offline+LLM split is deliberate: spellbook kills obvious
+typos with zero latency and zero network; the LLM handles genuinely
+ambiguous corrections that need context — the cases the Google-search
+prototype was really being used for.
 
 ## Interaction modes
 
@@ -247,7 +247,7 @@ fix-last-word = "..."          # portal / Carbon binding descriptor
 review        = "..."
 
 [providers]
-default = "harper"
+default = "spellbook"
 smart   = "llm"                # used by fix-last-sentence / review
 
 [providers.llm]
@@ -282,7 +282,7 @@ defensively:
   indicator showing capture state.
 - Typed text leaves the machine only when a network provider (LLM,
   remote LanguageTool) is the active backend, and only the snippet being
-  corrected. The Harper default keeps everything local. The GUI states
+  corrected. The spellbook default keeps everything local. The GUI states
   this plainly per provider.
 
 ## Licensing
@@ -297,7 +297,7 @@ Wayland protocols.
 | Milestone | Deliverable |
 |---|---|
 | **M0 — Scaffold** | `git init`; 4-crate workspace, edition 2024, shared deps, `rust-toolchain.toml`, dual license, CI + `release-plz` skeleton. Mirrors `vernier`. |
-| **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → buffer; Harper provider; virtual-keyboard emulation; one hardcoded portal hotkey; `fix-last-word` working end-to-end on Hyprland incl. a terminal. No GUI. Proves the riskiest path. |
+| **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → buffer; offline spell-check provider (spellbook); virtual-keyboard emulation; one hardcoded portal hotkey; `fix-last-word` working end-to-end on Hyprland incl. a terminal. No GUI. Proves the riskiest path. |
 | **M2 — macOS parity** | `CGEventTap` capture, `CGEvent` emulation, Carbon hotkey, TCC permission flow. `fix-last-word` on macOS. Core now runs on both. |
 | **M3 — Config GUI + tray** | egui prefs (hotkeys/providers/behavior/privacy), `config.toml`, `keyring`, `ksni`/`NSStatusItem` tray, pause control. Hotkeys user-configurable. |
 | **M4 — Review popup + sentence mode** | egui popup with keyboard nav; `fix-last-sentence`; multi-word review/apply; LLM provider wired in. |

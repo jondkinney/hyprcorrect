@@ -10,7 +10,7 @@ pub mod providers;
 pub mod replace;
 
 pub use buffer::{Buffer, Key, LastWord};
-pub use providers::{Context, Correction, CorrectionProvider};
+pub use providers::{Context, Correction, CorrectionProvider, OfflineProvider};
 pub use replace::{Edit, plan_word_replacement};
 
 /// hyprcorrect's version string, surfaced by the CLI and the About pane.
