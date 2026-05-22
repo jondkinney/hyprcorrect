@@ -1,0 +1,13 @@
+[package]
+name = "hyprcorrect-core"
+description = "Core logic for hyprcorrect: configuration, the keystroke buffer, and correction providers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+async-trait.workspace = true

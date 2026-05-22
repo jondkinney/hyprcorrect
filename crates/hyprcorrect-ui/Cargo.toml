@@ -1,0 +1,13 @@
+[package]
+name = "hyprcorrect-ui"
+description = "egui preferences window and suggestion popup for hyprcorrect."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# egui / eframe and a dependency on hyprcorrect-core are added in
+# milestone M3, when the preferences window is built.
+[dependencies]

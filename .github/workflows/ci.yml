@@ -1,0 +1,61 @@
+name: CI
+
+# Per-PR safety net: fmt + clippy + test on every OS we ship to.
+# Release-time builds will live in release.yml (added with packaging at
+# milestone M6); this is the pre-merge gate that keeps main green.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Format (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          # Run fmt on both OSes: rustfmt only sees the cfg-gated source
+          # for the platform it runs on, so a macOS-only block stays
+          # unchecked until fmt runs on macOS too.
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  check:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The platform layer gains native dependencies (Wayland,
+      # libxkbcommon, …) at milestone M1 — add the apt-get / brew step
+      # back here then. The M0 scaffold builds with pure-Rust crates.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --all-features

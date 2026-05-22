@@ -1,0 +1,13 @@
+[package]
+name = "hyprcorrect-platform"
+description = "Platform layer for hyprcorrect: input capture, synthetic input, and global hotkeys (macOS, Linux/Wayland)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Per-OS backends (evdev, wayland-client, xkbcommon, ashpd, objc2-*, …)
+# are added under [target.'cfg(...)'.dependencies] from milestone M1.
+[dependencies]

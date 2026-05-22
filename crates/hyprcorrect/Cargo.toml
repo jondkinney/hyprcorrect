@@ -1,0 +1,22 @@
+[package]
+name = "hyprcorrect"
+description = "Keyboard-driven desktop spelling and typo corrector for macOS and Linux/Wayland."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["spelling", "autocorrect", "wayland", "hyprland", "keyboard"]
+categories = ["command-line-utilities", "text-processing"]
+
+[[bin]]
+name = "hyprcorrect"
+path = "src/main.rs"
+
+[dependencies]
+hyprcorrect-core.workspace = true
+hyprcorrect-platform.workspace = true
+hyprcorrect-ui.workspace = true
+clap.workspace = true
+env_logger.workspace = true
