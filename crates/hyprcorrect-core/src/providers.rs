@@ -76,6 +76,23 @@ impl OfflineProvider {
         Ok(Self { dictionary })
     }
 
+    /// Build the provider from the bundled `en_US` dictionary.
+    ///
+    /// The dictionary is vendored from wooorm/dictionaries (the `en`
+    /// dictionary, derived from SCOWL) and embedded at compile time; its
+    /// license is at `dictionaries/en_US/LICENSE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Init`] if the bundled dictionary fails to parse,
+    /// which would indicate a packaging bug.
+    pub fn en_us() -> Result<Self, Error> {
+        Self::from_hunspell(
+            include_str!("../dictionaries/en_US/en_US.aff"),
+            include_str!("../dictionaries/en_US/en_US.dic"),
+        )
+    }
+
     /// Spell-check `text`, returning one [`Correction`] per misspelled
     /// word. This is the synchronous core behind the async trait method.
     pub fn check_text(&self, text: &str) -> Vec<Correction> {
@@ -166,5 +183,36 @@ mod tests {
         let corrections = provider().check_text("the quick fakeword");
         assert_eq!(corrections.len(), 1);
         assert_eq!(corrections[0].original, "fakeword");
+    }
+
+    /// The real bundled en_US dictionary, parsed once for the tests below.
+    static EN_US: std::sync::LazyLock<OfflineProvider> =
+        std::sync::LazyLock::new(|| OfflineProvider::en_us().expect("bundled en_US parses"));
+
+    #[test]
+    fn en_us_accepts_common_words() {
+        assert!(EN_US.check_text("the quick brown fox").is_empty());
+    }
+
+    #[test]
+    fn en_us_flags_a_misspelling_with_the_right_fix() {
+        let corrections = EN_US.check_text("teh");
+        assert_eq!(corrections.len(), 1);
+        assert!(
+            corrections[0].suggestions.iter().any(|s| s == "the"),
+            "expected 'the' among suggestions, got {:?}",
+            corrections[0].suggestions,
+        );
+    }
+
+    #[test]
+    fn en_us_suggests_for_the_motivating_typo() {
+        // The prototype's example — a real typo should yield suggestions.
+        let corrections = EN_US.check_text("vernuer");
+        assert_eq!(corrections.len(), 1);
+        assert!(
+            !corrections[0].suggestions.is_empty(),
+            "expected suggestions for 'vernuer'",
+        );
     }
 }

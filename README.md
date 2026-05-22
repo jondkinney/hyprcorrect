@@ -36,3 +36,8 @@ The toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml).
 
 Dual-licensed under either of [MIT](LICENSE-MIT) or
 [Apache-2.0](LICENSE-APACHE) at your option.
+
+The bundled `en_US` spelling dictionary is vendored from
+[wooorm/dictionaries](https://github.com/wooorm/dictionaries) (derived
+from SCOWL) under its own permissive license — see
+[`crates/hyprcorrect-core/dictionaries/en_US/LICENSE`](crates/hyprcorrect-core/dictionaries/en_US/LICENSE).
