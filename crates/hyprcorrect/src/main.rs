@@ -224,6 +224,7 @@ fn run_daemon() {
                 // letter under the chord. A full restart is only needed
                 // if other capture-time settings change later.
             }
+            DaemonEvent::Signal(hotkey::HotkeyEvent::Shutdown) => break,
             DaemonEvent::Focus(focus::FocusEvent::Focused { address, class }) => {
                 current_blocked = blocklist.contains(&class.to_ascii_lowercase());
                 current_address = Some(address);

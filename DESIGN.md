@@ -142,6 +142,64 @@ Notes:
   `objc2-*`, `windows`, `enigo`). No lan-mouse/GPL-derived code —
   hyprcorrect is MIT/Apache like `vernier`.
 
+### Platform interface — M2 macOS surface
+
+M3 froze the module-level API the daemon and prefs subprocess expect.
+The Linux backend already satisfies it; macOS M2 fills the same shape
+under `crates/hyprcorrect-platform/src/macos/`, after which `main.rs`
+only needs an `#[cfg(target_os = "macos")]` clone of `run_daemon`
+calling `platform::macos::*` instead of `platform::linux::*`.
+
+```rust
+// capture
+pub fn start(trigger_letter: &str) -> Result<Receiver<core::Key>, CaptureError>;
+
+// emit
+pub fn replace(backspaces: usize, insert: &str) -> Result<(), EmitError>;
+
+// hotkey
+pub fn install_bind(letter: &str)   -> Result<(), HotkeyError>;
+pub fn uninstall_bind(letter: &str) -> Result<(), HotkeyError>;
+pub fn signal_channel()             -> Result<Receiver<HotkeyEvent>, HotkeyError>;
+// HotkeyEvent::{Trigger, Reload} — Trigger is the chord, Reload is config-changed.
+
+// focus
+pub struct InitialFocus { pub address: String, pub class: String }
+pub enum FocusEvent { Focused { address, class }, Closed { address } }
+pub fn start() -> Result<(Option<InitialFocus>, Receiver<FocusEvent>), FocusError>;
+
+// tray
+pub fn start(paused: Arc<AtomicBool>)
+    -> Result<(TrayHandle, Receiver<TrayEvent>), TrayError>;
+// TrayHandle::refresh() — re-publishes properties; called after pause toggle.
+// TrayEvent::{TogglePause, OpenPrefs, Quit}.
+```
+
+The UI's `notify_daemon_reload` already uses the runtime PID file +
+`kill -HUP` (Unix-portable), and the prefs singleton uses
+`UnixListener` under `$XDG_RUNTIME_DIR` or `$TMPDIR` — both work on
+macOS without change. The only UI cfg-gate is the existing-window
+focus call inside the prefs singleton (`hyprctl dispatch focuswindow`
+on Linux) — M2 adds a sibling cfg branch using `NSRunningApplication
+.activate` or `osascript -e 'tell app "hyprcorrect" to activate'`.
+
+macOS-specific extras M2 will need on top of the shared interface:
+
+- **TCC permission flow.** Capture (`CGEventTap`) needs Input
+  Monitoring; emit + hotkey may need Accessibility. The daemon probes
+  on startup and surfaces the system prompts (mirror `mousehop`'s TCC
+  probe/watch).
+- **Trigger letter under Carbon.** `RegisterEventHotKey` registers a
+  global chord and the Carbon runloop dispatches it. The simplest
+  wiring is for the macOS hotkey callback to `raise(SIGUSR1)` on the
+  current process, so `signal_channel` can stay the same shape — the
+  Trigger branch fires on SIGUSR1 either way.
+- **Per-window focus.** macOS's `NSWorkspace.frontmostApplication`
+  gives app-level focus, not window-level. App-level addressing
+  (bundle identifier as `address`) is acceptable for M2; per-window
+  buffers degrade to per-app buffers, which is still a strict
+  improvement over the M1 "single global buffer" the Linux side had.
+
 ## The keystroke buffer
 
 A bounded, in-memory rolling buffer of characters typed in each focused
@@ -314,7 +372,7 @@ Wayland protocols.
 | **M0 — Scaffold** | `git init`; 4-crate workspace, edition 2024, shared deps, `rust-toolchain.toml`, dual license, CI + `release-plz` skeleton. Mirrors `vernier`. |
 | **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → per-window buffers driven by Hyprland focus events; offline spell-check provider (spellbook); `wtype`-based synthetic input; one hyprctl-bound hotkey signaling `SIGUSR1`; ksni tray; `fix-last-word` working end-to-end on Hyprland incl. terminals. No GUI. Proves the riskiest path. |
 | **M2 — macOS parity** | `CGEventTap` capture, `CGEvent` emulation, Carbon hotkey, TCC permission flow. `fix-last-word` on macOS. Core now runs on both. |
-| **M3 — Config GUI + tray** | egui prefs (hotkeys/providers/behavior/privacy), `config.toml`, `keyring`, `ksni`/`NSStatusItem` tray, pause control. Hotkeys user-configurable. |
+| **M3 — Config GUI + tray** | egui prefs (Hotkeys / Providers / Behavior / Privacy / About) running standalone via `hyprcorrect prefs`; `config.toml` with serde defaults; `keyring`-backed LLM API key storage; ksni tray expanded with Pause/Resume + Open Preferences + Quit, live status refresh; pause control gates the daemon; `SIGHUP` config reload with safe trigger rebind; daemon PID file for targeted reload. (Linux landed first; the macOS side is a `NSStatusItem` tray + a cfg-gated focus call — the UI itself is platform-independent.) |
 | **M4 — Review popup + sentence mode** | egui popup with keyboard nav; `fix-last-sentence`; multi-word review/apply; LLM provider wired in. |
 | **M5 — Selection fallback + polish** | Clipboard/selection secondary mode; per-app behavior; inter-key delay tuning; LanguageTool-HTTP provider; IME caveats handled. |
 | **M6 — Packaging** | AUR (source/-bin/-git like `vernier`), macOS dmg (ad-hoc signed), GitHub releases via `release-plz`. Windows remains a stub. |

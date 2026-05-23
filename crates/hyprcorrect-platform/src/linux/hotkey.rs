@@ -17,7 +17,7 @@
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use signal_hook::consts::{SIGHUP, SIGUSR1};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::iterator::Signals;
 
 /// A daemon-level event driven by the operating-system signal stream.
@@ -28,6 +28,9 @@ pub enum HotkeyEvent {
     /// `SIGHUP` — the user saved the config. Reload it and rebind the
     /// trigger if the chord letter changed.
     Reload,
+    /// `SIGTERM` / `SIGINT` — the daemon should shut down cleanly so
+    /// the Hyprland bind and PID file are removed.
+    Shutdown,
 }
 
 /// An error registering the Hyprland keybind or signal handler.
@@ -49,10 +52,15 @@ pub enum HotkeyError {
 
 /// Install the Hyprland inline keybind for the given trigger letter.
 ///
+/// Idempotent: first runs `hyprctl keyword unbind` for the same chord
+/// so a previous (uncleanly-shut-down) daemon's bind doesn't leave
+/// duplicates behind.
+///
 /// # Errors
 ///
 /// See [`HotkeyError`].
 pub fn install_bind(letter: &str) -> Result<(), HotkeyError> {
+    let _ = uninstall_bind(letter); // dedup any stale prior bind
     let upper = normalize_letter(letter);
     let bind_value = format!("SUPER CTRL SHIFT ALT, {upper}, exec, pkill -SIGUSR1 -x hyprcorrect");
     let output = Command::new("hyprctl")
@@ -94,15 +102,17 @@ pub fn uninstall_bind(letter: &str) -> Result<(), HotkeyError> {
 
 /// Start the signal listener.
 ///
-/// Installs handlers for `SIGUSR1` and `SIGHUP` and returns a receiver
-/// of [`HotkeyEvent`]s.
+/// Installs handlers for `SIGUSR1` (trigger), `SIGHUP` (reload), and
+/// `SIGTERM` / `SIGINT` (shutdown) and returns a receiver of
+/// [`HotkeyEvent`]s. The shutdown signals let the daemon clean up its
+/// Hyprland bind and PID file even when killed via `pkill` or Ctrl-C.
 ///
 /// # Errors
 ///
 /// See [`HotkeyError`].
 pub fn signal_channel() -> Result<Receiver<HotkeyEvent>, HotkeyError> {
-    let mut signals =
-        Signals::new([SIGUSR1, SIGHUP]).map_err(|e| HotkeyError::Signal(e.to_string()))?;
+    let mut signals = Signals::new([SIGUSR1, SIGHUP, SIGTERM, SIGINT])
+        .map_err(|e| HotkeyError::Signal(e.to_string()))?;
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("hyprcorrect-signal".into())
@@ -116,6 +126,7 @@ fn forward_signals(signals: &mut Signals, tx: &Sender<HotkeyEvent>) {
         let event = match signal {
             SIGUSR1 => HotkeyEvent::Trigger,
             SIGHUP => HotkeyEvent::Reload,
+            SIGTERM | SIGINT => HotkeyEvent::Shutdown,
             _ => continue,
         };
         if tx.send(event).is_err() {
