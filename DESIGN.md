@@ -152,16 +152,16 @@ calling `platform::macos::*` instead of `platform::linux::*`.
 
 ```rust
 // capture
-pub fn start(trigger_letter: &str) -> Result<Receiver<core::Key>, CaptureError>;
+pub fn start(chord: &core::Chord) -> Result<Receiver<core::Key>, CaptureError>;
 
 // emit
 pub fn replace(backspaces: usize, insert: &str) -> Result<(), EmitError>;
 
 // hotkey
-pub fn install_bind(letter: &str)   -> Result<(), HotkeyError>;
-pub fn uninstall_bind(letter: &str) -> Result<(), HotkeyError>;
-pub fn signal_channel()             -> Result<Receiver<HotkeyEvent>, HotkeyError>;
-// HotkeyEvent::{Trigger, Reload} — Trigger is the chord, Reload is config-changed.
+pub fn install_bind(chord: &core::Chord)   -> Result<(), HotkeyError>;
+pub fn uninstall_bind(chord: &core::Chord) -> Result<(), HotkeyError>;
+pub fn signal_channel()                    -> Result<Receiver<HotkeyEvent>, HotkeyError>;
+// HotkeyEvent::{Trigger, Reload, Release, Shutdown}.
 
 // focus
 pub struct InitialFocus { pub address: String, pub class: String }
@@ -175,13 +175,51 @@ pub fn start(paused: Arc<AtomicBool>)
 // TrayEvent::{TogglePause, OpenPrefs, Quit}.
 ```
 
-The UI's `notify_daemon_reload` already uses the runtime PID file +
-`kill -HUP` (Unix-portable), and the prefs singleton uses
-`UnixListener` under `$XDG_RUNTIME_DIR` or `$TMPDIR` — both work on
-macOS without change. The only UI cfg-gate is the existing-window
-focus call inside the prefs singleton (`hyprctl dispatch focuswindow`
-on Linux) — M2 adds a sibling cfg branch using `NSRunningApplication
-.activate` or `osascript -e 'tell app "hyprcorrect" to activate'`.
+The `Chord` type (`core::Chord`) is the parsed accelerator —
+modifier flags + uppercase key name. `Chord::hyprland_modifiers()` /
+`hyprland_key()` produce the Linux bind syntax; the macOS hotkey
+backend uses the same struct to translate to `RegisterEventHotKey`
+parameters.
+
+**Signal contract** (Unix-portable, shared by both backends):
+
+| Signal | Sender | `HotkeyEvent`  | Daemon action |
+|---|---|---|---|
+| `SIGUSR1` | hyprctl bind / Carbon callback | `Trigger`  | Run `fix-last-word` against the active window's buffer. |
+| `SIGUSR2` | prefs subprocess | `Release`  | `uninstall_bind(&chord)`; keep running so the prefs window can capture the chord's key press. `Reload` re-installs. |
+| `SIGHUP`  | prefs subprocess after Save / Cancel | `Reload`   | Re-read `config.toml`; `install_bind(&chord)` (idempotent — also covers post-`Release`). |
+| `SIGTERM` / `SIGINT` | user, systemd, pkill | `Shutdown` | Run cleanup: `uninstall_bind`, drop tray handle, `runtime::clear_pid`, exit loop. |
+
+**Runtime PID file** (`core::runtime`): the daemon writes its PID to
+`$XDG_RUNTIME_DIR/hyprcorrect.pid` (or `$TMPDIR/...` on macOS) at
+startup and removes it on clean shutdown. Both the hyprctl bind's
+`exec` (`kill -USR1 $(cat …)`) and the prefs subprocess's
+`signal_daemon` lookup read from this file. Targeting by PID avoids
+the `pkill -x hyprcorrect` trap where the prefs subprocess shares
+the daemon's binary name and would receive the signal too.
+
+**Prefs subprocess singleton.** `acquire_singleton` binds
+`UnixListener` at `$XDG_RUNTIME_DIR/hyprcorrect-prefs.sock`. If
+already bound, the new invocation best-effort tells the desktop to
+focus the existing window and exits. The cfg-gated focus call is
+`hyprctl dispatch focuswindow class:hyprcorrect-prefs` on Linux;
+macOS M2 adds a sibling branch via `NSRunningApplication.activate`
+or `osascript -e 'tell app "hyprcorrect-prefs" to activate'`.
+
+**UI / chord chip** uses a `shortcut` egui font family chained as
+`[symbol-sans, egui-defaults, omarchy.ttf]` (Omarchy last so its
+partial-coverage cmap doesn't eat letters). The chip's display goes
+through `chord_glyphs()` which maps `SUPER → \u{e900}` (or `⌘`
+fallback) / `CTRL → ⌃` / `SHIFT → ⇧` / `ALT → ⌥` plus named-key
+glyphs (`SPACE → ␣`, `RETURN → ↵`, arrows, …). Storage in
+`config.hotkeys` stays as plain `+`-separated UPPERCASE strings.
+
+**Privacy app-picker.** `linux::list_running_classes` shells out to
+`hyprctl clients -j` to populate the prefs ComboBox; macOS M2's
+equivalent should enumerate `NSWorkspace.runningApplications` and
+return bundle identifiers (so the blocklist on macOS is a list of
+`com.apple.Safari`-style strings rather than X11/Wayland classes).
+The app-picker UI itself is platform-independent egui.
 
 macOS-specific extras M2 will need on top of the shared interface:
 
@@ -189,11 +227,15 @@ macOS-specific extras M2 will need on top of the shared interface:
   Monitoring; emit + hotkey may need Accessibility. The daemon probes
   on startup and surfaces the system prompts (mirror `mousehop`'s TCC
   probe/watch).
-- **Trigger letter under Carbon.** `RegisterEventHotKey` registers a
-  global chord and the Carbon runloop dispatches it. The simplest
-  wiring is for the macOS hotkey callback to `raise(SIGUSR1)` on the
-  current process, so `signal_channel` can stay the same shape — the
-  Trigger branch fires on SIGUSR1 either way.
+- **Trigger under Carbon.** `RegisterEventHotKey` registers a global
+  chord and the Carbon runloop dispatches it. The simplest wiring is
+  for the macOS hotkey callback to `raise(SIGUSR1)` on the current
+  process, so `signal_channel` can stay the same shape — the
+  `Trigger` branch fires on SIGUSR1 either way. `SIGUSR2` (`Release`)
+  on macOS just means "stop dispatching the Carbon hotkey to the
+  app" until the next `Reload`; the simplest form is to call
+  `UnregisterEventHotKey` and re-register on Reload, mirroring the
+  Linux `uninstall_bind` / `install_bind` pair.
 - **Per-window focus.** macOS's `NSWorkspace.frontmostApplication`
   gives app-level focus, not window-level. App-level addressing
   (bundle identifier as `address`) is acceptable for M2; per-window
