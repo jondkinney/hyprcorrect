@@ -72,6 +72,7 @@ fn run_daemon() {
             Chord::parse("SUPER+CTRL+SHIFT+ALT+F").expect("default chord parses")
         }
     };
+    let mut sentence_chord = parse_optional_chord(&initial_config.hotkeys.fix_sentence);
     let mut blocklist = build_blocklist(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
 
@@ -100,15 +101,25 @@ fn run_daemon() {
             return;
         }
     };
-    if let Err(e) = hotkey::install_bind(&chord) {
+    if let Err(e) = hotkey::install_bind(&chord, "word") {
         eprintln!("hyprcorrect: {e}");
         return;
+    }
+    if let Some(ref sc) = sentence_chord
+        && let Err(e) = hotkey::install_bind(sc, "sentence")
+    {
+        eprintln!("hyprcorrect: sentence bind failed: {e}");
+        // Non-fatal — fall through with the word chord still bound.
+        sentence_chord = None;
     }
     let (initial_window, focus_rx) = match focus::start() {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             let _ = hotkey::uninstall_bind(&chord);
+            if let Some(ref sc) = sentence_chord {
+                let _ = hotkey::uninstall_bind(sc);
+            }
             return;
         }
     };
@@ -117,6 +128,9 @@ fn run_daemon() {
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             let _ = hotkey::uninstall_bind(&chord);
+            if let Some(ref sc) = sentence_chord {
+                let _ = hotkey::uninstall_bind(sc);
+            }
             return;
         }
     };
@@ -201,7 +215,10 @@ fn run_daemon() {
                     && let Some(addr) = current_address.as_deref()
                     && let Some(buffer) = buffers.get_mut(addr)
                 {
-                    fix_last_word(buffer, &provider);
+                    match hyprcorrect_core::runtime::read_action().as_str() {
+                        "sentence" => fix_last_sentence(buffer, &provider),
+                        _ => fix_last_word(buffer, &provider),
+                    }
                 }
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Reload) => {
@@ -215,13 +232,24 @@ fn run_daemon() {
                                 );
                                 chord = new_chord;
                             }
-                            // Always re-install: also covers the case
-                            // where SIGUSR2 (`Release`) was sent for
-                            // chord-capture and we need to bind again.
-                            // install_bind is idempotent.
-                            if let Err(e) = hotkey::install_bind(&chord) {
+                            if let Err(e) = hotkey::install_bind(&chord, "word") {
                                 eprintln!("hyprcorrect: rebind failed: {e}");
                             }
+                            let new_sentence_chord =
+                                parse_optional_chord(&new_config.hotkeys.fix_sentence);
+                            // Drop the old sentence bind if the chord
+                            // changed or was cleared.
+                            if let Some(ref old) = sentence_chord
+                                && new_sentence_chord.as_ref() != Some(old)
+                            {
+                                let _ = hotkey::uninstall_bind(old);
+                            }
+                            if let Some(ref sc) = new_sentence_chord
+                                && let Err(e) = hotkey::install_bind(sc, "sentence")
+                            {
+                                eprintln!("hyprcorrect: sentence rebind failed: {e}");
+                            }
+                            sentence_chord = new_sentence_chord;
                             blocklist = build_blocklist(&new_config);
                             eprintln!("hyprcorrect: config reloaded");
                         }
@@ -240,6 +268,9 @@ fn run_daemon() {
                 // Prefs is recording — let Hyprland deliver the chord
                 // to the prefs window. We re-install on Reload.
                 let _ = hotkey::uninstall_bind(&chord);
+                if let Some(ref sc) = sentence_chord {
+                    let _ = hotkey::uninstall_bind(sc);
+                }
                 eprintln!("hyprcorrect: trigger released for capture");
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Shutdown) => break,
@@ -270,8 +301,11 @@ fn run_daemon() {
     }
     drop(tray_handle); // tear down the SNI service on exit
 
-    // Clean up so the bind and PID file don't outlive the daemon.
+    // Clean up so the binds and PID file don't outlive the daemon.
     let _ = hotkey::uninstall_bind(&chord);
+    if let Some(ref sc) = sentence_chord {
+        let _ = hotkey::uninstall_bind(sc);
+    }
     hyprcorrect_core::runtime::clear_pid();
 }
 
@@ -319,6 +353,24 @@ fn spawn_prefs_window() {
     }
 }
 
+/// Parse an optional chord string. Empty input → `None` (unbound);
+/// a non-empty string that fails to parse is reported and treated
+/// as unbound rather than killing the daemon.
+#[cfg(target_os = "linux")]
+fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match hyprcorrect_core::Chord::parse(trimmed) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("hyprcorrect: ignoring invalid chord '{trimmed}': {e}");
+            None
+        }
+    }
+}
+
 /// Correct the buffer's last word in place via the offline provider.
 #[cfg(target_os = "linux")]
 fn fix_last_word(
@@ -344,6 +396,50 @@ fn fix_last_word(
         Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
+}
+
+/// Correct the buffer's last sentence in place. Runs the offline
+/// provider over the whole sentence and applies each correction's
+/// top suggestion; if no corrections fire the buffer is left alone.
+#[cfg(target_os = "linux")]
+fn fix_last_sentence(
+    buffer: &mut hyprcorrect_core::Buffer,
+    provider: &hyprcorrect_core::OfflineProvider,
+) {
+    use hyprcorrect_platform::linux::emit;
+
+    let Some(last) = buffer.last_sentence() else {
+        return;
+    };
+    let corrected = apply_corrections(&last.sentence, provider);
+    if corrected == last.sentence {
+        return;
+    }
+    let backspaces = last.sentence.chars().count() + last.trailing.chars().count();
+    let insert = format!("{corrected}{}", last.trailing);
+    match emit::replace(backspaces, &insert) {
+        Ok(()) => buffer.apply(backspaces, &insert),
+        Err(e) => eprintln!("hyprcorrect: {e}"),
+    }
+}
+
+/// Run the provider over `text` and apply each correction's top
+/// suggestion to produce a corrected string. Applies right-to-left
+/// so earlier byte offsets stay valid through later replacements.
+#[cfg(target_os = "linux")]
+fn apply_corrections(text: &str, provider: &hyprcorrect_core::OfflineProvider) -> String {
+    let mut corrections = provider.check_text(text);
+    if corrections.is_empty() {
+        return text.to_string();
+    }
+    corrections.sort_by_key(|c| std::cmp::Reverse(c.span.start));
+    let mut out = text.to_string();
+    for c in corrections {
+        if let Some(fix) = c.suggestions.first() {
+            out.replace_range(c.span.clone(), fix);
+        }
+    }
+    out
 }
 
 #[cfg(not(target_os = "linux"))]

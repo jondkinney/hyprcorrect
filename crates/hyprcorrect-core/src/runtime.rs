@@ -21,10 +21,29 @@ pub enum PidError {
 /// Path to the daemon PID file. Falls back to the OS temp dir when
 /// `$XDG_RUNTIME_DIR` is unset (macOS, restricted environments).
 pub fn pid_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    runtime_dir().join("hyprcorrect.pid")
+}
+
+/// Path to the trigger-action file. The hyprctl bind writes "word",
+/// "sentence", or "review" here before signaling the daemon; the
+/// daemon reads it on `SIGUSR1` to know which action fired.
+pub fn action_path() -> PathBuf {
+    runtime_dir().join("hyprcorrect.action")
+}
+
+/// Read the trigger-action file, returning the trimmed contents. An
+/// empty string is returned if the file is missing or unreadable —
+/// callers treat that as "default action" (fix-last-word).
+pub fn read_action() -> String {
+    std::fs::read_to_string(action_path())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("hyprcorrect.pid")
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Write the current process's PID to the daemon PID file.
@@ -40,9 +59,12 @@ pub fn write_self_pid() -> Result<(), PidError> {
     fs::write(&path, std::process::id().to_string()).map_err(|e| PidError::Io(e.to_string()))
 }
 
-/// Remove the daemon PID file (idempotent — missing file is OK).
+/// Remove the daemon PID file (idempotent — missing file is OK). The
+/// action file is removed alongside it since the two have the same
+/// lifecycle: both are owned by the running daemon.
 pub fn clear_pid() {
     let _ = fs::remove_file(pid_path());
+    let _ = fs::remove_file(action_path());
 }
 
 /// Read the daemon's PID from the file. Returns `Ok(None)` if no file

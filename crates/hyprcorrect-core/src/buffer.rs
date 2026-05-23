@@ -33,6 +33,17 @@ pub struct LastWord {
     pub trailing: String,
 }
 
+/// The last sentence in the buffer, with any whitespace that follows it.
+/// "Sentence" here is "text after the previous `.`/`!`/`?`" (or, if
+/// there isn't one, the whole buffer's trimmed content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSentence {
+    /// The sentence itself, with no surrounding whitespace.
+    pub sentence: String,
+    /// Whitespace between the sentence and the caret.
+    pub trailing: String,
+}
+
 /// A bounded record of recently typed text in the focused element.
 #[derive(Debug)]
 pub struct Buffer {
@@ -82,6 +93,50 @@ impl Buffer {
     /// The buffered text, oldest character first.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The last sentence in the buffer with the whitespace that
+    /// follows it, or `None` when the buffer holds no sentence.
+    ///
+    /// "Sentence" means the run of text after the most recent
+    /// `.`/`!`/`?` (skipping the punctuation and any whitespace right
+    /// after it). If no sentence ender appears the entire buffer
+    /// content is treated as one sentence.
+    pub fn last_sentence(&self) -> Option<LastSentence> {
+        let trimmed = self.text.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Find the previous sentence ender, scanning backwards.
+        let after_ender = trimmed
+            .char_indices()
+            .rev()
+            .find_map(|(i, c)| {
+                if matches!(c, '.' | '!' | '?') {
+                    Some(i + c.len_utf8())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        // Skip whitespace after the ender to find the sentence's start.
+        let sentence_start = trimmed[after_ender..]
+            .char_indices()
+            .find_map(|(i, c)| {
+                if !c.is_whitespace() {
+                    Some(after_ender + i)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(trimmed.len());
+        if sentence_start >= trimmed.len() {
+            return None; // only an ender + trailing whitespace
+        }
+        Some(LastSentence {
+            sentence: trimmed[sentence_start..].to_string(),
+            trailing: self.text[trimmed.len()..].to_string(),
+        })
     }
 
     /// The last word in the buffer with the whitespace that follows it,
@@ -220,6 +275,46 @@ mod tests {
         let last = buf.last_word().unwrap();
         assert_eq!(last.word, "café");
         assert_eq!(last.trailing, " ");
+    }
+
+    #[test]
+    fn last_sentence_after_an_ender() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hello there. how are you ");
+        let last = buf.last_sentence().unwrap();
+        assert_eq!(last.sentence, "how are you");
+        assert_eq!(last.trailing, " ");
+    }
+
+    #[test]
+    fn last_sentence_when_no_ender_yet() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox");
+        let last = buf.last_sentence().unwrap();
+        assert_eq!(last.sentence, "the quick brown fox");
+        assert_eq!(last.trailing, "");
+    }
+
+    #[test]
+    fn last_sentence_with_multiple_enders() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hi! Hello there. How are yu");
+        let last = buf.last_sentence().unwrap();
+        assert_eq!(last.sentence, "How are yu");
+    }
+
+    #[test]
+    fn last_sentence_returns_none_for_trailing_ender_only() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hello there.");
+        assert!(buf.last_sentence().is_none());
+    }
+
+    #[test]
+    fn last_sentence_returns_none_for_whitespace() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "   ");
+        assert!(buf.last_sentence().is_none());
     }
 
     #[test]

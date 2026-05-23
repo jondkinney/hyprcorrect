@@ -12,7 +12,7 @@ pub mod replace;
 pub mod runtime;
 pub mod secrets;
 
-pub use buffer::{Buffer, Key, LastWord};
+pub use buffer::{Buffer, Key, LastSentence, LastWord};
 pub use chord::{Chord, ChordError};
 pub use config::{
     Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,

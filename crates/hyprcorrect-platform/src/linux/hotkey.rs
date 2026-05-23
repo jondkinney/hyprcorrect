@@ -64,26 +64,31 @@ pub enum HotkeyError {
     Thread(String),
 }
 
-/// Install the Hyprland inline keybind for the given chord.
+/// Install the Hyprland inline keybind for the given chord, tagged
+/// with an `action` label ("word", "sentence", "review", …).
 ///
-/// Idempotent: first runs `hyprctl keyword unbind` for the same chord
-/// so a previous (uncleanly-shut-down) daemon's bind doesn't leave
-/// duplicates behind.
+/// The bind's `exec` writes the action label to the runtime action
+/// file and then `kill -USR1`s the daemon — the daemon reads the
+/// label in its trigger handler to pick which fix to run. Hyprland's
+/// `exec` already wraps the command in `sh -c`, so shell
+/// substitution (`>`, `&&`, `$(...)`) works without extra quoting.
+///
+/// Idempotent: first runs `hyprctl keyword unbind` for the same
+/// chord so a previous (uncleanly-shut-down) daemon's bind doesn't
+/// leave duplicates behind.
 ///
 /// # Errors
 ///
 /// See [`HotkeyError`].
-pub fn install_bind(chord: &Chord) -> Result<(), HotkeyError> {
-    let _ = uninstall_bind(chord); // dedup any stale prior bind
-    // Hyprland's `exec` dispatcher already runs the command through
-    // `sh -c`, so we lean on shell substitution to read the PID at
-    // chord-press time — that way the bind survives the daemon
-    // exiting and restarting (the new PID is in the file by then).
+pub fn install_bind(chord: &Chord, action: &str) -> Result<(), HotkeyError> {
+    let _ = uninstall_bind(chord);
     let pid_path = runtime::pid_path();
+    let action_path = runtime::action_path();
     let bind_value = format!(
-        "{mods}, {key}, exec, kill -USR1 $(cat \"{pid_path}\")",
+        "{mods}, {key}, exec, printf %s {action} > {action_path} && kill -USR1 $(cat {pid_path})",
         mods = chord.hyprland_modifiers(),
         key = chord.hyprland_key(),
+        action_path = action_path.display(),
         pid_path = pid_path.display(),
     );
     let output = Command::new("hyprctl")
