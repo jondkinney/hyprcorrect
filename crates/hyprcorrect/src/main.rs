@@ -1,9 +1,10 @@
 //! hyprcorrect — keyboard-driven desktop spelling and typo correction.
 //!
 //! Running `hyprcorrect` with no subcommand starts the daemon: it
-//! registers the trigger chord with the GlobalShortcuts portal,
-//! captures keystrokes for the buffer, publishes a system-tray icon,
-//! and corrects the last typed word in place when the chord fires.
+//! registers the trigger chord with Hyprland, captures keystrokes into
+//! a per-window keystroke buffer, subscribes to focus events so each
+//! window owns its own buffer, publishes a system-tray icon, and
+//! corrects the last typed word in place when the chord fires.
 //! See `DESIGN.md` at the repository root.
 
 use clap::{Parser, Subcommand};
@@ -45,15 +46,17 @@ fn main() {
     }
 }
 
-/// Run the background daemon: register the portal trigger, capture
-/// keystrokes, publish the tray, and correct on the chord.
+/// Run the background daemon: register the trigger, capture keystrokes
+/// into per-window buffers, subscribe to focus events, publish the
+/// tray, and correct the focused window's last word on the chord.
 #[cfg(target_os = "linux")]
 fn run_daemon() {
+    use std::collections::HashMap;
     use std::sync::mpsc;
     use std::thread;
 
     use hyprcorrect_core::{Buffer, OfflineProvider};
-    use hyprcorrect_platform::linux::{capture, hotkey, tray};
+    use hyprcorrect_platform::linux::{capture, focus, hotkey, tray};
 
     let provider = match OfflineProvider::en_us() {
         Ok(provider) => provider,
@@ -71,6 +74,13 @@ fn run_daemon() {
     };
     let trigger_rx = match hotkey::start() {
         Ok(rx) => rx,
+        Err(e) => {
+            eprintln!("hyprcorrect: {e}");
+            return;
+        }
+    };
+    let (initial_window, focus_rx) = match focus::start() {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             return;
@@ -94,10 +104,11 @@ fn run_daemon() {
     enum DaemonEvent {
         Key(hyprcorrect_core::Key),
         Trigger,
+        Focus(focus::FocusEvent),
         Quit,
     }
 
-    // Merge the three sources into one channel so the main loop can
+    // Merge all four sources into one channel so the main loop can
     // process them in arrival order.
     let (tx, rx) = mpsc::channel::<DaemonEvent>();
     {
@@ -123,6 +134,16 @@ fn run_daemon() {
     {
         let tx = tx.clone();
         thread::spawn(move || {
+            while let Ok(event) = focus_rx.recv() {
+                if tx.send(DaemonEvent::Focus(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
             // The tray currently emits only Quit; M3 adds more.
             if matches!(tray_rx.recv(), Ok(tray::TrayEvent::Quit)) {
                 let _ = tx.send(DaemonEvent::Quit);
@@ -131,11 +152,33 @@ fn run_daemon() {
     }
     drop(tx); // the forwarder threads now own all senders
 
-    let mut buffer = Buffer::default();
+    let mut buffers: HashMap<String, Buffer> = HashMap::new();
+    let mut current: Option<String> = initial_window;
     for event in rx {
         match event {
-            DaemonEvent::Key(key) => buffer.push(key),
-            DaemonEvent::Trigger => fix_last_word(&mut buffer, &provider),
+            DaemonEvent::Key(key) => {
+                if let Some(addr) = current.as_deref() {
+                    buffers.entry(addr.to_string()).or_default().push(key);
+                }
+                // No focused window known yet: drop the key. The next
+                // focus event will start a fresh buffer for that window.
+            }
+            DaemonEvent::Trigger => {
+                if let Some(addr) = current.as_deref()
+                    && let Some(buffer) = buffers.get_mut(addr)
+                {
+                    fix_last_word(buffer, &provider);
+                }
+            }
+            DaemonEvent::Focus(focus::FocusEvent::Focused(addr)) => {
+                current = Some(addr);
+            }
+            DaemonEvent::Focus(focus::FocusEvent::Closed(addr)) => {
+                buffers.remove(&addr);
+                if current.as_deref() == Some(addr.as_str()) {
+                    current = None;
+                }
+            }
             DaemonEvent::Quit => break,
         }
     }

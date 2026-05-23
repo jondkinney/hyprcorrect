@@ -139,21 +139,31 @@ Notes:
 
 ## The keystroke buffer
 
-A bounded, in-memory rolling buffer of characters typed in the currently
-focused element.
+A bounded, in-memory rolling buffer of characters typed in each focused
+element. The daemon keeps **one buffer per window**, keyed by the
+compositor's window address; the active buffer is whichever window
+currently has focus.
 
-- Printable keys append; Backspace pops.
+- Printable keys append to the active window's buffer; Backspace pops.
 - Queries: last word, last N words, last sentence (sentence = split on
   `.!?` with simple boundary rules — trivial since we hold the literal
   text).
-- **Reset triggers** — anything meaning the caret may no longer sit at
-  the buffer's end: focus/window change, mouse click,
+- **Reset triggers** — anything within the focused window that means
+  the caret may no longer sit at the buffer's end:
   arrow/Home/End/PageUp-Down, Ctrl+arrows, Enter, Tab, Esc, undo/redo.
-  After a reset the buffer is empty and "fix last word" does nothing
-  until typing resumes — correct and safe (better than corrupting text).
-  The selection fallback covers "fix something I didn't just type."
-- Single buffer, reset on focus change (the use case is always the
-  current focus).
+  Only the active window's buffer is cleared; other windows' buffers
+  are untouched. After a reset "fix last word" does nothing until
+  typing resumes — correct and safe (better than corrupting text). The
+  selection fallback covers "fix something I didn't just type."
+- **Per-window storage:** switching focus does *not* clear buffers, so
+  returning to a window and triggering can still fix the last word you
+  typed there. Buffers are dropped when their window closes.
+- **Inherent limit of the keystroke model:** events the daemon cannot
+  observe — mouse clicks inside the window, app-driven edits
+  (autocomplete, autocorrect, paste), undo/redo done with a mouse — can
+  leave a window's buffer out of sync with what is actually on screen.
+  In that state the chord will garble text. The review popup (M4) is
+  the safety net: it shows the planned edit before it lands.
 - After applying a correction the buffer is rewritten to the corrected
   text so fixes can chain; if anything is uncertain it resets instead.
 

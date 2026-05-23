@@ -10,5 +10,6 @@
 
 pub mod capture;
 pub mod emit;
+pub mod focus;
 pub mod hotkey;
 pub mod tray;
