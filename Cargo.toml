@@ -28,6 +28,12 @@ env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 
+# Config (toml on disk, OS-resolved paths) and secrets.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+keyring = { version = "3", features = ["linux-native", "apple-native", "windows-native"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -8,8 +8,13 @@ pub mod buffer;
 pub mod config;
 pub mod providers;
 pub mod replace;
+pub mod secrets;
 
 pub use buffer::{Buffer, Key, LastWord};
+pub use config::{
+    Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,
+    Providers,
+};
 pub use providers::{Context, Correction, CorrectionProvider, OfflineProvider};
 pub use replace::{Edit, plan_word_replacement};
 
