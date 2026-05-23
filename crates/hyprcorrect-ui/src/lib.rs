@@ -8,6 +8,7 @@
 //!
 //! See the "Configuration & GUI" section of `DESIGN.md`.
 
+mod icon;
 mod prefs;
 
 /// Open the preferences window. Blocks until the user closes it.

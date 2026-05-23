@@ -43,6 +43,11 @@ eframe = { version = "0.32", default-features = false, features = [
 ] }
 egui = "0.32"
 
+# Icon rasterization for the prefs sidebar.
+resvg = { version = "0.45", default-features = false }
+tiny-skia = "0.11"
+usvg = { version = "0.45", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

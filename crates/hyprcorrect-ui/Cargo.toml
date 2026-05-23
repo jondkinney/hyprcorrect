@@ -12,3 +12,6 @@ rust-version.workspace = true
 hyprcorrect-core.workspace = true
 eframe.workspace = true
 egui.workspace = true
+resvg.workspace = true
+tiny-skia.workspace = true
+usvg.workspace = true

@@ -9,9 +9,12 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use hyprcorrect_core::{Config, LlmConfig, ProviderId, runtime, secrets};
+
+use crate::icon;
 
 const APP_ID: &str = "hyprcorrect-prefs";
 const LLM_ANTHROPIC_KEY: &str = "llm.anthropic";
@@ -73,6 +76,16 @@ struct PrefsApp {
     blocklist_entry: String,
     /// Signal the singleton holder thread to shut down on close.
     shutdown_tx: Option<Sender<()>>,
+    /// Lazy-loaded app icon for the sidebar (256×256 raster from the
+    /// bundled SVG).
+    logo: Option<egui::TextureHandle>,
+    /// Last time we recomputed `daemon_stale`. Rechecked at most once
+    /// a second so a recompile shows up promptly without thrashing the
+    /// filesystem on every repaint.
+    last_stale_check: Instant,
+    /// Cached "binary is newer than the running daemon" flag — drives
+    /// the "Relaunch daemon (new build)" button's visibility.
+    daemon_stale: bool,
 }
 
 impl PrefsApp {
@@ -86,7 +99,32 @@ impl PrefsApp {
             status: Status::default(),
             blocklist_entry: String::new(),
             shutdown_tx: Some(shutdown_tx),
+            logo: None,
+            last_stale_check: Instant::now() - Duration::from_secs(60),
+            daemon_stale: false,
         }
+    }
+
+    fn logo_texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
+        if self.logo.is_none() {
+            let size = 256u32;
+            let rgba = icon::render_app_icon_rgba(size);
+            if rgba.len() == (size as usize) * (size as usize) * 4 {
+                let image =
+                    egui::ColorImage::from_rgba_unmultiplied([size as usize, size as usize], &rgba);
+                self.logo =
+                    Some(ctx.load_texture("hyprcorrect_logo", image, egui::TextureOptions::LINEAR));
+            }
+        }
+        self.logo.as_ref()
+    }
+
+    fn refresh_stale_check(&mut self) {
+        if self.last_stale_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_stale_check = Instant::now();
+        self.daemon_stale = daemon_is_stale();
     }
 
     fn dirty(&self) -> bool {
@@ -146,13 +184,27 @@ impl PrefsApp {
 
 impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_style(ctx);
+        self.refresh_stale_check();
+
+        // Materialize the logo handle before borrowing self.* for the
+        // sidebar closure.
+        let logo = self.logo_texture(ctx).cloned();
+
         egui::SidePanel::left("sections")
             .resizable(false)
-            .exact_width(140.0)
+            .exact_width(160.0)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("hyprcorrect");
                 ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    if let Some(handle) = &logo {
+                        ui.add(egui::Image::new(handle).fit_to_exact_size(egui::vec2(28.0, 28.0)));
+                        ui.add_space(8.0);
+                    }
+                    ui.heading("hyprcorrect");
+                });
+                ui.add_space(16.0);
                 for section in Section::all() {
                     let selected = self.section == *section;
                     if ui.selectable_label(selected, section.label()).clicked() {
@@ -162,12 +214,33 @@ impl eframe::App for PrefsApp {
                 }
             });
 
+        let mut quit_requested = false;
+        let mut relaunch_requested = false;
+
         egui::TopBottomPanel::bottom("actions")
             .resizable(false)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
+                    let quit_label = egui::RichText::new("Quit hyprcorrect")
+                        .color(egui::Color32::from_rgb(220, 90, 90));
+                    if ui.add(egui::Button::new(quit_label)).clicked() {
+                        quit_requested = true;
+                    }
+                    if self.daemon_stale {
+                        let relaunch_label = egui::RichText::new("Relaunch daemon (new build)")
+                            .color(egui::Color32::from_rgb(220, 160, 50));
+                        let resp = ui.add(egui::Button::new(relaunch_label)).on_hover_text(
+                            "The on-disk binary is newer than the running daemon. \
+                             Click to quit the old daemon and spawn the new one.",
+                        );
+                        if resp.clicked() {
+                            relaunch_requested = true;
+                        }
+                    }
+
                     if !self.status.text.is_empty() {
+                        ui.add_space(8.0);
                         let color = if self.status.is_error {
                             ui.visuals().error_fg_color
                         } else {
@@ -175,6 +248,7 @@ impl eframe::App for PrefsApp {
                         };
                         ui.colored_label(color, &self.status.text);
                     }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(self.dirty(), egui::Button::new("Save"))
@@ -190,7 +264,7 @@ impl eframe::App for PrefsApp {
                         }
                     });
                 });
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.section {
@@ -200,6 +274,17 @@ impl eframe::App for PrefsApp {
             Section::Privacy => self.privacy_panel(ui),
             Section::About => self.about_panel(ui),
         });
+
+        if quit_requested {
+            quit_daemon();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if relaunch_requested {
+            relaunch_daemon_now();
+            // Force the next stale check to fire immediately so the
+            // button hides as soon as the new daemon is up.
+            self.last_stale_check = Instant::now() - Duration::from_secs(60);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -365,6 +450,111 @@ fn llm_section(ui: &mut egui::Ui, llm: &mut LlmConfig, api_key: &mut String) -> 
     });
     ui.small("The API key is stored in your OS keychain, not in config.toml.");
     changed
+}
+
+/// Apply hyprcorrect's egui style — larger fonts and more generous
+/// spacing than egui's defaults, mirroring `vernier`'s prefs window.
+fn apply_style(ctx: &egui::Context) {
+    use egui::FontFamily::Proportional;
+    use egui::TextStyle::{Body, Button, Heading, Monospace, Small};
+    ctx.style_mut(|style| {
+        style.text_styles = [
+            (Heading, egui::FontId::new(21.0, Proportional)),
+            (Body, egui::FontId::new(14.0, Proportional)),
+            (
+                Monospace,
+                egui::FontId::new(13.0, egui::FontFamily::Monospace),
+            ),
+            (Button, egui::FontId::new(14.0, Proportional)),
+            (Small, egui::FontId::new(12.0, Proportional)),
+        ]
+        .into();
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.indent = 14.0;
+        style.spacing.interact_size = egui::vec2(40.0, 28.0);
+        style.spacing.icon_width = 18.0;
+        style.spacing.icon_spacing = 6.0;
+        style.visuals.widgets.inactive.expansion = 0.0;
+    });
+}
+
+/// `true` when the daemon's on-disk binary has been replaced since the
+/// daemon was started — i.e. the PID file (written at daemon startup)
+/// is older than the executable file. Drives the
+/// "Relaunch daemon (new build)" button's visibility.
+fn daemon_is_stale() -> bool {
+    let Ok(Some(_pid)) = runtime::read_daemon_pid() else {
+        return false;
+    };
+    let pid_meta = match std::fs::metadata(runtime::pid_path()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let exe_meta = match std::fs::metadata(&exe) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let pid_t = pid_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let exe_t = exe_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    exe_t > pid_t
+}
+
+/// SIGTERM the running daemon. The daemon's shutdown handler cleans
+/// up its Hyprland bind, tray, and PID file.
+fn quit_daemon() {
+    let Ok(Some(pid)) = runtime::read_daemon_pid() else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Quit the running daemon and immediately spawn a fresh one from the
+/// current executable's on-disk path. Best-effort: errors are logged
+/// to stderr (the prefs window is on its way out anyway, or staying
+/// open with the in-memory status banner already shown by the caller).
+fn relaunch_daemon_now() {
+    let was_running = matches!(runtime::read_daemon_pid(), Ok(Some(_)));
+    if was_running {
+        quit_daemon();
+        // Wait up to ~1s for the daemon's PID file to disappear,
+        // which is its last cleanup step before exit.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if matches!(runtime::read_daemon_pid(), Ok(None)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hyprcorrect: cannot find own executable to relaunch: {e}");
+            return;
+        }
+    };
+    let result = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = result {
+        eprintln!("hyprcorrect: could not spawn fresh daemon: {e}");
+    }
 }
 
 fn validate(config: &Config) -> Result<(), String> {
