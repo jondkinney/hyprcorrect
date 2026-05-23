@@ -44,20 +44,25 @@ pub struct Config {
     pub privacy: Privacy,
 }
 
-/// Hotkey settings. The chord that fires `fix-last-word` is fully
-/// configurable — pick any combination of modifiers plus a single
-/// non-modifier key. Stored as a `+`-separated accelerator string
-/// (see [`crate::Chord`]) so the file stays human-readable.
+/// Hotkey settings. Each action is fully configurable — pick any
+/// combination of modifiers plus a single non-modifier key. Stored
+/// as `+`-separated accelerator strings (see [`crate::Chord`]) so
+/// the file stays human-readable. An empty string means "unbound".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Hotkeys {
     /// Accelerator for `fix-last-word`. Example: `"SUPER+CTRL+SHIFT+ALT+F"`.
     pub fix_word: String,
+    /// Accelerator for `fix-last-sentence`. Empty = unbound; the
+    /// daemon ignores it until milestone M4 wires the sentence
+    /// action.
+    pub fix_sentence: String,
 }
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
             fix_word: "SUPER+CTRL+SHIFT+ALT+F".into(),
+            fix_sentence: String::new(),
         }
     }
 }

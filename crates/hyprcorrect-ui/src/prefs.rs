@@ -19,6 +19,13 @@ use crate::icon;
 const APP_ID: &str = "hyprcorrect-prefs";
 const LLM_ANTHROPIC_KEY: &str = "llm.anthropic";
 
+/// Which hotkey row's chord is being recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyTarget {
+    FixWord,
+    FixSentence,
+}
+
 /// Sections in the left sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -86,9 +93,9 @@ struct PrefsApp {
     /// Cached "binary is newer than the running daemon" flag — drives
     /// the "Relaunch daemon (new build)" button's visibility.
     daemon_stale: bool,
-    /// `true` while the hotkey row is recording — the next non-modifier
-    /// key press becomes the new chord.
-    capturing_chord: bool,
+    /// Which hotkey row, if any, is recording. The next non-modifier
+    /// key press becomes the new chord for that target.
+    capturing_chord: Option<HotkeyTarget>,
     /// Window classes detected on the desktop right now, sorted and
     /// deduplicated. Populated lazily and refreshed when the privacy
     /// panel is opened so the picker reflects whatever's running.
@@ -115,7 +122,7 @@ impl PrefsApp {
             logo: None,
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
-            capturing_chord: false,
+            capturing_chord: None,
             running_apps: Vec::new(),
             last_apps_refresh: Instant::now() - Duration::from_secs(60),
             selected_app: None,
@@ -216,20 +223,21 @@ impl eframe::App for PrefsApp {
         // queue (so other widgets don't act on them) and commit the
         // first non-modifier key press with whatever modifiers are
         // currently held. Esc cancels.
-        if self.capturing_chord
+        if let Some(target) = self.capturing_chord
             && let Some(outcome) = ctx.input_mut(capture_outcome)
         {
             match outcome {
                 CaptureOutcome::Cancel => {
-                    self.capturing_chord = false;
-                    notify_daemon_reload(); // restore the original bind
+                    self.capturing_chord = None;
+                    notify_daemon_reload();
                 }
                 CaptureOutcome::Commit(s) => {
-                    self.config.hotkeys.fix_word = s;
-                    self.capturing_chord = false;
+                    match target {
+                        HotkeyTarget::FixWord => self.config.hotkeys.fix_word = s,
+                        HotkeyTarget::FixSentence => self.config.hotkeys.fix_sentence = s,
+                    }
+                    self.capturing_chord = None;
                     self.clear_status();
-                    // Restore the original bind (Save will fire its own
-                    // reload with the new chord if the user accepts).
                     notify_daemon_reload();
                 }
             }
@@ -323,12 +331,16 @@ impl eframe::App for PrefsApp {
                 egui::Frame::central_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(20, 18)),
             )
-            .show(ctx, |ui| match self.section {
-                Section::Hotkeys => self.hotkeys_panel(ui),
-                Section::Providers => self.providers_panel(ui),
-                Section::Behavior => self.behavior_panel(ui),
-                Section::Privacy => self.privacy_panel(ui),
-                Section::About => self.about_panel(ui),
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.section {
+                        Section::Hotkeys => self.hotkeys_panel(ui),
+                        Section::Providers => self.providers_panel(ui),
+                        Section::Behavior => self.behavior_panel(ui),
+                        Section::Privacy => self.privacy_panel(ui),
+                        Section::About => self.about_panel(ui),
+                    });
             });
 
         if quit_requested {
@@ -350,7 +362,7 @@ impl eframe::App for PrefsApp {
         // If the window is closing while we were still recording,
         // restore the daemon's bind so the user isn't left with a
         // dead trigger.
-        if self.capturing_chord {
+        if self.capturing_chord.is_some() {
             notify_daemon_reload();
         }
     }
@@ -361,27 +373,20 @@ impl PrefsApp {
         ui.heading("Hotkeys");
         ui.add_space(14.0);
 
+        // -- Fix last word --------------------------------------------------
         field_label(ui, "Fix last word");
         ui.add_space(4.0);
-
-        let chord_value = self.config.hotkeys.fix_word.clone();
-        let display = if self.capturing_chord {
-            "Press a shortcut…".to_string()
-        } else if chord_value.is_empty() {
-            "Click to set".to_string()
-        } else {
-            chord_glyphs(&chord_value)
-        };
-        let chord_resp = chord_chip(ui, &display, self.capturing_chord);
-        if chord_resp.clicked() {
-            self.capturing_chord = true;
+        let fix_word_value = self.config.hotkeys.fix_word.clone();
+        if hotkey_chord_row(
+            ui,
+            HotkeyTarget::FixWord,
+            &fix_word_value,
+            self.capturing_chord,
+        ) {
+            self.capturing_chord = Some(HotkeyTarget::FixWord);
             self.clear_status();
-            // Ask the daemon to release the bind so Hyprland stops
-            // intercepting the chord; that's what was blocking the
-            // user from re-recording the currently-bound chord.
             notify_daemon_release();
         }
-
         ui.add_space(6.0);
         caption(
             ui,
@@ -389,10 +394,44 @@ impl PrefsApp {
              Hyprland will eat the chord so terminals and other focused \
              apps never see it.",
         );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        // -- Fix last sentence (M4 — UI ready, daemon not yet wired) -------
+        field_label(ui, "Fix last sentence");
         ui.add_space(4.0);
+        let fix_sentence_value = self.config.hotkeys.fix_sentence.clone();
+        if hotkey_chord_row(
+            ui,
+            HotkeyTarget::FixSentence,
+            &fix_sentence_value,
+            self.capturing_chord,
+        ) {
+            self.capturing_chord = Some(HotkeyTarget::FixSentence);
+            self.clear_status();
+            notify_daemon_release();
+        }
+        if !self.config.hotkeys.fix_sentence.is_empty()
+            && ui
+                .add(egui::Button::new("Clear").frame(false))
+                .on_hover_text("Unbind this chord")
+                .clicked()
+        {
+            self.config.hotkeys.fix_sentence.clear();
+            self.clear_status();
+        }
+        ui.add_space(6.0);
         caption(
             ui,
-            "$HYPRCORRECT_CHORD overrides this for one-off dev runs.",
+            "Corrects the previous sentence in one keypress. Bind it if \
+             you want it now — the daemon ignores this chord until \
+             milestone M4 wires up the sentence action.",
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        caption(
+            ui,
+            "$HYPRCORRECT_CHORD overrides Fix last word for one-off dev runs.",
         );
     }
 
@@ -724,43 +763,85 @@ const OMARCHY_LOGO: char = '\u{e900}';
 static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Look for `omarchy.ttf` in the conventional install locations and
-/// register it with egui as a fallback for the proportional family.
-/// Mirrors `vernier`'s approach so users running Omarchy see the
-/// Hyprland logo on the Super-key segment of the chord chip.
+/// Register the fonts the chord chip needs into a dedicated
+/// `shortcut` font family:
+///
+///   shortcut = [ omarchy.ttf ? , sans-with-modifier-glyphs ? ,
+///                default Proportional ]
+///
+/// The chain order means egui draws each character with the first
+/// font that has it. Omarchy gives us the Hyprland logo at
+/// `\u{e900}`; a system sans font with `⌃ ⇧ ⌥ ⌘` covers the
+/// standard modifier glyphs; the default proportional font handles
+/// plain letters. If no symbol font is found we fall back to the
+/// default, and `chord_glyphs` will show ASCII names through
+/// [`OMARCHY_FONT_AVAILABLE`] — but the symbol font search rarely
+/// fails on a desktop Linux system.
+///
+/// Mirrors `vernier`'s `install_glyph_fonts` pattern.
 fn install_glyph_fonts(ctx: &egui::Context) {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    let candidates: Vec<std::path::PathBuf> = {
-        let mut paths = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            let mut p = std::path::PathBuf::from(home);
-            p.push(".local/share/fonts/omarchy.ttf");
-            paths.push(p);
-        }
-        paths.push(std::path::PathBuf::from("/usr/share/fonts/omarchy.ttf"));
-        paths
-    };
+    let mut fonts = egui::FontDefinitions::default();
+    let mut shortcut_chain: Vec<String> = Vec::new();
 
-    for path in candidates {
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "omarchy".into(),
-            Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("omarchy".into());
-        ctx.set_fonts(fonts);
-        OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
-        return;
+    // -- Omarchy / Hyprland logo at U+E900 ----------------------------
+    let mut omarchy_candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".local/share/fonts/omarchy.ttf");
+        omarchy_candidates.push(p);
     }
+    omarchy_candidates.push("/usr/share/fonts/omarchy.ttf".into());
+    for path in omarchy_candidates {
+        if let Ok(bytes) = std::fs::read(&path) {
+            fonts.font_data.insert(
+                "omarchy".into(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            shortcut_chain.push("omarchy".into());
+            OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+
+    // -- Sans font with the standard modifier glyphs ------------------
+    // Adwaita Sans and DejaVu Sans both ship `⌃ ⇧ ⌥ ⌘`; Noto Sans
+    // Symbols is a guaranteed fallback. Take the first that loads.
+    let symbol_paths = [
+        // Linux
+        "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols-Black.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+        // macOS
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial Bold.ttf",
+    ];
+    for path in symbol_paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "shortcut_symbols".into(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            shortcut_chain.push("shortcut_symbols".into());
+            break;
+        }
+    }
+
+    // -- Always-available fallback to whatever egui shipped -----------
+    if let Some(default_chain) = fonts.families.get(&egui::FontFamily::Proportional) {
+        shortcut_chain.extend(default_chain.iter().cloned());
+    }
+
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("shortcut".into()), shortcut_chain);
+    ctx.set_fonts(fonts);
 }
 
 /// Replace `+`-separated modifier tokens with Unicode glyphs the
@@ -801,8 +882,33 @@ fn chord_glyphs(stored: &str) -> String {
         .join(" ")
 }
 
+/// Render one row of the Hotkeys panel: a chord-capture chip whose
+/// label reflects `value` (or a "Press…" / "Click to set" prompt
+/// depending on capture state). Returns `true` when the row was
+/// clicked and should enter capture mode.
+fn hotkey_chord_row(
+    ui: &mut egui::Ui,
+    target: HotkeyTarget,
+    value: &str,
+    capturing: Option<HotkeyTarget>,
+) -> bool {
+    let is_capturing_this = capturing == Some(target);
+    let display = if is_capturing_this {
+        "Press a shortcut…".to_string()
+    } else if value.is_empty() {
+        "Click to set".to_string()
+    } else {
+        chord_glyphs(value)
+    };
+    chord_chip(ui, &display, is_capturing_this).clicked()
+}
+
 /// Render the chord-capture chip — a wide, click-to-record button
 /// that displays the current accelerator or a prompt while recording.
+/// Uses the `shortcut` font family registered by
+/// [`install_glyph_fonts`] so modifier glyphs (⌃ ⇧ ⌥ ⌘ / Omarchy
+/// logo) render even when egui's default proportional font lacks
+/// them.
 fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Response {
     let chip_size = egui::vec2(280.0, 32.0);
     let resp = ui.allocate_response(chip_size, egui::Sense::click());
@@ -819,10 +925,14 @@ fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Respon
         resp.rect.center(),
         egui::Align2::CENTER_CENTER,
         display,
-        egui::FontId::proportional(14.0),
+        shortcut_font(14.0),
         egui::Color32::WHITE,
     );
     resp
+}
+
+fn shortcut_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("shortcut".into()))
 }
 
 /// Outcome of one frame of chord capture.
@@ -1079,9 +1189,14 @@ fn list_running_classes() -> Vec<String> {
 }
 
 fn validate(config: &Config) -> Result<(), String> {
-    hyprcorrect_core::Chord::parse(&config.hotkeys.fix_word)
-        .map(|_| ())
-        .map_err(|e| format!("Trigger chord is invalid ({e}). Click the chip and re-record it."))
+    hyprcorrect_core::Chord::parse(&config.hotkeys.fix_word).map_err(|e| {
+        format!("Fix-last-word chord is invalid ({e}). Click the chip and re-record it.")
+    })?;
+    if !config.hotkeys.fix_sentence.is_empty() {
+        hyprcorrect_core::Chord::parse(&config.hotkeys.fix_sentence)
+            .map_err(|e| format!("Fix-last-sentence chord is invalid ({e})."))?;
+    }
+    Ok(())
 }
 
 /// Send a Unix signal to the running daemon (if any).
