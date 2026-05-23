@@ -220,11 +220,17 @@ impl eframe::App for PrefsApp {
             && let Some(outcome) = ctx.input_mut(capture_outcome)
         {
             match outcome {
-                CaptureOutcome::Cancel => self.capturing_chord = false,
+                CaptureOutcome::Cancel => {
+                    self.capturing_chord = false;
+                    notify_daemon_reload(); // restore the original bind
+                }
                 CaptureOutcome::Commit(s) => {
                     self.config.hotkeys.fix_word = s;
                     self.capturing_chord = false;
                     self.clear_status();
+                    // Restore the original bind (Save will fire its own
+                    // reload with the new chord if the user accepts).
+                    notify_daemon_reload();
                 }
             }
         }
@@ -341,6 +347,12 @@ impl eframe::App for PrefsApp {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        // If the window is closing while we were still recording,
+        // restore the daemon's bind so the user isn't left with a
+        // dead trigger.
+        if self.capturing_chord {
+            notify_daemon_reload();
+        }
     }
 }
 
@@ -358,12 +370,16 @@ impl PrefsApp {
         } else if chord_value.is_empty() {
             "Click to set".to_string()
         } else {
-            chord_value
+            chord_glyphs(&chord_value)
         };
         let chord_resp = chord_chip(ui, &display, self.capturing_chord);
         if chord_resp.clicked() {
             self.capturing_chord = true;
             self.clear_status();
+            // Ask the daemon to release the bind so Hyprland stops
+            // intercepting the chord; that's what was blocking the
+            // user from re-recording the currently-bound chord.
+            notify_daemon_release();
         }
 
         ui.add_space(6.0);
@@ -700,6 +716,91 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
 
+/// The Hyprland/Omarchy logo glyph in the bundled `omarchy.ttf`.
+/// Renders as a blank tofu box if the font isn't installed — we
+/// guard with [`OMARCHY_FONT_AVAILABLE`] before using it.
+const OMARCHY_LOGO: char = '\u{e900}';
+
+static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Look for `omarchy.ttf` in the conventional install locations and
+/// register it with egui as a fallback for the proportional family.
+/// Mirrors `vernier`'s approach so users running Omarchy see the
+/// Hyprland logo on the Super-key segment of the chord chip.
+fn install_glyph_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut paths = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut p = std::path::PathBuf::from(home);
+            p.push(".local/share/fonts/omarchy.ttf");
+            paths.push(p);
+        }
+        paths.push(std::path::PathBuf::from("/usr/share/fonts/omarchy.ttf"));
+        paths
+    };
+
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "omarchy".into(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("omarchy".into());
+        ctx.set_fonts(fonts);
+        OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
+        return;
+    }
+}
+
+/// Replace `+`-separated modifier tokens with Unicode glyphs the
+/// reader recognizes from native menus. Used to display the stored
+/// accelerator string on the chord chip.
+fn chord_glyphs(stored: &str) -> String {
+    use std::sync::atomic::Ordering;
+    let omarchy = OMARCHY_FONT_AVAILABLE.load(Ordering::Relaxed);
+    stored
+        .split('+')
+        .filter(|t| !t.trim().is_empty())
+        .map(|tok| match tok.trim().to_ascii_uppercase().as_str() {
+            "SUPER" | "META" | "CMD" | "COMMAND" | "WIN" | "WINDOWS" => {
+                if omarchy {
+                    OMARCHY_LOGO.to_string()
+                } else {
+                    "⌘".to_string()
+                }
+            }
+            "CTRL" | "CONTROL" => "⌃".to_string(),
+            "SHIFT" => "⇧".to_string(),
+            "ALT" | "OPTION" => "⌥".to_string(),
+            "RETURN" | "ENTER" => "↵".to_string(),
+            "TAB" => "⇥".to_string(),
+            "ESCAPE" | "ESC" => "⎋".to_string(),
+            "BACKSPACE" => "⌫".to_string(),
+            "DELETE" => "⌦".to_string(),
+            "SPACE" => "␣".to_string(),
+            "UP" => "↑".to_string(),
+            "DOWN" => "↓".to_string(),
+            "LEFT" => "←".to_string(),
+            "RIGHT" => "→".to_string(),
+            "PRIOR" => "PgUp".to_string(),
+            "NEXT" => "PgDn".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Render the chord-capture chip — a wide, click-to-record button
 /// that displays the current accelerator or a prompt while recording.
 fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Response {
@@ -983,13 +1084,13 @@ fn validate(config: &Config) -> Result<(), String> {
         .map_err(|e| format!("Trigger chord is invalid ({e}). Click the chip and re-record it."))
 }
 
-/// Ask the running daemon (if any) to reload its config.
+/// Send a Unix signal to the running daemon (if any).
 ///
-/// Reads the daemon's PID from the runtime PID file and sends it
-/// `SIGHUP`. Targeting by PID avoids the trap of `pkill -x hyprcorrect`
-/// — the prefs subprocess shares the daemon's binary name and would
-/// receive the signal too, exiting immediately.
-fn notify_daemon_reload() {
+/// Reads the daemon's PID from the runtime PID file and sends the
+/// signal to that PID. Targeting by PID avoids the trap of
+/// `pkill -x hyprcorrect` — the prefs subprocess shares the daemon's
+/// binary name and would receive the signal too.
+fn signal_daemon(signal: &str) {
     let pid = match runtime::read_daemon_pid() {
         Ok(Some(pid)) => pid,
         Ok(None) => return, // no daemon running
@@ -1001,13 +1102,25 @@ fn notify_daemon_reload() {
     #[cfg(unix)]
     {
         let _ = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
+            .args([signal, &pid.to_string()])
             .output();
     }
     #[cfg(not(unix))]
     {
-        let _ = pid; // Windows: M-later
+        let _ = (pid, signal); // Windows: M-later
     }
+}
+
+/// Ask the daemon to reload its config — re-installs the bind, applies
+/// new blocklist + chord.
+fn notify_daemon_reload() {
+    signal_daemon("-HUP");
+}
+
+/// Ask the daemon to temporarily release its Hyprland keybind so the
+/// prefs window can capture the chord's keypress. Reload restores it.
+fn notify_daemon_release() {
+    signal_daemon("-USR2");
 }
 
 /// Acquire the singleton lock and return a listener that holds it for
@@ -1086,7 +1199,10 @@ pub(crate) fn run() {
     let _ = eframe::run_native(
         "hyprcorrect — Preferences",
         options,
-        Box::new(move |_cc| Ok(Box::new(PrefsApp::new(saved, saved_api_key, shutdown_tx)))),
+        Box::new(move |cc| {
+            install_glyph_fonts(&cc.egui_ctx);
+            Ok(Box::new(PrefsApp::new(saved, saved_api_key, shutdown_tx)))
+        }),
     );
 
     // Best-effort cleanup of the socket file.

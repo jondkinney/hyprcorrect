@@ -208,23 +208,25 @@ fn run_daemon() {
                 match Config::load() {
                     Ok(new_config) => match effective_chord(&new_config) {
                         Ok(new_chord) => {
-                            if new_chord != chord
-                                && let Err(e) = rebind_trigger(&chord, &new_chord)
-                            {
-                                eprintln!("hyprcorrect: rebind failed: {e}");
-                            } else {
-                                if new_chord != chord {
-                                    eprintln!(
-                                        "hyprcorrect: trigger chord changed: {chord} → {new_chord}"
-                                    );
-                                }
+                            if new_chord != chord {
+                                let _ = hotkey::uninstall_bind(&chord);
+                                eprintln!(
+                                    "hyprcorrect: trigger chord changed: {chord} → {new_chord}"
+                                );
                                 chord = new_chord;
+                            }
+                            // Always re-install: also covers the case
+                            // where SIGUSR2 (`Release`) was sent for
+                            // chord-capture and we need to bind again.
+                            // install_bind is idempotent.
+                            if let Err(e) = hotkey::install_bind(&chord) {
+                                eprintln!("hyprcorrect: rebind failed: {e}");
                             }
                             blocklist = build_blocklist(&new_config);
                             eprintln!("hyprcorrect: config reloaded");
                         }
                         Err(e) => {
-                            eprintln!("hyprcorrect: bad chord in new config ({e}) — kept old")
+                            eprintln!("hyprcorrect: bad chord in new config ({e}) — kept old");
                         }
                     },
                     Err(e) => eprintln!("hyprcorrect: reload failed: {e}"),
@@ -233,6 +235,12 @@ fn run_daemon() {
                 // intercepts the chord and capture never sees the new
                 // key under the chord. A full restart is only needed
                 // if other capture-time settings change later.
+            }
+            DaemonEvent::Signal(hotkey::HotkeyEvent::Release) => {
+                // Prefs is recording — let Hyprland deliver the chord
+                // to the prefs window. We re-install on Reload.
+                let _ = hotkey::uninstall_bind(&chord);
+                eprintln!("hyprcorrect: trigger released for capture");
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Shutdown) => break,
             DaemonEvent::Focus(focus::FocusEvent::Focused { address, class }) => {
@@ -309,22 +317,6 @@ fn spawn_prefs_window() {
     if let Err(e) = result {
         eprintln!("hyprcorrect: could not launch prefs window: {e}");
     }
-}
-
-/// Swap the Hyprland keybind from `old` to `new`. If installing the
-/// new bind fails, restore the old one so the trigger keeps working.
-#[cfg(target_os = "linux")]
-fn rebind_trigger(
-    old: &hyprcorrect_core::Chord,
-    new: &hyprcorrect_core::Chord,
-) -> Result<(), hyprcorrect_platform::linux::hotkey::HotkeyError> {
-    use hyprcorrect_platform::linux::hotkey;
-    let _ = hotkey::uninstall_bind(old);
-    if let Err(e) = hotkey::install_bind(new) {
-        let _ = hotkey::install_bind(old);
-        return Err(e);
-    }
-    Ok(())
 }
 
 /// Correct the buffer's last word in place via the offline provider.

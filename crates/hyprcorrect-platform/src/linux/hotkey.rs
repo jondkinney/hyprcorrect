@@ -26,7 +26,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use hyprcorrect_core::{Chord, runtime};
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 
 /// A daemon-level event driven by the operating-system signal stream.
@@ -35,8 +35,13 @@ pub enum HotkeyEvent {
     /// `SIGUSR1` — the trigger chord fired. Run `fix-last-word`.
     Trigger,
     /// `SIGHUP` — the user saved the config. Reload it and rebind the
-    /// trigger if the chord letter changed.
+    /// trigger if the chord changed.
     Reload,
+    /// `SIGUSR2` — the prefs window entered chord-capture mode and
+    /// wants Hyprland to stop intercepting the chord so the prefs
+    /// window can see the key press. The daemon temporarily
+    /// uninstalls its bind; `Reload` reinstalls it after capture.
+    Release,
     /// `SIGTERM` / `SIGINT` — the daemon should shut down cleanly so
     /// the Hyprland bind and PID file are removed.
     Shutdown,
@@ -130,7 +135,7 @@ pub fn uninstall_bind(chord: &Chord) -> Result<(), HotkeyError> {
 ///
 /// See [`HotkeyError`].
 pub fn signal_channel() -> Result<Receiver<HotkeyEvent>, HotkeyError> {
-    let mut signals = Signals::new([SIGUSR1, SIGHUP, SIGTERM, SIGINT])
+    let mut signals = Signals::new([SIGUSR1, SIGUSR2, SIGHUP, SIGTERM, SIGINT])
         .map_err(|e| HotkeyError::Signal(e.to_string()))?;
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -144,6 +149,7 @@ fn forward_signals(signals: &mut Signals, tx: &Sender<HotkeyEvent>) {
     for signal in signals.forever() {
         let event = match signal {
             SIGUSR1 => HotkeyEvent::Trigger,
+            SIGUSR2 => HotkeyEvent::Release,
             SIGHUP => HotkeyEvent::Reload,
             SIGTERM | SIGINT => HotkeyEvent::Shutdown,
             _ => continue,
