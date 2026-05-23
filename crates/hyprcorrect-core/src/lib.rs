@@ -5,6 +5,7 @@
 //! the repository root for the architecture.
 
 pub mod buffer;
+pub mod chord;
 pub mod config;
 pub mod providers;
 pub mod replace;
@@ -12,6 +13,7 @@ pub mod runtime;
 pub mod secrets;
 
 pub use buffer::{Buffer, Key, LastWord};
+pub use chord::{Chord, ChordError};
 pub use config::{
     Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,
     Providers,

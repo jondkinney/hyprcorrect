@@ -23,7 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use evdev::{Device, EventSummary, KeyCode};
-use hyprcorrect_core::Key;
+use hyprcorrect_core::{Chord, Key};
 use xkbcommon::xkb;
 
 /// An error starting keystroke capture.
@@ -42,21 +42,27 @@ pub enum CaptureError {
     Keymap,
 }
 
-/// The trigger chord — a letter pressed while Ctrl, Alt, Shift, and
-/// Super are all held. Capture uses this only to *suppress* the
-/// would-be Reset the chord's letter press would otherwise emit; the
-/// Hyprland keybind in `hotkey` is what actually fires the trigger.
+/// The trigger chord, expanded into the data capture needs: which
+/// modifier flags must match, and the xkb keysyms (upper- and
+/// lower-case) of the non-modifier key. Capture uses this only to
+/// *suppress* the would-be Reset the chord's key press would
+/// otherwise emit; the Hyprland keybind in `hotkey` is what actually
+/// fires the trigger.
 #[derive(Debug, Clone, Copy)]
 struct TriggerSpec {
     sym: u32,
     alt_sym: u32,
+    needs_ctrl: bool,
+    needs_alt: bool,
+    needs_shift: bool,
+    needs_super: bool,
 }
 
 /// Start capturing keystrokes from every keyboard under `/dev/input`.
 ///
-/// `trigger_letter` is the chord's letter — capture uses it only to
-/// suppress the would-be [`Key::Reset`] that pressing it under the
-/// chord would otherwise emit.
+/// `chord` is the trigger chord — capture uses it only to suppress
+/// the would-be [`Key::Reset`] that pressing the chord's key under
+/// its modifier set would otherwise emit.
 ///
 /// Returns a channel of [`Key`] events. One detached OS thread per
 /// keyboard device feeds the channel for the life of the process;
@@ -65,7 +71,7 @@ struct TriggerSpec {
 /// # Errors
 ///
 /// See [`CaptureError`].
-pub fn start(trigger_letter: &str) -> Result<Receiver<Key>, CaptureError> {
+pub fn start(chord: &Chord) -> Result<Receiver<Key>, CaptureError> {
     // Compile the keymap once, up front, so a broken layout fails fast
     // with a clear error rather than a silent no-events daemon.
     let keymap_text = {
@@ -83,7 +89,7 @@ pub fn start(trigger_letter: &str) -> Result<Receiver<Key>, CaptureError> {
         keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
     };
 
-    let trigger = resolve_trigger(trigger_letter);
+    let trigger = resolve_trigger(chord);
     let keyboards = keyboard_devices()?;
     let (tx, rx) = mpsc::channel();
     for device in keyboards {
@@ -94,15 +100,24 @@ pub fn start(trigger_letter: &str) -> Result<Receiver<Key>, CaptureError> {
     Ok(rx)
 }
 
-/// Resolve the trigger spec for the given letter.
-fn resolve_trigger(letter: &str) -> TriggerSpec {
-    let sym = xkb::keysym_from_name(letter, xkb::KEYSYM_CASE_INSENSITIVE).raw();
+/// Resolve the trigger spec for the given chord. Bare modifiers (no
+/// non-modifier key) are degenerate; in that case both `sym` fields
+/// are 0 and `letter_match` below never fires.
+fn resolve_trigger(chord: &Chord) -> TriggerSpec {
+    let sym = xkb::keysym_from_name(&chord.key, xkb::KEYSYM_CASE_INSENSITIVE).raw();
     let alt_sym = match sym {
         0x61..=0x7A => sym - 0x20,
         0x41..=0x5A => sym + 0x20,
         _ => 0,
     };
-    TriggerSpec { sym, alt_sym }
+    TriggerSpec {
+        sym,
+        alt_sym,
+        needs_ctrl: chord.ctrl,
+        needs_alt: chord.alt,
+        needs_shift: chord.shift,
+        needs_super: chord.super_,
+    }
 }
 
 /// Enumerate `/dev/input` and return the devices that look like
@@ -223,7 +238,7 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, trigger: TriggerSpec) ->
     // is about to ask for a fix.
     let letter_match = trigger.sym != 0
         && (sym == trigger.sym || (trigger.alt_sym != 0 && sym == trigger.alt_sym));
-    if letter_match && is_trigger_chord(state) {
+    if letter_match && is_trigger_chord(state, trigger) {
         return None;
     }
 
@@ -237,14 +252,14 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, trigger: TriggerSpec) ->
     classify(sym, &state.key_get_utf8(keycode))
 }
 
-/// `true` if Ctrl, Alt, Shift, and Super are all currently held — the
-/// trigger chord's modifier set.
-fn is_trigger_chord(state: &xkb::State) -> bool {
+/// `true` when the currently-held modifier set matches the trigger
+/// chord's modifier set exactly.
+fn is_trigger_chord(state: &xkb::State, trigger: TriggerSpec) -> bool {
     let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
-    active(xkb::MOD_NAME_CTRL)
-        && active(xkb::MOD_NAME_ALT)
-        && active(xkb::MOD_NAME_SHIFT)
-        && active(xkb::MOD_NAME_LOGO)
+    active(xkb::MOD_NAME_CTRL) == trigger.needs_ctrl
+        && active(xkb::MOD_NAME_ALT) == trigger.needs_alt
+        && active(xkb::MOD_NAME_SHIFT) == trigger.needs_shift
+        && active(xkb::MOD_NAME_LOGO) == trigger.needs_super
 }
 
 /// `true` if Ctrl, Alt, or Super is currently held.

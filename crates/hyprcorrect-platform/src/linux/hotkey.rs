@@ -17,6 +17,7 @@
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use hyprcorrect_core::Chord;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::iterator::Signals;
 
@@ -50,7 +51,7 @@ pub enum HotkeyError {
     Thread(String),
 }
 
-/// Install the Hyprland inline keybind for the given trigger letter.
+/// Install the Hyprland inline keybind for the given chord.
 ///
 /// Idempotent: first runs `hyprctl keyword unbind` for the same chord
 /// so a previous (uncleanly-shut-down) daemon's bind doesn't leave
@@ -59,10 +60,13 @@ pub enum HotkeyError {
 /// # Errors
 ///
 /// See [`HotkeyError`].
-pub fn install_bind(letter: &str) -> Result<(), HotkeyError> {
-    let _ = uninstall_bind(letter); // dedup any stale prior bind
-    let upper = normalize_letter(letter);
-    let bind_value = format!("SUPER CTRL SHIFT ALT, {upper}, exec, pkill -SIGUSR1 -x hyprcorrect");
+pub fn install_bind(chord: &Chord) -> Result<(), HotkeyError> {
+    let _ = uninstall_bind(chord); // dedup any stale prior bind
+    let bind_value = format!(
+        "{mods}, {key}, exec, pkill -SIGUSR1 -x hyprcorrect",
+        mods = chord.hyprland_modifiers(),
+        key = chord.hyprland_key(),
+    );
     let output = Command::new("hyprctl")
         .args(["keyword", "bind", &bind_value])
         .output()
@@ -77,22 +81,23 @@ pub fn install_bind(letter: &str) -> Result<(), HotkeyError> {
     Ok(())
 }
 
-/// Remove the Hyprland inline keybind for the given trigger letter.
-/// Calling this for an unbound chord is silently fine.
+/// Remove the Hyprland inline keybind for the given chord. Calling
+/// this for an unbound chord is silently fine.
 ///
 /// # Errors
 ///
 /// Returns [`HotkeyError::HyprctlUnbind`] only on `hyprctl` invocation
 /// failure (not on "nothing to unbind").
-pub fn uninstall_bind(letter: &str) -> Result<(), HotkeyError> {
-    let upper = normalize_letter(letter);
-    let unbind_value = format!("SUPER CTRL SHIFT ALT, {upper}");
+pub fn uninstall_bind(chord: &Chord) -> Result<(), HotkeyError> {
+    let unbind_value = format!(
+        "{mods}, {key}",
+        mods = chord.hyprland_modifiers(),
+        key = chord.hyprland_key(),
+    );
     let output = Command::new("hyprctl")
         .args(["keyword", "unbind", &unbind_value])
         .output()
         .map_err(|e| HotkeyError::HyprctlUnbind(format!("invoke hyprctl: {e}")))?;
-    // unbind returns "ok" whether or not the chord was bound — treat
-    // anything but a clean invocation failure as success.
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(HotkeyError::HyprctlUnbind(stderr.into_owned()));
@@ -132,36 +137,5 @@ fn forward_signals(signals: &mut Signals, tx: &Sender<HotkeyEvent>) {
         if tx.send(event).is_err() {
             break; // receiver dropped — daemon is shutting down
         }
-    }
-}
-
-/// Normalize the trigger letter to a single uppercase ASCII char.
-/// Anything outside `A..=Z` falls back to `F` so a malformed config
-/// can't kill the daemon at bind time.
-fn normalize_letter(letter: &str) -> char {
-    letter
-        .chars()
-        .next()
-        .map(|c| c.to_ascii_uppercase())
-        .filter(char::is_ascii_alphabetic)
-        .unwrap_or('F')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_letter_uppercases_ascii() {
-        assert_eq!(normalize_letter("f"), 'F');
-        assert_eq!(normalize_letter("J"), 'J');
-        assert_eq!(normalize_letter("kjs"), 'K'); // takes the first char
-    }
-
-    #[test]
-    fn normalize_letter_rejects_garbage() {
-        assert_eq!(normalize_letter(""), 'F');
-        assert_eq!(normalize_letter("1"), 'F');
-        assert_eq!(normalize_letter("é"), 'F');
     }
 }

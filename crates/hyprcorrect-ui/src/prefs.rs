@@ -86,6 +86,9 @@ struct PrefsApp {
     /// Cached "binary is newer than the running daemon" flag — drives
     /// the "Relaunch daemon (new build)" button's visibility.
     daemon_stale: bool,
+    /// `true` while the hotkey row is recording — the next non-modifier
+    /// key press becomes the new chord.
+    capturing_chord: bool,
 }
 
 impl PrefsApp {
@@ -102,6 +105,7 @@ impl PrefsApp {
             logo: None,
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
+            capturing_chord: false,
         }
     }
 
@@ -187,6 +191,23 @@ impl eframe::App for PrefsApp {
         apply_style(ctx);
         self.refresh_stale_check();
 
+        // While recording a chord, drain key events from egui's input
+        // queue (so other widgets don't act on them) and commit the
+        // first non-modifier key press with whatever modifiers are
+        // currently held. Esc cancels.
+        if self.capturing_chord
+            && let Some(outcome) = ctx.input_mut(capture_outcome)
+        {
+            match outcome {
+                CaptureOutcome::Cancel => self.capturing_chord = false,
+                CaptureOutcome::Commit(s) => {
+                    self.config.hotkeys.fix_word = s;
+                    self.capturing_chord = false;
+                    self.clear_status();
+                }
+            }
+        }
+
         // Materialize the logo handle before borrowing self.* for the
         // sidebar closure.
         let logo = self.logo_texture(ctx).cloned();
@@ -194,7 +215,6 @@ impl eframe::App for PrefsApp {
         egui::SidePanel::left("sections")
             .resizable(false)
             .default_width(200.0)
-            .show_separator_line(false)
             .show(ctx, |ui| {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -228,18 +248,16 @@ impl eframe::App for PrefsApp {
                     ui.add_space(4.0);
                     let quit_label = egui::RichText::new("Quit hyprcorrect")
                         .color(egui::Color32::from_rgb(220, 90, 90));
-                    if ui.add(egui::Button::new(quit_label).frame(false)).clicked() {
+                    if ui.add(egui::Button::new(quit_label)).clicked() {
                         quit_requested = true;
                     }
                     if self.daemon_stale {
                         let relaunch_label = egui::RichText::new("Relaunch daemon (new build)")
                             .color(egui::Color32::from_rgb(220, 160, 50));
-                        let resp = ui
-                            .add(egui::Button::new(relaunch_label).frame(false))
-                            .on_hover_text(
-                                "The on-disk binary is newer than the running daemon. \
+                        let resp = ui.add(egui::Button::new(relaunch_label)).on_hover_text(
+                            "The on-disk binary is newer than the running daemon. \
                                  Click to quit the old daemon and spawn the new one.",
-                            );
+                        );
                         if resp.clicked() {
                             relaunch_requested = true;
                         }
@@ -258,13 +276,13 @@ impl eframe::App for PrefsApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(4.0);
                         if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Save").frame(false))
+                            .add_enabled(self.dirty(), egui::Button::new("Save"))
                             .clicked()
                         {
                             self.save();
                         }
                         if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Cancel").frame(false))
+                            .add_enabled(self.dirty(), egui::Button::new("Cancel"))
                             .clicked()
                         {
                             self.cancel();
@@ -310,26 +328,34 @@ impl PrefsApp {
         ui.heading("Hotkeys");
         ui.add_space(14.0);
 
-        field_label(ui, "Trigger letter");
+        field_label(ui, "Fix last word");
         ui.add_space(4.0);
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut self.config.hotkeys.trigger_letter)
-                .margin(egui::Margin::symmetric(8, 6))
-                .desired_width(72.0),
-        );
-        if response.changed() {
+
+        let chord_value = self.config.hotkeys.fix_word.clone();
+        let display = if self.capturing_chord {
+            "Press a shortcut…".to_string()
+        } else if chord_value.is_empty() {
+            "Click to set".to_string()
+        } else {
+            chord_value
+        };
+        let chord_resp = chord_chip(ui, &display, self.capturing_chord);
+        if chord_resp.clicked() {
+            self.capturing_chord = true;
             self.clear_status();
         }
+
         ui.add_space(6.0);
         caption(
             ui,
-            "Pressed alongside Super+Ctrl+Shift+Alt to fix the last word. \
-             Single A–Z; case is ignored. The modifier set is fixed for now.",
+            "Click the chip and press the chord you want. Esc cancels. \
+             Hyprland will eat the chord so terminals and other focused \
+             apps never see it.",
         );
         ui.add_space(4.0);
         caption(
             ui,
-            "$HYPRCORRECT_TRIGGER overrides this for one-off dev runs.",
+            "$HYPRCORRECT_CHORD overrides this for one-off dev runs.",
         );
     }
 
@@ -584,6 +610,124 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
 
+/// Render the chord-capture chip — a wide, click-to-record button
+/// that displays the current accelerator or a prompt while recording.
+fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Response {
+    let chip_size = egui::vec2(280.0, 32.0);
+    let resp = ui.allocate_response(chip_size, egui::Sense::click());
+    let bg = if capturing {
+        egui::Color32::from_rgb(50, 90, 140)
+    } else if resp.hovered() {
+        egui::Color32::from_gray(74)
+    } else {
+        egui::Color32::from_gray(56)
+    };
+    ui.painter()
+        .rect_filled(resp.rect, egui::CornerRadius::same(6), bg);
+    ui.painter().text(
+        resp.rect.center(),
+        egui::Align2::CENTER_CENTER,
+        display,
+        egui::FontId::proportional(14.0),
+        egui::Color32::WHITE,
+    );
+    resp
+}
+
+/// Outcome of one frame of chord capture.
+enum CaptureOutcome {
+    /// User pressed Escape — exit capture without changing anything.
+    Cancel,
+    /// User pressed a non-modifier key — `String` is the accelerator
+    /// (e.g. `"SUPER+CTRL+SHIFT+ALT+F"`).
+    Commit(String),
+}
+
+/// Drain the input queue for one frame of chord capture. Eats any
+/// key events so they don't reach other widgets.
+fn capture_outcome(i: &mut egui::InputState) -> Option<CaptureOutcome> {
+    // Esc with no modifiers cancels.
+    let escaped = i.events.iter().any(|ev| {
+        matches!(
+            ev,
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                modifiers,
+                ..
+            } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt
+                && !modifiers.command && !modifiers.mac_cmd
+        )
+    });
+    if escaped {
+        i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
+        return Some(CaptureOutcome::Cancel);
+    }
+    let result = i.events.iter().find_map(|ev| match ev {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => Some(format_accelerator(*key, *modifiers)),
+        _ => None,
+    });
+    i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
+    result.map(CaptureOutcome::Commit)
+}
+
+/// Format an egui (key, modifiers) pair as an UPPERCASE
+/// `+`-separated accelerator that round-trips through
+/// [`hyprcorrect_core::Chord::parse`].
+fn format_accelerator(key: egui::Key, modifiers: egui::Modifiers) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if modifiers.command || modifiers.mac_cmd {
+        parts.push("SUPER");
+    }
+    if modifiers.ctrl {
+        parts.push("CTRL");
+    }
+    if modifiers.shift {
+        parts.push("SHIFT");
+    }
+    if modifiers.alt {
+        parts.push("ALT");
+    }
+    let key_str = match key {
+        egui::Key::Space => "space".to_string(),
+        egui::Key::Enter => "Return".to_string(),
+        egui::Key::Escape => "Escape".to_string(),
+        egui::Key::Tab => "Tab".to_string(),
+        egui::Key::Backspace => "BackSpace".to_string(),
+        egui::Key::Delete => "Delete".to_string(),
+        egui::Key::Insert => "Insert".to_string(),
+        egui::Key::Home => "Home".to_string(),
+        egui::Key::End => "End".to_string(),
+        egui::Key::PageUp => "Prior".to_string(),
+        egui::Key::PageDown => "Next".to_string(),
+        egui::Key::ArrowUp => "Up".to_string(),
+        egui::Key::ArrowDown => "Down".to_string(),
+        egui::Key::ArrowLeft => "Left".to_string(),
+        egui::Key::ArrowRight => "Right".to_string(),
+        // Punctuation: spell out so the saved string can't collide
+        // with the `+` modifier separator.
+        egui::Key::Plus => "PLUS".to_string(),
+        egui::Key::Minus => "MINUS".to_string(),
+        egui::Key::Equals => "EQUAL".to_string(),
+        egui::Key::Comma => "COMMA".to_string(),
+        egui::Key::Period => "PERIOD".to_string(),
+        egui::Key::Slash => "SLASH".to_string(),
+        egui::Key::Backslash => "BACKSLASH".to_string(),
+        egui::Key::Semicolon => "SEMICOLON".to_string(),
+        other => other.name().to_uppercase(),
+    };
+    if parts.is_empty() {
+        key_str
+    } else {
+        format!("{}+{}", parts.join("+"), key_str)
+    }
+}
+
 /// Apply hyprcorrect's egui style — larger fonts and more generous
 /// spacing than egui's defaults, mirroring `vernier`'s prefs window.
 fn apply_style(ctx: &egui::Context) {
@@ -690,12 +834,9 @@ fn relaunch_daemon_now() {
 }
 
 fn validate(config: &Config) -> Result<(), String> {
-    let letter = config.hotkeys.trigger_letter.trim();
-    let mut chars = letter.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) if c.is_ascii_alphabetic() => Ok(()),
-        _ => Err("Trigger letter must be a single A–Z character".into()),
-    }
+    hyprcorrect_core::Chord::parse(&config.hotkeys.fix_word)
+        .map(|_| ())
+        .map_err(|e| format!("Trigger chord is invalid ({e}). Click the chip and re-record it."))
 }
 
 /// Ask the running daemon (if any) to reload its config.
@@ -816,19 +957,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_accepts_single_letter() {
+    fn validate_accepts_well_formed_chords() {
         let mut cfg = Config::default();
-        cfg.hotkeys.trigger_letter = "k".into();
-        assert!(validate(&cfg).is_ok());
-        cfg.hotkeys.trigger_letter = "J".into();
-        assert!(validate(&cfg).is_ok());
+        for good in ["F", "CTRL+F", "SUPER+CTRL+SHIFT+ALT+F1", "ALT+space"] {
+            cfg.hotkeys.fix_word = good.into();
+            assert!(validate(&cfg).is_ok(), "should accept {good:?}");
+        }
     }
 
     #[test]
-    fn validate_rejects_empty_or_multichar_or_nonalpha() {
+    fn validate_rejects_empty_or_garbage() {
         let mut cfg = Config::default();
-        for bad in ["", "ff", "1", " ", "F1", "ée"] {
-            cfg.hotkeys.trigger_letter = bad.into();
+        for bad in ["", "  ", "+", "FOO+F", "CTRL+"] {
+            cfg.hotkeys.fix_word = bad.into();
             assert!(validate(&cfg).is_err(), "should reject {bad:?}");
         }
     }

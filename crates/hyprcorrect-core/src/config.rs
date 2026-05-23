@@ -44,21 +44,20 @@ pub struct Config {
     pub privacy: Privacy,
 }
 
-/// Hotkey settings. The modifier set (Super+Ctrl+Shift+Alt) is fixed
-/// in M3; only the letter is configurable.
+/// Hotkey settings. The chord that fires `fix-last-word` is fully
+/// configurable — pick any combination of modifiers plus a single
+/// non-modifier key. Stored as a `+`-separated accelerator string
+/// (see [`crate::Chord`]) so the file stays human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Hotkeys {
-    /// The letter pressed alongside Super+Ctrl+Shift+Alt to fire
-    /// `fix-last-word`. Stored as a string so non-Latin keysym names
-    /// (e.g. `"period"`) work later; today only single ASCII letters
-    /// are sensible.
-    pub trigger_letter: String,
+    /// Accelerator for `fix-last-word`. Example: `"SUPER+CTRL+SHIFT+ALT+F"`.
+    pub fix_word: String,
 }
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            trigger_letter: "F".into(),
+            fix_word: "SUPER+CTRL+SHIFT+ALT+F".into(),
         }
     }
 }
@@ -241,11 +240,11 @@ mod tests {
     fn partial_file_fills_missing_with_defaults() {
         let cfg: Config = toml::from_str(
             r#"[hotkeys]
-trigger_letter = "J"
+fix_word = "CTRL+J"
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.hotkeys.trigger_letter, "J");
+        assert_eq!(cfg.hotkeys.fix_word, "CTRL+J");
         // Untouched sections still hold defaults.
         assert_eq!(cfg.behavior.inter_key_delay_ms, 2);
         assert_eq!(cfg.providers.default, ProviderId::Spellbook);
@@ -257,7 +256,7 @@ trigger_letter = "J"
         let dir = unique_tempdir();
         let path = dir.join("config.toml");
         let mut cfg = Config::default();
-        cfg.hotkeys.trigger_letter = "K".into();
+        cfg.hotkeys.fix_word = "CTRL+ALT+K".into();
         cfg.privacy.app_blocklist = vec!["1password".into(), "keepassxc".into()];
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();

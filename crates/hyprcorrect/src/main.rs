@@ -58,14 +58,20 @@ fn run_daemon() {
     use std::sync::mpsc;
     use std::thread;
 
-    use hyprcorrect_core::{Buffer, Config, OfflineProvider};
+    use hyprcorrect_core::{Buffer, Chord, Config, OfflineProvider};
     use hyprcorrect_platform::linux::{capture, focus, hotkey, tray};
 
     let initial_config = Config::load().unwrap_or_else(|e| {
         eprintln!("hyprcorrect: could not load config ({e}) — using defaults");
         Config::default()
     });
-    let mut trigger_letter = effective_trigger_letter(&initial_config);
+    let mut chord = match effective_chord(&initial_config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyprcorrect: invalid chord in config ({e}) — falling back to default");
+            Chord::parse("SUPER+CTRL+SHIFT+ALT+F").expect("default chord parses")
+        }
+    };
     let mut blocklist = build_blocklist(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
 
@@ -80,7 +86,7 @@ fn run_daemon() {
             return;
         }
     };
-    let key_rx = match capture::start(&trigger_letter) {
+    let key_rx = match capture::start(&chord) {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
@@ -94,7 +100,7 @@ fn run_daemon() {
             return;
         }
     };
-    if let Err(e) = hotkey::install_bind(&trigger_letter) {
+    if let Err(e) = hotkey::install_bind(&chord) {
         eprintln!("hyprcorrect: {e}");
         return;
     }
@@ -102,7 +108,7 @@ fn run_daemon() {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
-            let _ = hotkey::uninstall_bind(&trigger_letter);
+            let _ = hotkey::uninstall_bind(&chord);
             return;
         }
     };
@@ -110,14 +116,14 @@ fn run_daemon() {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
-            let _ = hotkey::uninstall_bind(&trigger_letter);
+            let _ = hotkey::uninstall_bind(&chord);
             return;
         }
     };
 
     println!(
-        "hyprcorrect {} — running. Press Super+Ctrl+Shift+Alt+{trigger_letter} to correct \
-         the last word; quit from the tray menu.",
+        "hyprcorrect {} — running. Press {chord} to correct the last word; \
+         quit from the tray menu.",
         hyprcorrect_core::version(),
     );
 
@@ -200,28 +206,32 @@ fn run_daemon() {
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Reload) => {
                 match Config::load() {
-                    Ok(new_config) => {
-                        let new_letter = effective_trigger_letter(&new_config);
-                        if new_letter != trigger_letter
-                            && let Err(e) = rebind_trigger(&trigger_letter, &new_letter)
-                        {
-                            eprintln!("hyprcorrect: rebind failed: {e}");
-                        } else {
-                            if new_letter != trigger_letter {
-                                eprintln!(
-                                    "hyprcorrect: trigger letter changed: {trigger_letter} → {new_letter}"
-                                );
+                    Ok(new_config) => match effective_chord(&new_config) {
+                        Ok(new_chord) => {
+                            if new_chord != chord
+                                && let Err(e) = rebind_trigger(&chord, &new_chord)
+                            {
+                                eprintln!("hyprcorrect: rebind failed: {e}");
+                            } else {
+                                if new_chord != chord {
+                                    eprintln!(
+                                        "hyprcorrect: trigger chord changed: {chord} → {new_chord}"
+                                    );
+                                }
+                                chord = new_chord;
                             }
-                            trigger_letter = new_letter;
+                            blocklist = build_blocklist(&new_config);
+                            eprintln!("hyprcorrect: config reloaded");
                         }
-                        blocklist = build_blocklist(&new_config);
-                        eprintln!("hyprcorrect: config reloaded");
-                    }
+                        Err(e) => {
+                            eprintln!("hyprcorrect: bad chord in new config ({e}) — kept old")
+                        }
+                    },
                     Err(e) => eprintln!("hyprcorrect: reload failed: {e}"),
                 }
                 // Capture's stale TriggerSpec doesn't matter — Hyprland
                 // intercepts the chord and capture never sees the new
-                // letter under the chord. A full restart is only needed
+                // key under the chord. A full restart is only needed
                 // if other capture-time settings change later.
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Shutdown) => break,
@@ -253,16 +263,20 @@ fn run_daemon() {
     drop(tray_handle); // tear down the SNI service on exit
 
     // Clean up so the bind and PID file don't outlive the daemon.
-    let _ = hotkey::uninstall_bind(&trigger_letter);
+    let _ = hotkey::uninstall_bind(&chord);
     hyprcorrect_core::runtime::clear_pid();
 }
 
-/// Resolve the trigger letter the daemon should bind. `$HYPRCORRECT_TRIGGER`
+/// Resolve the trigger chord the daemon should bind. `$HYPRCORRECT_CHORD`
 /// overrides the config so tests and ad-hoc dev runs don't have to edit
 /// `config.toml`.
 #[cfg(target_os = "linux")]
-fn effective_trigger_letter(config: &hyprcorrect_core::Config) -> String {
-    std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| config.hotkeys.trigger_letter.clone())
+fn effective_chord(
+    config: &hyprcorrect_core::Config,
+) -> Result<hyprcorrect_core::Chord, hyprcorrect_core::ChordError> {
+    let raw =
+        std::env::var("HYPRCORRECT_CHORD").unwrap_or_else(|_| config.hotkeys.fix_word.clone());
+    hyprcorrect_core::Chord::parse(&raw)
 }
 
 #[cfg(target_os = "linux")]
@@ -297,18 +311,17 @@ fn spawn_prefs_window() {
     }
 }
 
-/// Swap the Hyprland keybind from `old_letter` to `new_letter`. If
-/// installing the new bind fails, restore the old one so the trigger
-/// keeps working.
+/// Swap the Hyprland keybind from `old` to `new`. If installing the
+/// new bind fails, restore the old one so the trigger keeps working.
 #[cfg(target_os = "linux")]
 fn rebind_trigger(
-    old_letter: &str,
-    new_letter: &str,
+    old: &hyprcorrect_core::Chord,
+    new: &hyprcorrect_core::Chord,
 ) -> Result<(), hyprcorrect_platform::linux::hotkey::HotkeyError> {
     use hyprcorrect_platform::linux::hotkey;
-    let _ = hotkey::uninstall_bind(old_letter);
-    if let Err(e) = hotkey::install_bind(new_letter) {
-        let _ = hotkey::install_bind(old_letter);
+    let _ = hotkey::uninstall_bind(old);
+    if let Err(e) = hotkey::install_bind(new) {
+        let _ = hotkey::install_bind(old);
         return Err(e);
     }
     Ok(())
