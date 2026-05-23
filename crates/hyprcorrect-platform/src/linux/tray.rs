@@ -107,14 +107,14 @@ impl ksni::Tray for HyprcorrectTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        let suffix = if self.is_paused() {
-            "currently paused"
+        let description = if self.is_paused() {
+            "Paused. Click the tray icon to resume.".to_string()
         } else {
-            "press Super+Ctrl+Shift+Alt+F to correct"
+            "Press the trigger chord to fix the last word.".to_string()
         };
         ksni::ToolTip {
             title: "hyprcorrect".into(),
-            description: format!("hyprcorrect — {suffix}"),
+            description,
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
         }

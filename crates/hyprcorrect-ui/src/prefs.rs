@@ -89,6 +89,16 @@ struct PrefsApp {
     /// `true` while the hotkey row is recording — the next non-modifier
     /// key press becomes the new chord.
     capturing_chord: bool,
+    /// Window classes detected on the desktop right now, sorted and
+    /// deduplicated. Populated lazily and refreshed when the privacy
+    /// panel is opened so the picker reflects whatever's running.
+    running_apps: Vec<String>,
+    /// Last time we refreshed `running_apps` — re-checked every few
+    /// seconds while the Privacy panel is visible so newly-launched
+    /// apps show up.
+    last_apps_refresh: Instant,
+    /// Currently-selected entry in the Privacy "Add app" dropdown.
+    selected_app: Option<String>,
 }
 
 impl PrefsApp {
@@ -106,7 +116,18 @@ impl PrefsApp {
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
             capturing_chord: false,
+            running_apps: Vec::new(),
+            last_apps_refresh: Instant::now() - Duration::from_secs(60),
+            selected_app: None,
         }
+    }
+
+    fn refresh_running_apps(&mut self) {
+        if self.last_apps_refresh.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        self.last_apps_refresh = Instant::now();
+        self.running_apps = list_running_classes();
     }
 
     fn logo_texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
@@ -427,45 +448,108 @@ impl PrefsApp {
     }
 
     fn privacy_panel(&mut self, ui: &mut egui::Ui) {
+        self.refresh_running_apps();
+
         ui.heading("Privacy");
         ui.add_space(14.0);
 
         field_label(ui, "App blocklist");
         caption(
             ui,
-            "Windows whose class matches one of these never have their keys buffered. \
-             Match is case-insensitive; use the class shown by `hyprctl activewindow`.",
+            "Windows whose class is on this list never have their keys buffered. \
+             Match is case-insensitive.",
         );
-        ui.add_space(8.0);
+        ui.add_space(12.0);
 
+        // -- Currently blocked entries ------------------------------------
         let mut remove: Option<usize> = None;
-        let mut touched_any = false;
-        for (i, entry) in self.config.privacy.app_blocklist.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(entry)
-                        .margin(egui::Margin::symmetric(8, 6))
-                        .desired_width(ui.available_width() - 100.0),
-                );
-                if resp.changed() {
-                    touched_any = true;
-                }
-                if ui.add(egui::Button::new("Remove").frame(false)).clicked() {
-                    remove = Some(i);
-                }
-            });
-            ui.add_space(4.0);
+        if self.config.privacy.app_blocklist.is_empty() {
+            caption(ui, "(none yet — pick a running app below)");
+            ui.add_space(8.0);
+        } else {
+            for (i, entry) in self.config.privacy.app_blocklist.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(entry);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("Remove").frame(false))
+                            .on_hover_text("Remove from the blocklist")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+            }
         }
         if let Some(i) = remove {
-            self.config.privacy.app_blocklist.remove(i);
-            touched_any = true;
-        }
-        if touched_any {
+            let removed = self.config.privacy.app_blocklist.remove(i);
+            // If the removed class was the selected picker entry,
+            // clear it so the dropdown re-opens cleanly.
+            if self.selected_app.as_deref() == Some(removed.as_str()) {
+                self.selected_app = None;
+            }
             self.clear_status();
         }
 
         ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "Add entry");
+        ui.separator();
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        // -- Picker: running apps not already on the blocklist ------------
+        field_label(ui, "Add a running app");
+        ui.add_space(4.0);
+
+        let already_blocked: std::collections::HashSet<String> = self
+            .config
+            .privacy
+            .app_blocklist
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let candidates: Vec<String> = self
+            .running_apps
+            .iter()
+            .filter(|c| !already_blocked.contains(&c.to_ascii_lowercase()))
+            .cloned()
+            .collect();
+
+        ui.horizontal(|ui| {
+            let placeholder = if candidates.is_empty() {
+                "(no running apps detected)".to_string()
+            } else {
+                self.selected_app
+                    .clone()
+                    .unwrap_or_else(|| "Choose an app…".to_string())
+            };
+            let selected_ref = &mut self.selected_app;
+            egui::ComboBox::from_id_salt("blocklist_app_picker")
+                .selected_text(placeholder)
+                .width(ui.available_width() - 80.0)
+                .show_ui(ui, |ui| {
+                    for class in &candidates {
+                        let is_selected = selected_ref.as_deref() == Some(class.as_str());
+                        if ui.selectable_label(is_selected, class).clicked() {
+                            *selected_ref = Some(class.clone());
+                        }
+                    }
+                });
+            let can_add = self.selected_app.as_ref().is_some_and(|s| {
+                !s.is_empty() && !already_blocked.contains(&s.to_ascii_lowercase())
+            });
+            if ui.add_enabled(can_add, egui::Button::new("Add")).clicked()
+                && let Some(class) = self.selected_app.take()
+            {
+                self.config.privacy.app_blocklist.push(class);
+                self.clear_status();
+            }
+        });
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        // -- Fallback: type-in for apps that aren't running right now ------
+        field_label(ui, "Or add by class name");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let resp = ui.add(
@@ -477,13 +561,19 @@ impl PrefsApp {
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if add_clicked {
                 let entry = self.blocklist_entry.trim().to_string();
-                if !entry.is_empty() {
+                if !entry.is_empty() && !already_blocked.contains(&entry.to_ascii_lowercase()) {
                     self.config.privacy.app_blocklist.push(entry);
                     self.blocklist_entry.clear();
                     self.clear_status();
                 }
             }
         });
+        ui.add_space(4.0);
+        caption(
+            ui,
+            "Useful for apps that aren't open yet. The class is whatever \
+             `hyprctl activewindow` shows for that app.",
+        );
     }
 
     fn about_panel(&mut self, ui: &mut egui::Ui) {
@@ -830,6 +920,60 @@ fn relaunch_daemon_now() {
         .spawn();
     if let Err(e) = result {
         eprintln!("hyprcorrect: could not spawn fresh daemon: {e}");
+    }
+}
+
+/// Enumerate currently-running windows' classes (Hyprland-specific
+/// for now — calls `hyprctl clients -j` and parses out unique
+/// `class` strings). Sorted alphabetically; case-insensitive dedup.
+/// Returns an empty Vec on non-Hyprland systems or if hyprctl fails.
+fn list_running_classes() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(output) = std::process::Command::new("hyprctl")
+            .args(["clients", "-j"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let Ok(text) = std::str::from_utf8(&output.stdout) else {
+            return Vec::new();
+        };
+        // Crude scan for `"class": "..."`. The full hyprctl JSON is
+        // large, but every entry has exactly one top-level `class`
+        // string per object — we can collect them without a JSON dep.
+        let mut classes: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let needle = "\"class\"";
+        for chunk in text.split(needle).skip(1) {
+            let after = chunk
+                .split_once(':')
+                .map(|p| p.1)
+                .unwrap_or(chunk)
+                .trim_start();
+            let Some(rest) = after.strip_prefix('"') else {
+                continue;
+            };
+            let Some((value, _)) = rest.split_once('"') else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            classes
+                .entry(value.to_ascii_lowercase())
+                .or_insert_with(|| value.to_string());
+        }
+        let mut out: Vec<String> = classes.into_values().collect();
+        out.sort_by_key(|a| a.to_ascii_lowercase());
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
     }
 }
 
