@@ -46,17 +46,25 @@ fn main() {
     }
 }
 
-/// Run the background daemon: register the trigger, capture keystrokes
-/// into per-window buffers, subscribe to focus events, publish the
-/// tray, and correct the focused window's last word on the chord.
+/// Run the background daemon: load config, register the trigger,
+/// capture keystrokes into per-window buffers, subscribe to focus
+/// events, publish the tray, and correct the focused window's last
+/// word on the chord.
 #[cfg(target_os = "linux")]
 fn run_daemon() {
     use std::collections::HashMap;
     use std::sync::mpsc;
     use std::thread;
 
-    use hyprcorrect_core::{Buffer, OfflineProvider};
+    use hyprcorrect_core::{Buffer, Config, OfflineProvider};
     use hyprcorrect_platform::linux::{capture, focus, hotkey, tray};
+
+    let initial_config = Config::load().unwrap_or_else(|e| {
+        eprintln!("hyprcorrect: could not load config ({e}) — using defaults");
+        Config::default()
+    });
+    let mut trigger_letter = effective_trigger_letter(&initial_config);
+    let mut blocklist = build_blocklist(&initial_config);
 
     let provider = match OfflineProvider::en_us() {
         Ok(provider) => provider,
@@ -65,24 +73,29 @@ fn run_daemon() {
             return;
         }
     };
-    let key_rx = match capture::start() {
+    let key_rx = match capture::start(&trigger_letter) {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             return;
         }
     };
-    let trigger_rx = match hotkey::start() {
+    let signal_rx = match hotkey::signal_channel() {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             return;
         }
     };
+    if let Err(e) = hotkey::install_bind(&trigger_letter) {
+        eprintln!("hyprcorrect: {e}");
+        return;
+    }
     let (initial_window, focus_rx) = match focus::start() {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
+            let _ = hotkey::uninstall_bind(&trigger_letter);
             return;
         }
     };
@@ -90,20 +103,20 @@ fn run_daemon() {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
+            let _ = hotkey::uninstall_bind(&trigger_letter);
             return;
         }
     };
 
-    let letter = std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| "F".to_string());
     println!(
-        "hyprcorrect {} — running. Press Super+Ctrl+Shift+Alt+{letter} to correct \
+        "hyprcorrect {} — running. Press Super+Ctrl+Shift+Alt+{trigger_letter} to correct \
          the last word; quit from the tray menu.",
         hyprcorrect_core::version(),
     );
 
     enum DaemonEvent {
         Key(hyprcorrect_core::Key),
-        Trigger,
+        Signal(hotkey::HotkeyEvent),
         Focus(focus::FocusEvent),
         Quit,
     }
@@ -124,8 +137,8 @@ fn run_daemon() {
     {
         let tx = tx.clone();
         thread::spawn(move || {
-            while trigger_rx.recv().is_ok() {
-                if tx.send(DaemonEvent::Trigger).is_err() {
+            while let Ok(event) = signal_rx.recv() {
+                if tx.send(DaemonEvent::Signal(event)).is_err() {
                     break;
                 }
             }
@@ -153,35 +166,104 @@ fn run_daemon() {
     drop(tx); // the forwarder threads now own all senders
 
     let mut buffers: HashMap<String, Buffer> = HashMap::new();
-    let mut current: Option<String> = initial_window;
+    let mut current_address: Option<String> = initial_window.as_ref().map(|f| f.address.clone());
+    let mut current_blocked = initial_window
+        .as_ref()
+        .is_some_and(|f| blocklist.contains(&f.class.to_ascii_lowercase()));
+
     for event in rx {
         match event {
             DaemonEvent::Key(key) => {
-                if let Some(addr) = current.as_deref() {
+                if !current_blocked && let Some(addr) = current_address.as_deref() {
                     buffers.entry(addr.to_string()).or_default().push(key);
                 }
-                // No focused window known yet: drop the key. The next
-                // focus event will start a fresh buffer for that window.
             }
-            DaemonEvent::Trigger => {
-                if let Some(addr) = current.as_deref()
+            DaemonEvent::Signal(hotkey::HotkeyEvent::Trigger) => {
+                if !current_blocked
+                    && let Some(addr) = current_address.as_deref()
                     && let Some(buffer) = buffers.get_mut(addr)
                 {
                     fix_last_word(buffer, &provider);
                 }
             }
-            DaemonEvent::Focus(focus::FocusEvent::Focused(addr)) => {
-                current = Some(addr);
+            DaemonEvent::Signal(hotkey::HotkeyEvent::Reload) => {
+                match Config::load() {
+                    Ok(new_config) => {
+                        let new_letter = effective_trigger_letter(&new_config);
+                        if new_letter != trigger_letter
+                            && let Err(e) = rebind_trigger(&trigger_letter, &new_letter)
+                        {
+                            eprintln!("hyprcorrect: rebind failed: {e}");
+                        } else {
+                            if new_letter != trigger_letter {
+                                eprintln!(
+                                    "hyprcorrect: trigger letter changed: {trigger_letter} → {new_letter}"
+                                );
+                            }
+                            trigger_letter = new_letter;
+                        }
+                        blocklist = build_blocklist(&new_config);
+                        eprintln!("hyprcorrect: config reloaded");
+                    }
+                    Err(e) => eprintln!("hyprcorrect: reload failed: {e}"),
+                }
+                // Capture's stale TriggerSpec doesn't matter — Hyprland
+                // intercepts the chord and capture never sees the new
+                // letter under the chord. A full restart is only needed
+                // if other capture-time settings change later.
             }
-            DaemonEvent::Focus(focus::FocusEvent::Closed(addr)) => {
-                buffers.remove(&addr);
-                if current.as_deref() == Some(addr.as_str()) {
-                    current = None;
+            DaemonEvent::Focus(focus::FocusEvent::Focused { address, class }) => {
+                current_blocked = blocklist.contains(&class.to_ascii_lowercase());
+                current_address = Some(address);
+            }
+            DaemonEvent::Focus(focus::FocusEvent::Closed { address }) => {
+                buffers.remove(&address);
+                if current_address.as_deref() == Some(address.as_str()) {
+                    current_address = None;
+                    current_blocked = false;
                 }
             }
             DaemonEvent::Quit => break,
         }
     }
+
+    // Clean up so the bind doesn't outlive the daemon.
+    let _ = hotkey::uninstall_bind(&trigger_letter);
+}
+
+/// Resolve the trigger letter the daemon should bind. `$HYPRCORRECT_TRIGGER`
+/// overrides the config so tests and ad-hoc dev runs don't have to edit
+/// `config.toml`.
+#[cfg(target_os = "linux")]
+fn effective_trigger_letter(config: &hyprcorrect_core::Config) -> String {
+    std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| config.hotkeys.trigger_letter.clone())
+}
+
+#[cfg(target_os = "linux")]
+fn build_blocklist(config: &hyprcorrect_core::Config) -> std::collections::HashSet<String> {
+    config
+        .privacy
+        .app_blocklist
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Swap the Hyprland keybind from `old_letter` to `new_letter`. If
+/// installing the new bind fails, restore the old one so the trigger
+/// keeps working.
+#[cfg(target_os = "linux")]
+fn rebind_trigger(
+    old_letter: &str,
+    new_letter: &str,
+) -> Result<(), hyprcorrect_platform::linux::hotkey::HotkeyError> {
+    use hyprcorrect_platform::linux::hotkey;
+    let _ = hotkey::uninstall_bind(old_letter);
+    if let Err(e) = hotkey::install_bind(new_letter) {
+        let _ = hotkey::install_bind(old_letter);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Correct the buffer's last word in place via the offline provider.

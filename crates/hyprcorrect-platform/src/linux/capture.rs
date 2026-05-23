@@ -54,6 +54,10 @@ struct TriggerSpec {
 
 /// Start capturing keystrokes from every keyboard under `/dev/input`.
 ///
+/// `trigger_letter` is the chord's letter — capture uses it only to
+/// suppress the would-be [`Key::Reset`] that pressing it under the
+/// chord would otherwise emit.
+///
 /// Returns a channel of [`Key`] events. One detached OS thread per
 /// keyboard device feeds the channel for the life of the process;
 /// dropping the [`Receiver`] makes those threads exit.
@@ -61,7 +65,7 @@ struct TriggerSpec {
 /// # Errors
 ///
 /// See [`CaptureError`].
-pub fn start() -> Result<Receiver<Key>, CaptureError> {
+pub fn start(trigger_letter: &str) -> Result<Receiver<Key>, CaptureError> {
     // Compile the keymap once, up front, so a broken layout fails fast
     // with a clear error rather than a silent no-events daemon.
     let keymap_text = {
@@ -79,7 +83,7 @@ pub fn start() -> Result<Receiver<Key>, CaptureError> {
         keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
     };
 
-    let trigger = resolve_trigger();
+    let trigger = resolve_trigger(trigger_letter);
     let keyboards = keyboard_devices()?;
     let (tx, rx) = mpsc::channel();
     for device in keyboards {
@@ -90,10 +94,9 @@ pub fn start() -> Result<Receiver<Key>, CaptureError> {
     Ok(rx)
 }
 
-/// Resolve the trigger spec from `$HYPRCORRECT_TRIGGER` (default `F`).
-fn resolve_trigger() -> TriggerSpec {
-    let name = std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| "F".to_string());
-    let sym = xkb::keysym_from_name(&name, xkb::KEYSYM_CASE_INSENSITIVE).raw();
+/// Resolve the trigger spec for the given letter.
+fn resolve_trigger(letter: &str) -> TriggerSpec {
+    let sym = xkb::keysym_from_name(letter, xkb::KEYSYM_CASE_INSENSITIVE).raw();
     let alt_sym = match sym {
         0x61..=0x7A => sym - 0x20,
         0x41..=0x5A => sym + 0x20,
