@@ -88,19 +88,22 @@ impl ksni::Tray for HyprcorrectTray {
     }
 
     fn status(&self) -> ksni::Status {
-        if self.is_paused() {
-            ksni::Status::Passive
-        } else {
-            ksni::Status::Active
-        }
+        // Stay `Active` even while paused — many SNI hosts (Waybar,
+        // for example) hide `Passive` items entirely, which would make
+        // the menu unreachable. Pause is conveyed by the icon swap.
+        ksni::Status::Active
     }
 
     fn icon_name(&self) -> String {
         // Bundling a proper hyprcorrect icon (SVG → tiny-skia,
-        // vernier-style) is M3-ish polish. For now, use the theme's
-        // spelling-check icon and lean on `Status::Passive` to indicate
-        // the paused state.
-        "tools-check-spelling".to_string()
+        // vernier-style) is later polish. For now, use the theme's
+        // spelling-check icon, swapped for a muted symbolic variant
+        // while paused.
+        if self.is_paused() {
+            "tools-check-spelling-symbolic".to_string()
+        } else {
+            "tools-check-spelling".to_string()
+        }
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
