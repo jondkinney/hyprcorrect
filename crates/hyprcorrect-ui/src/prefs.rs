@@ -193,9 +193,10 @@ impl eframe::App for PrefsApp {
 
         egui::SidePanel::left("sections")
             .resizable(false)
-            .exact_width(160.0)
+            .default_width(200.0)
+            .show_separator_line(false)
             .show(ctx, |ui| {
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
                     if let Some(handle) = &logo {
@@ -204,10 +205,12 @@ impl eframe::App for PrefsApp {
                     }
                     ui.heading("hyprcorrect");
                 });
-                ui.add_space(16.0);
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
                 for section in Section::all() {
                     let selected = self.section == *section;
-                    if ui.selectable_label(selected, section.label()).clicked() {
+                    if sidebar_item(ui, selected, section.label()).clicked() {
                         self.section = *section;
                         self.clear_status();
                     }
@@ -219,21 +222,24 @@ impl eframe::App for PrefsApp {
 
         egui::TopBottomPanel::bottom("actions")
             .resizable(false)
+            .min_height(54.0)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(4.0);
                     let quit_label = egui::RichText::new("Quit hyprcorrect")
                         .color(egui::Color32::from_rgb(220, 90, 90));
-                    if ui.add(egui::Button::new(quit_label)).clicked() {
+                    if ui.add(egui::Button::new(quit_label).frame(false)).clicked() {
                         quit_requested = true;
                     }
                     if self.daemon_stale {
                         let relaunch_label = egui::RichText::new("Relaunch daemon (new build)")
                             .color(egui::Color32::from_rgb(220, 160, 50));
-                        let resp = ui.add(egui::Button::new(relaunch_label)).on_hover_text(
-                            "The on-disk binary is newer than the running daemon. \
-                             Click to quit the old daemon and spawn the new one.",
-                        );
+                        let resp = ui
+                            .add(egui::Button::new(relaunch_label).frame(false))
+                            .on_hover_text(
+                                "The on-disk binary is newer than the running daemon. \
+                                 Click to quit the old daemon and spawn the new one.",
+                            );
                         if resp.clicked() {
                             relaunch_requested = true;
                         }
@@ -250,30 +256,35 @@ impl eframe::App for PrefsApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(4.0);
                         if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Save"))
+                            .add_enabled(self.dirty(), egui::Button::new("Save").frame(false))
                             .clicked()
                         {
                             self.save();
                         }
                         if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Cancel"))
+                            .add_enabled(self.dirty(), egui::Button::new("Cancel").frame(false))
                             .clicked()
                         {
                             self.cancel();
                         }
                     });
                 });
-                ui.add_space(6.0);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.section {
-            Section::Hotkeys => self.hotkeys_panel(ui),
-            Section::Providers => self.providers_panel(ui),
-            Section::Behavior => self.behavior_panel(ui),
-            Section::Privacy => self.privacy_panel(ui),
-            Section::About => self.about_panel(ui),
-        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(20, 18)),
+            )
+            .show(ctx, |ui| match self.section {
+                Section::Hotkeys => self.hotkeys_panel(ui),
+                Section::Providers => self.providers_panel(ui),
+                Section::Behavior => self.behavior_panel(ui),
+                Section::Privacy => self.privacy_panel(ui),
+                Section::About => self.about_panel(ui),
+            });
 
         if quit_requested {
             quit_daemon();
@@ -297,56 +308,71 @@ impl eframe::App for PrefsApp {
 impl PrefsApp {
     fn hotkeys_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Hotkeys");
-        ui.add_space(8.0);
-        ui.label("The trigger chord is Super+Ctrl+Shift+Alt+ a letter.");
-        ui.label("Pick the letter (single A–Z; case is ignored):");
-        ui.add_space(4.0);
+        ui.add_space(14.0);
 
-        let response = ui.text_edit_singleline(&mut self.config.hotkeys.trigger_letter);
+        field_label(ui, "Trigger letter");
+        ui.add_space(4.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.config.hotkeys.trigger_letter)
+                .margin(egui::Margin::symmetric(8, 6))
+                .desired_width(72.0),
+        );
         if response.changed() {
             self.clear_status();
         }
-        ui.add_space(8.0);
-        ui.small(
-            "$HYPRCORRECT_TRIGGER overrides this for one-off dev runs. \
-             The modifier set is fixed for now.",
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "Pressed alongside Super+Ctrl+Shift+Alt to fix the last word. \
+             Single A–Z; case is ignored. The modifier set is fixed for now.",
+        );
+        ui.add_space(4.0);
+        caption(
+            ui,
+            "$HYPRCORRECT_TRIGGER overrides this for one-off dev runs.",
         );
     }
 
     fn providers_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Providers");
-        ui.add_space(8.0);
+        ui.add_space(14.0);
 
         let mut touched = false;
 
-        ui.label("Default provider (fix-last-word):");
+        field_label(ui, "Default provider");
+        caption(ui, "Used for fix-last-word — instant, ideally local.");
+        ui.add_space(4.0);
         touched |= provider_radio(ui, &mut self.config.providers.default);
 
-        ui.add_space(12.0);
-        ui.label("Smart provider (fix-last-sentence / review — M4):");
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Smart provider");
+        caption(ui, "Used for fix-last-sentence and the review popup (M4).");
+        ui.add_space(4.0);
         touched |= provider_radio(ui, &mut self.config.providers.smart);
 
-        ui.add_space(16.0);
+        ui.add_space(SETTING_BLOCK_SPACING);
         ui.separator();
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        ui.label(egui::RichText::new("LLM").size(16.0).strong());
         ui.add_space(8.0);
-        ui.heading("LLM");
-        ui.add_space(4.0);
         touched |= llm_section(ui, &mut self.config.providers.llm, &mut self.api_key_field);
 
-        ui.add_space(16.0);
+        ui.add_space(SETTING_BLOCK_SPACING);
         ui.separator();
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        ui.label(egui::RichText::new("LanguageTool").size(16.0).strong());
         ui.add_space(8.0);
-        ui.heading("LanguageTool");
-        ui.add_space(4.0);
         touched |= ui
             .checkbox(&mut self.config.providers.languagetool.enabled, "Enabled")
             .changed();
-        ui.horizontal(|ui| {
-            ui.label("URL:");
-            touched |= ui
-                .text_edit_singleline(&mut self.config.providers.languagetool.url)
-                .changed();
-        });
+        ui.add_space(8.0);
+        field_label(ui, "URL");
+        ui.add_space(4.0);
+        touched |= padded_text_edit(ui, &mut self.config.providers.languagetool.url).changed();
+        ui.add_space(4.0);
+        caption(ui, "POST endpoint of your self-hosted LanguageTool server.");
 
         if touched {
             self.clear_status();
@@ -355,16 +381,20 @@ impl PrefsApp {
 
     fn behavior_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Behavior");
-        ui.add_space(8.0);
-        ui.label("Inter-key delay applied to synthetic typing:");
+        ui.add_space(14.0);
+
+        field_label(ui, "Inter-key delay");
+        caption(ui, "Applied to synthetic typing.");
+        ui.add_space(6.0);
         let response = ui.add(
             egui::Slider::new(&mut self.config.behavior.inter_key_delay_ms, 0..=50).suffix(" ms"),
         );
         if response.changed() {
             self.clear_status();
         }
-        ui.add_space(8.0);
-        ui.small(
+        ui.add_space(6.0);
+        caption(
+            ui,
             "0 ms is fastest but some apps drop characters under that speed; \
              2 ms is the safe default.",
         );
@@ -372,31 +402,54 @@ impl PrefsApp {
 
     fn privacy_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Privacy");
-        ui.add_space(8.0);
-        ui.label("Windows whose class is on this list never have their keys buffered.");
-        ui.small("Match is case-insensitive; use the class shown by `hyprctl activewindow`.");
+        ui.add_space(14.0);
+
+        field_label(ui, "App blocklist");
+        caption(
+            ui,
+            "Windows whose class matches one of these never have their keys buffered. \
+             Match is case-insensitive; use the class shown by `hyprctl activewindow`.",
+        );
         ui.add_space(8.0);
 
         let mut remove: Option<usize> = None;
+        let mut touched_any = false;
         for (i, entry) in self.config.privacy.app_blocklist.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                if ui.text_edit_singleline(entry).changed() {
-                    // Status cleared by setter below.
+                let resp = ui.add(
+                    egui::TextEdit::singleline(entry)
+                        .margin(egui::Margin::symmetric(8, 6))
+                        .desired_width(ui.available_width() - 100.0),
+                );
+                if resp.changed() {
+                    touched_any = true;
                 }
-                if ui.small_button("Remove").clicked() {
+                if ui.add(egui::Button::new("Remove").frame(false)).clicked() {
                     remove = Some(i);
                 }
             });
+            ui.add_space(4.0);
         }
         if let Some(i) = remove {
             self.config.privacy.app_blocklist.remove(i);
+            touched_any = true;
+        }
+        if touched_any {
             self.clear_status();
         }
 
-        ui.add_space(8.0);
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Add entry");
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.blocklist_entry);
-            if ui.button("Add").clicked() {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.blocklist_entry)
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .desired_width(ui.available_width() - 80.0),
+            );
+            let add_clicked = ui.button("Add").clicked()
+                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if add_clicked {
                 let entry = self.blocklist_entry.trim().to_string();
                 if !entry.is_empty() {
                     self.config.privacy.app_blocklist.push(entry);
@@ -409,13 +462,23 @@ impl PrefsApp {
 
     fn about_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("About hyprcorrect");
+        ui.add_space(14.0);
+
+        ui.label(
+            egui::RichText::new(format!("Version {}", hyprcorrect_core::version()))
+                .size(15.0)
+                .strong(),
+        );
         ui.add_space(8.0);
-        ui.label(format!("Version {}", hyprcorrect_core::version()));
-        ui.add_space(4.0);
         ui.label("Keyboard-driven spelling and typo correction for the whole desktop.");
-        ui.add_space(8.0);
-        ui.label("Source: https://github.com/jondkinney/hyprcorrect");
-        ui.label("License: MIT OR Apache-2.0");
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        field_label(ui, "Source");
+        caption(ui, "https://github.com/jondkinney/hyprcorrect");
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        field_label(ui, "License");
+        caption(ui, "MIT OR Apache-2.0");
     }
 }
 
@@ -434,23 +497,92 @@ fn provider_radio(ui: &mut egui::Ui, selection: &mut ProviderId) -> bool {
 /// Render LLM-specific fields. Returns `true` if anything changed.
 fn llm_section(ui: &mut egui::Ui, llm: &mut LlmConfig, api_key: &mut String) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Backend:");
-        changed |= ui.text_edit_singleline(&mut llm.backend).changed();
-    });
-    ui.horizontal(|ui| {
-        ui.label("Model:");
-        changed |= ui.text_edit_singleline(&mut llm.model).changed();
-    });
-    ui.horizontal(|ui| {
-        ui.label("API key:");
-        changed |= ui
-            .add(egui::TextEdit::singleline(api_key).password(true))
-            .changed();
-    });
-    ui.small("The API key is stored in your OS keychain, not in config.toml.");
+
+    field_label(ui, "Backend");
+    ui.add_space(4.0);
+    changed |= padded_text_edit(ui, &mut llm.backend).changed();
+
+    ui.add_space(SETTING_BLOCK_SPACING);
+    field_label(ui, "Model");
+    ui.add_space(4.0);
+    changed |= padded_text_edit(ui, &mut llm.model).changed();
+
+    ui.add_space(SETTING_BLOCK_SPACING);
+    field_label(ui, "API key");
+    ui.add_space(4.0);
+    changed |= padded_password_edit(ui, api_key).changed();
+    ui.add_space(4.0);
+    caption(ui, "Stored in your OS keychain, not in config.toml.");
+
     changed
 }
+
+/// Sidebar row — vernier-style. Egui's default `selectable_label`
+/// puts a square, light selection backdrop behind whatever it draws;
+/// we want a rounded, contained pill. Allocates a click-sized rect
+/// and paints the selection backdrop + label ourselves.
+fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let height = 32.0;
+    let response = ui.allocate_response(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            response.rect.expand(-2.0),
+            egui::CornerRadius::same(6),
+            visuals.bg_fill,
+        );
+    }
+    let text_pos = response.rect.left_center() + egui::vec2(12.0, 0.0);
+    ui.painter().text(
+        text_pos,
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        visuals.text_color(),
+    );
+    response
+}
+
+/// Single-line text input with consistent inner padding so fields
+/// don't collapse to ~16 px tall at the body font size.
+fn padded_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .margin(egui::Margin::symmetric(8, 6))
+            .desired_width(f32::INFINITY),
+    )
+}
+
+/// Single-line *password* input with the same padding as
+/// [`padded_text_edit`]. The contents render as bullets.
+fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .password(true)
+            .margin(egui::Margin::symmetric(8, 6))
+            .desired_width(f32::INFINITY),
+    )
+}
+
+/// Bold-ish label introducing a setting. Slightly larger than the
+/// caption text below the input.
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).strong().size(14.0));
+}
+
+/// Muted explainer text under inputs or checkboxes.
+fn caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.0)
+            .color(egui::Color32::from_gray(170)),
+    );
+}
+
+const SETTING_BLOCK_SPACING: f32 = 22.0;
 
 /// Apply hyprcorrect's egui style — larger fonts and more generous
 /// spacing than egui's defaults, mirroring `vernier`'s prefs window.

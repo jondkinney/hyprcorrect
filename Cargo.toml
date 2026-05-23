@@ -44,9 +44,11 @@ eframe = { version = "0.32", default-features = false, features = [
 egui = "0.32"
 
 # Icon rasterization for the prefs sidebar.
-resvg = { version = "0.45", default-features = false }
+# Default features enable text shaping so the bundled SVG can render
+# `<text>` elements through a fontdb populated with system fonts.
+resvg = "0.45"
 tiny-skia = "0.11"
-usvg = { version = "0.45", default-features = false }
+usvg = "0.45"
 
 [profile.release]
 lto = "thin"
