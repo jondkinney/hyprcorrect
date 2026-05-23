@@ -1,8 +1,10 @@
 //! hyprcorrect — keyboard-driven desktop spelling and typo correction.
 //!
 //! Running `hyprcorrect` with no subcommand starts the daemon: it
-//! captures keystrokes and, when the trigger key is pressed, corrects
-//! the last typed word in place. See `DESIGN.md` at the repository root.
+//! registers the trigger chord with the GlobalShortcuts portal,
+//! captures keystrokes for the buffer, publishes a system-tray icon,
+//! and corrects the last typed word in place when the chord fires.
+//! See `DESIGN.md` at the repository root.
 
 use clap::{Parser, Subcommand};
 
@@ -34,7 +36,7 @@ fn main() {
         Some(Command::FixWord) => {
             eprintln!(
                 "hyprcorrect: run `hyprcorrect` with no subcommand — the daemon \
-                 corrects the last word when you press the trigger key"
+                 corrects the last word when you press the trigger chord"
             );
         }
         Some(Command::FixSentence) => not_yet("fix-sentence", "M4"),
@@ -43,12 +45,15 @@ fn main() {
     }
 }
 
-/// Run the background daemon: capture keystrokes, and on the trigger key
-/// correct the buffer's last word in place.
+/// Run the background daemon: register the portal trigger, capture
+/// keystrokes, publish the tray, and correct on the chord.
 #[cfg(target_os = "linux")]
 fn run_daemon() {
+    use std::sync::mpsc;
+    use std::thread;
+
     use hyprcorrect_core::{Buffer, OfflineProvider};
-    use hyprcorrect_platform::linux::capture::{self, Event};
+    use hyprcorrect_platform::linux::{capture, hotkey, tray};
 
     let provider = match OfflineProvider::en_us() {
         Ok(provider) => provider,
@@ -57,8 +62,22 @@ fn run_daemon() {
             return;
         }
     };
-    let events = match capture::start() {
-        Ok(events) => events,
+    let key_rx = match capture::start() {
+        Ok(rx) => rx,
+        Err(e) => {
+            eprintln!("hyprcorrect: {e}");
+            return;
+        }
+    };
+    let trigger_rx = match hotkey::start() {
+        Ok(rx) => rx,
+        Err(e) => {
+            eprintln!("hyprcorrect: {e}");
+            return;
+        }
+    };
+    let tray_rx = match tray::start() {
+        Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             return;
@@ -67,16 +86,57 @@ fn run_daemon() {
 
     let letter = std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| "F".to_string());
     println!(
-        "hyprcorrect {} — capturing. Type a word, then press \
-         Super+Ctrl+Shift+Alt+{letter} to correct it; Ctrl+C to quit.",
+        "hyprcorrect {} — running. Press Super+Ctrl+Shift+Alt+{letter} to correct \
+         the last word; quit from the tray menu.",
         hyprcorrect_core::version(),
     );
 
+    enum DaemonEvent {
+        Key(hyprcorrect_core::Key),
+        Trigger,
+        Quit,
+    }
+
+    // Merge the three sources into one channel so the main loop can
+    // process them in arrival order.
+    let (tx, rx) = mpsc::channel::<DaemonEvent>();
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            while let Ok(key) = key_rx.recv() {
+                if tx.send(DaemonEvent::Key(key)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            while trigger_rx.recv().is_ok() {
+                if tx.send(DaemonEvent::Trigger).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            // The tray currently emits only Quit; M3 adds more.
+            if matches!(tray_rx.recv(), Ok(tray::TrayEvent::Quit)) {
+                let _ = tx.send(DaemonEvent::Quit);
+            }
+        });
+    }
+    drop(tx); // the forwarder threads now own all senders
+
     let mut buffer = Buffer::default();
-    for event in events {
+    for event in rx {
         match event {
-            Event::Key(key) => buffer.push(key),
-            Event::Trigger => fix_last_word(&mut buffer, &provider),
+            DaemonEvent::Key(key) => buffer.push(key),
+            DaemonEvent::Trigger => fix_last_word(&mut buffer, &provider),
+            DaemonEvent::Quit => break,
         }
     }
 }
@@ -94,13 +154,13 @@ fn fix_last_word(
         return;
     };
     let Some(correction) = provider.check_text(&last.word).into_iter().next() else {
-        return; // the word is spelled correctly
+        return;
     };
     let Some(fix) = correction.suggestions.into_iter().next() else {
-        return; // no suggestion available
+        return;
     };
     let Some(edit) = plan_word_replacement(&last, &fix) else {
-        return; // already correct
+        return;
     };
     match emit::replace(edit.backspaces, &edit.insert) {
         Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
@@ -108,7 +168,6 @@ fn fix_last_word(
     }
 }
 
-/// The daemon is implemented for Linux first; macOS arrives in M2.
 #[cfg(not(target_os = "linux"))]
 fn run_daemon() {
     println!(

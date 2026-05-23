@@ -2,9 +2,14 @@
 //!
 //! Reads key events from every keyboard under `/dev/input` via `evdev`
 //! and translates them — honoring the keyboard layout and modifiers via
-//! `xkbcommon` — into [`Event`]s: buffer keystrokes, plus a trigger
-//! signal when the user presses the trigger chord
-//! (Super+Ctrl+Shift+Alt+F by default).
+//! `xkbcommon` — into [`Key`] values for the keystroke buffer.
+//!
+//! The trigger chord itself (Super+Ctrl+Shift+Alt+letter) is *not*
+//! delivered here — the `GlobalShortcuts` portal (`hotkey`) handles
+//! that at the compositor level. Capture only suppresses the would-be
+//! [`Key::Reset`] that the chord's letter press would otherwise emit,
+//! so the buffer survives the chord and the portal trigger has a word
+//! to fix.
 //!
 //! One OS thread per keyboard device runs for the life of the process;
 //! [`start`] returns the channel they feed.
@@ -20,16 +25,6 @@ use std::thread;
 use evdev::{Device, EventSummary, KeyCode};
 use hyprcorrect_core::Key;
 use xkbcommon::xkb;
-
-/// Something the capture layer observed: a keystroke for the buffer, or
-/// the user pressing the trigger chord to ask for a correction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
-    /// A keystroke to feed the keystroke buffer.
-    Key(Key),
-    /// The trigger chord was pressed — correct the buffer's last word.
-    Trigger,
-}
 
 /// An error starting keystroke capture.
 #[derive(Debug, thiserror::Error)]
@@ -47,33 +42,26 @@ pub enum CaptureError {
     Keymap,
 }
 
-/// The trigger chord — a letter keysym pressed while Ctrl, Alt, Shift,
-/// and Super are all held. The letter is configurable via
-/// `$HYPRCORRECT_TRIGGER`; the modifier set is fixed for M1 (M3 makes
-/// it user-configurable).
+/// The trigger chord — a letter pressed while Ctrl, Alt, Shift, and
+/// Super are all held. Capture uses this only to *suppress* the
+/// would-be Reset the chord's letter press would otherwise emit; the
+/// portal (`hotkey`) is what actually fires the trigger.
 #[derive(Debug, Clone, Copy)]
 struct TriggerSpec {
-    /// The letter keysym to match (the lowercase form for ASCII letters).
     sym: u32,
-    /// The opposite case of `sym` for ASCII letters — the chord holds
-    /// Shift, which toggles a keysym's case. `0` for non-letters.
     alt_sym: u32,
 }
 
 /// Start capturing keystrokes from every keyboard under `/dev/input`.
 ///
-/// Returns a channel of [`Event`]s. One detached OS thread per keyboard
-/// device feeds the channel for the life of the process; dropping the
-/// [`Receiver`] makes those threads exit.
-///
-/// The trigger chord is Super+Ctrl+Shift+Alt+letter; the letter is
-/// taken from `$HYPRCORRECT_TRIGGER` (an xkb keysym name, default `F`).
+/// Returns a channel of [`Key`] events. One detached OS thread per
+/// keyboard device feeds the channel for the life of the process;
+/// dropping the [`Receiver`] makes those threads exit.
 ///
 /// # Errors
 ///
-/// See [`CaptureError`] — no keyboards, missing `input`-group
-/// permission, or a layout that fails to compile.
-pub fn start() -> Result<Receiver<Event>, CaptureError> {
+/// See [`CaptureError`].
+pub fn start() -> Result<Receiver<Key>, CaptureError> {
     // Compile the keymap once, up front, so a broken layout fails fast
     // with a clear error rather than a silent no-events daemon.
     let keymap_text = {
@@ -106,11 +94,9 @@ pub fn start() -> Result<Receiver<Event>, CaptureError> {
 fn resolve_trigger() -> TriggerSpec {
     let name = std::env::var("HYPRCORRECT_TRIGGER").unwrap_or_else(|_| "F".to_string());
     let sym = xkb::keysym_from_name(&name, xkb::KEYSYM_CASE_INSENSITIVE).raw();
-    // The chord holds Shift, which toggles a keysym's case. Accept
-    // either case so the env var works the same however it's written.
     let alt_sym = match sym {
-        0x61..=0x7A => sym - 0x20, // lower → upper
-        0x41..=0x5A => sym + 0x20, // upper → lower
+        0x61..=0x7A => sym - 0x20,
+        0x41..=0x5A => sym + 0x20,
         _ => 0,
     };
     TriggerSpec { sym, alt_sym }
@@ -164,10 +150,10 @@ fn is_keyboard(device: &Device) -> bool {
         .is_some_and(|keys| keys.contains(KeyCode::KEY_A))
 }
 
-/// Read one device forever, translating key events into [`Event`]s and
+/// Read one device forever, translating key events into [`Key`]s and
 /// sending them to `tx`. Returns — ending the thread — when the device
 /// disappears or the receiver is dropped.
-fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: &Sender<Event>) {
+fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: &Sender<Key>) {
     // Each thread builds its own xkb state: Context/Keymap/State hold
     // raw pointers and are not Send, so they cannot cross the thread
     // boundary. The keymap text was already validated by `start`.
@@ -184,7 +170,7 @@ fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: 
 
     loop {
         let Ok(events) = device.fetch_events() else {
-            return; // device gone
+            return;
         };
         for input in events {
             let EventSummary::Key(_, code, value) = input.destructure() else {
@@ -192,12 +178,12 @@ fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: 
             };
             let keycode = xkb::Keycode::new(u32::from(code.0) + 8);
 
-            // value: 0 = release, 1 = press, 2 = auto-repeat. Emit on
-            // press and repeat, reading the key from the *current* state
-            // before this key updates it (the xkbcommon convention).
+            // value: 0 = release, 1 = press, 2 = auto-repeat. Read the
+            // key from the *current* state, before this key updates it
+            // (the xkbcommon convention).
             if value != 0
-                && let Some(event) = translate(&state, keycode, trigger, value == 2)
-                && tx.send(event).is_err()
+                && let Some(key) = translate(&state, keycode, trigger)
+                && tx.send(key).is_err()
             {
                 return; // receiver dropped
             }
@@ -216,44 +202,35 @@ fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: 
     }
 }
 
-/// Translate a pressed key into an [`Event`], or `None` to ignore it.
-fn translate(
-    state: &xkb::State,
-    keycode: xkb::Keycode,
-    trigger: TriggerSpec,
-    is_repeat: bool,
-) -> Option<Event> {
+/// Translate a pressed key into a [`Key`] for the buffer, or `None` to
+/// ignore it.
+fn translate(state: &xkb::State, keycode: xkb::Keycode, trigger: TriggerSpec) -> Option<Key> {
     let sym = state.key_get_one_sym(keycode).raw();
 
     // Modifier keys themselves are never buffered and never reset —
-    // they only affect xkb state (which `read_device` updates after
-    // this call). Without this guard, pressing the chord's modifiers
-    // in sequence — Shift, then Ctrl-with-Shift-held, then Alt with
-    // Ctrl held … — would see the second-and-onward presses as
-    // "shortcut while Ctrl held" and reset the buffer before the
-    // chord's letter ever arrives.
+    // they only affect xkb state, which `read_device` updates after
+    // this call.
     if is_modifier_keysym(sym) {
         return None;
     }
 
-    // The trigger chord — letter (either case) + Ctrl + Alt + Shift + Super.
+    // The trigger chord's letter press: ignored here. The portal fires
+    // the trigger separately; suppressing this prevents the buffer
+    // from being reset right when the user is about to ask for a fix.
     let letter_match = trigger.sym != 0
         && (sym == trigger.sym || (trigger.alt_sym != 0 && sym == trigger.alt_sym));
     if letter_match && is_trigger_chord(state) {
-        // A held chord auto-repeats; fire it once, on the press.
-        return if is_repeat {
-            None
-        } else {
-            Some(Event::Trigger)
-        };
+        return None;
     }
 
-    // A key pressed while Ctrl/Alt/Super is held is a shortcut, not
-    // typed text, and may have moved the caret or edited — reset.
+    // A non-modifier key pressed while Ctrl/Alt/Super is held is a
+    // shortcut, not typed text — and it may have moved the caret or
+    // edited. Reset.
     if has_action_modifier(state) {
-        return Some(Event::Key(Key::Reset));
+        return Some(Key::Reset);
     }
-    classify(sym, &state.key_get_utf8(keycode)).map(Event::Key)
+
+    classify(sym, &state.key_get_utf8(keycode))
 }
 
 /// `true` if Ctrl, Alt, Shift, and Super are all currently held — the
@@ -289,9 +266,6 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         KEY_Insert, KEY_KP_Enter, KEY_Left, KEY_Linefeed, KEY_Next, KEY_Prior, KEY_Return,
         KEY_Right, KEY_Tab, KEY_Up,
     };
-    // Caret-moving / context-changing keysyms — they invalidate the
-    // buffer. Compared as values, not match patterns: xkbcommon's
-    // constant names are mixed-case and would trip `non_upper_case_globals`.
     const RESET_KEYS: [u32; 16] = [
         KEY_Return,
         KEY_KP_Enter,
@@ -343,8 +317,7 @@ mod tests {
 
     #[test]
     fn a_printable_key_maps_to_a_char() {
-        // 0x0061 / 0x0020 are the keysyms for 'a' and space; classify
-        // takes the character from the UTF-8 argument regardless.
+        // 0x0061 / 0x0020 are the keysyms for 'a' and space.
         assert_eq!(classify(0x0061, "a"), Some(Key::Char('a')));
         assert_eq!(classify(0x0020, " "), Some(Key::Char(' ')));
     }

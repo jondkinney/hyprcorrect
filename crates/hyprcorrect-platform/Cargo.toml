@@ -17,3 +17,7 @@ thiserror.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
 xkbcommon = "0.9.0"
+ashpd = { version = "0.13", features = ["global_shortcuts"] }
+ksni = { version = "0.3", features = ["blocking"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+futures-util = "0.3"
