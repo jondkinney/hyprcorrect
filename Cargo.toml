@@ -34,6 +34,11 @@ toml = "0.8"
 directories = "5"
 keyring = { version = "3", features = ["linux-native", "apple-native", "windows-native"] }
 
+# HTTP — used by the LLM provider (Anthropic Messages API, M4) and the
+# LanguageTool HTTP provider (M5). `ureq` is sync + small (no tokio).
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
 # GUI.
 eframe = { version = "0.32", default-features = false, features = [
     "default_fonts",

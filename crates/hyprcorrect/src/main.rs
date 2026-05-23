@@ -65,6 +65,8 @@ fn run_daemon() {
         eprintln!("hyprcorrect: could not load config ({e}) — using defaults");
         Config::default()
     });
+    let mut llm = build_llm(&initial_config);
+    let mut smart_provider_id = initial_config.providers.smart;
     let mut chord = match effective_chord(&initial_config) {
         Ok(c) => c,
         Err(e) => {
@@ -216,7 +218,9 @@ fn run_daemon() {
                     && let Some(buffer) = buffers.get_mut(addr)
                 {
                     match hyprcorrect_core::runtime::read_action().as_str() {
-                        "sentence" => fix_last_sentence(buffer, &provider),
+                        "sentence" => {
+                            fix_last_sentence(buffer, &provider, smart_provider_id, llm.as_ref());
+                        }
                         _ => fix_last_word(buffer, &provider),
                     }
                 }
@@ -251,6 +255,8 @@ fn run_daemon() {
                             }
                             sentence_chord = new_sentence_chord;
                             blocklist = build_blocklist(&new_config);
+                            llm = build_llm(&new_config);
+                            smart_provider_id = new_config.providers.smart;
                             eprintln!("hyprcorrect: config reloaded");
                         }
                         Err(e) => {
@@ -398,20 +404,43 @@ fn fix_last_word(
     }
 }
 
-/// Correct the buffer's last sentence in place. Runs the offline
-/// provider over the whole sentence and applies each correction's
-/// top suggestion; if no corrections fire the buffer is left alone.
+/// Try to build the LLM provider from the current config. Returns
+/// `None` if the user hasn't picked the LLM provider, hasn't set an
+/// API key, or has configured an unsupported backend — all
+/// non-fatal: the daemon just falls back to the offline provider.
+#[cfg(target_os = "linux")]
+fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmProvider> {
+    use hyprcorrect_core::{LlmProvider, ProviderId};
+    if config.providers.smart != ProviderId::Llm {
+        return None;
+    }
+    match LlmProvider::from_config(&config.providers.llm) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("hyprcorrect: LLM provider unavailable — {e}");
+            None
+        }
+    }
+}
+
+/// Correct the buffer's last sentence in place. If the user routed
+/// the "smart" path to the LLM and the provider initialized cleanly,
+/// the sentence goes through the LLM; otherwise (or on LLM failure)
+/// we fall back to the offline spellbook provider so the trigger
+/// never silently no-ops.
 #[cfg(target_os = "linux")]
 fn fix_last_sentence(
     buffer: &mut hyprcorrect_core::Buffer,
     provider: &hyprcorrect_core::OfflineProvider,
+    smart: hyprcorrect_core::ProviderId,
+    llm: Option<&hyprcorrect_core::LlmProvider>,
 ) {
     use hyprcorrect_platform::linux::emit;
 
     let Some(last) = buffer.last_sentence() else {
         return;
     };
-    let corrected = apply_corrections(&last.sentence, provider);
+    let corrected = correct_sentence(&last.sentence, smart, llm, provider);
     if corrected == last.sentence {
         return;
     }
@@ -420,6 +449,33 @@ fn fix_last_sentence(
     match emit::replace(backspaces, &insert) {
         Ok(()) => buffer.apply(backspaces, &insert),
         Err(e) => eprintln!("hyprcorrect: {e}"),
+    }
+}
+
+/// Route the sentence to whichever provider the user configured for
+/// the "smart" path. LanguageTool stays on the offline fallback for
+/// now (M5 wires it up). On LLM failure (network, bad key) we drop
+/// back to the offline path so the chord never silently no-ops.
+#[cfg(target_os = "linux")]
+fn correct_sentence(
+    text: &str,
+    smart: hyprcorrect_core::ProviderId,
+    llm: Option<&hyprcorrect_core::LlmProvider>,
+    spell: &hyprcorrect_core::OfflineProvider,
+) -> String {
+    use hyprcorrect_core::ProviderId;
+    match smart {
+        ProviderId::Llm => match llm {
+            Some(llm) => match llm.rewrite(text) {
+                Ok(corrected) => corrected,
+                Err(e) => {
+                    eprintln!("hyprcorrect: LLM call failed ({e}) — falling back to spellbook");
+                    apply_corrections(text, spell)
+                }
+            },
+            None => apply_corrections(text, spell),
+        },
+        ProviderId::Spellbook | ProviderId::LanguageTool => apply_corrections(text, spell),
     }
 }
 

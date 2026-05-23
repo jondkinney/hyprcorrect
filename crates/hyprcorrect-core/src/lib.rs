@@ -7,6 +7,7 @@
 pub mod buffer;
 pub mod chord;
 pub mod config;
+pub mod llm;
 pub mod providers;
 pub mod replace;
 pub mod runtime;
@@ -18,6 +19,7 @@ pub use config::{
     Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,
     Providers,
 };
+pub use llm::{LlmError, LlmProvider};
 pub use providers::{Context, Correction, CorrectionProvider, OfflineProvider};
 pub use replace::{Edit, plan_word_replacement};
 

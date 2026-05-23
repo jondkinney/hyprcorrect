@@ -18,3 +18,7 @@ serde.workspace = true
 toml.workspace = true
 directories.workspace = true
 keyring.workspace = true
+
+# HTTP for network correction providers (LLM, LanguageTool).
+ureq.workspace = true
+serde_json.workspace = true
