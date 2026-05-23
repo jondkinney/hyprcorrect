@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod config;
 pub mod providers;
 pub mod replace;
+pub mod runtime;
 pub mod secrets;
 
 pub use buffer::{Buffer, Key, LastWord};

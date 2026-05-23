@@ -69,6 +69,10 @@ fn run_daemon() {
     let mut blocklist = build_blocklist(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
 
+    if let Err(e) = hyprcorrect_core::runtime::write_self_pid() {
+        eprintln!("hyprcorrect: could not write PID file ({e}) — prefs reload won't work");
+    }
+
     let provider = match OfflineProvider::en_us() {
         Ok(provider) => provider,
         Err(e) => {
@@ -247,8 +251,9 @@ fn run_daemon() {
     }
     drop(tray_handle); // tear down the SNI service on exit
 
-    // Clean up so the bind doesn't outlive the daemon.
+    // Clean up so the bind and PID file don't outlive the daemon.
     let _ = hotkey::uninstall_bind(&trigger_letter);
+    hyprcorrect_core::runtime::clear_pid();
 }
 
 /// Resolve the trigger letter the daemon should bind. `$HYPRCORRECT_TRIGGER`
