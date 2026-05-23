@@ -68,20 +68,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "ashpd"
-version = "0.13.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "340e0f6bf7f9ee78549c61454f1460a3ed97c011902ee76b58301bbc6d502a32"
-dependencies = [
- "enumflags2",
- "futures-util",
- "getrandom",
- "serde",
- "tokio",
- "zbus",
-]
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,13 +452,11 @@ dependencies = [
 name = "hyprcorrect-platform"
 version = "0.1.0"
 dependencies = [
- "ashpd",
  "evdev",
- "futures-util",
  "hyprcorrect-core",
  "ksni",
+ "signal-hook",
  "thiserror",
- "tokio",
  "xkbcommon",
 ]
 
@@ -841,6 +825,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
 ]
 
 [[package]]
