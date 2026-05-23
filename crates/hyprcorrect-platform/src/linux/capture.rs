@@ -225,6 +225,17 @@ fn translate(
 ) -> Option<Event> {
     let sym = state.key_get_one_sym(keycode).raw();
 
+    // Modifier keys themselves are never buffered and never reset —
+    // they only affect xkb state (which `read_device` updates after
+    // this call). Without this guard, pressing the chord's modifiers
+    // in sequence — Shift, then Ctrl-with-Shift-held, then Alt with
+    // Ctrl held … — would see the second-and-onward presses as
+    // "shortcut while Ctrl held" and reset the buffer before the
+    // chord's letter ever arrives.
+    if is_modifier_keysym(sym) {
+        return None;
+    }
+
     // The trigger chord — letter (either case) + Ctrl + Alt + Shift + Super.
     let letter_match = trigger.sym != 0
         && (sym == trigger.sym || (trigger.alt_sym != 0 && sym == trigger.alt_sym));
@@ -259,6 +270,13 @@ fn is_trigger_chord(state: &xkb::State) -> bool {
 fn has_action_modifier(state: &xkb::State) -> bool {
     let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
     active(xkb::MOD_NAME_CTRL) || active(xkb::MOD_NAME_ALT) || active(xkb::MOD_NAME_LOGO)
+}
+
+/// `true` if `sym` is one of the modifier keysyms — Shift, Control,
+/// Caps Lock, Meta, Alt, Super, or Hyper (left or right). xkb assigns
+/// these the contiguous range `0xffe1..=0xffee`.
+fn is_modifier_keysym(sym: u32) -> bool {
+    (0xffe1..=0xffee).contains(&sym)
 }
 
 /// Classify an xkb keysym and the UTF-8 it produces into a buffer
