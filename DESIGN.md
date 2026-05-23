@@ -107,7 +107,7 @@ with a per-OS backend:
 |---|---|---|---|
 | Key capture (observe-only) | `evdev` `/dev/input` + `xkbcommon` for keycode→char | `CGEventTap` (listen) | `WH_KEYBOARD_LL` |
 | Synthetic input | `virtual-keyboard-v1` protocol (wtype-style) | `CGEvent` + unicode string | `SendInput` |
-| Global hotkey | `ashpd` GlobalShortcuts portal | `RegisterEventHotKey` (Carbon) | `RegisterHotKey` |
+| Global hotkey | Hyprland `hyprctl keyword bind` + `SIGUSR1` (today); `ashpd` GlobalShortcuts portal once compositor auto-bind matures | `RegisterEventHotKey` (Carbon) | `RegisterHotKey` |
 | Focused app | Hyprland IPC (`activewindow`) | `NSWorkspace.frontmostApplication` | `GetForegroundWindow` |
 | Tray / menu bar | `ksni` | `NSStatusItem` | — |
 
@@ -123,19 +123,24 @@ Notes:
   compositors. `ydotool`/uinput is a documented fallback for non-wlroots.
   `enigo` is evaluated as a single cross-platform emulation crate; if its
   Wayland path is insufficient we keep the direct protocol impl.
-- **Hotkeys:** the `ashpd` GlobalShortcuts portal is the primary,
-  in-app-configurable path (`vernier` already uses this). Power users can
-  instead bind a key in `hyprland.conf` to signal the daemon; the GUI's
-  hotkey picker writes whichever mechanism is active.
+- **Hotkeys:** on Hyprland today the daemon adds an inline
+  `hyprctl keyword bind` whose `exec` raises `SIGUSR1` on itself —
+  Hyprland intercepts the chord so terminals never see it, and the
+  daemon manages its own keybind (no `hyprland.conf` edit required).
+  The `ashpd` GlobalShortcuts portal is the planned cross-compositor
+  route; `xdg-desktop-portal-hyprland` 1.3 doesn't yet honor
+  `preferred_trigger`, so we'll revisit it together with other
+  compositors. The GUI's hotkey picker writes whichever mechanism is
+  active.
 - **macOS** uses the OS-provided unicode for both capture
   (`CGEventKeyboardGetUnicodeString`) and typing
   (`CGEventKeyboardSetUnicodeString`), so no manual keymap handling.
   Needs Accessibility + Input Monitoring (TCC); the daemon
   detects/prompts (`mousehop`'s TCC probe/watch are the pattern).
 - All backends use **permissively-licensed crates only** (`evdev`,
-  `xkbcommon`, `wayland-client`, `ashpd`, `objc2-*`, `windows`, `enigo`).
-  No lan-mouse/GPL-derived code — hyprcorrect is MIT/Apache like
-  `vernier`.
+  `xkbcommon`, `wayland-client`, `signal-hook`, `ksni`, `ashpd`,
+  `objc2-*`, `windows`, `enigo`). No lan-mouse/GPL-derived code —
+  hyprcorrect is MIT/Apache like `vernier`.
 
 ## The keystroke buffer
 
@@ -253,7 +258,7 @@ is a borderless `NSPanel`.
 ```toml
 # config.toml sketch
 [hotkeys]
-fix-last-word = "..."          # portal / Carbon binding descriptor
+fix-last-word = "..."          # hyprctl chord / Carbon binding descriptor
 review        = "..."
 
 [providers]
@@ -307,7 +312,7 @@ Wayland protocols.
 | Milestone | Deliverable |
 |---|---|
 | **M0 — Scaffold** | `git init`; 4-crate workspace, edition 2024, shared deps, `rust-toolchain.toml`, dual license, CI + `release-plz` skeleton. Mirrors `vernier`. |
-| **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → buffer; offline spell-check provider (spellbook); virtual-keyboard emulation; one hardcoded portal hotkey; `fix-last-word` working end-to-end on Hyprland incl. a terminal. No GUI. Proves the riskiest path. |
+| **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → per-window buffers driven by Hyprland focus events; offline spell-check provider (spellbook); `wtype`-based synthetic input; one hyprctl-bound hotkey signaling `SIGUSR1`; ksni tray; `fix-last-word` working end-to-end on Hyprland incl. terminals. No GUI. Proves the riskiest path. |
 | **M2 — macOS parity** | `CGEventTap` capture, `CGEvent` emulation, Carbon hotkey, TCC permission flow. `fix-last-word` on macOS. Core now runs on both. |
 | **M3 — Config GUI + tray** | egui prefs (hotkeys/providers/behavior/privacy), `config.toml`, `keyring`, `ksni`/`NSStatusItem` tray, pause control. Hotkeys user-configurable. |
 | **M4 — Review popup + sentence mode** | egui popup with keyboard nav; `fix-last-sentence`; multi-word review/apply; LLM provider wired in. |

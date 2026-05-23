@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Per-OS backends (evdev, wayland-client, xkbcommon, ashpd, objc2-*, …)
-# are added under [target.'cfg(...)'.dependencies] from milestone M1.
+# Per-OS backends (evdev, xkbcommon, signal-hook, ksni, objc2-*, …) are
+# added under [target.'cfg(...)'.dependencies] from milestone M1.
 [dependencies]
 hyprcorrect-core.workspace = true
 thiserror.workspace = true

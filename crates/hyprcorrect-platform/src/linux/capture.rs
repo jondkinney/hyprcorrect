@@ -5,11 +5,11 @@
 //! `xkbcommon` — into [`Key`] values for the keystroke buffer.
 //!
 //! The trigger chord itself (Super+Ctrl+Shift+Alt+letter) is *not*
-//! delivered here — the `GlobalShortcuts` portal (`hotkey`) handles
-//! that at the compositor level. Capture only suppresses the would-be
-//! [`Key::Reset`] that the chord's letter press would otherwise emit,
-//! so the buffer survives the chord and the portal trigger has a word
-//! to fix.
+//! delivered here — Hyprland intercepts it (via the inline keybind set
+//! up by `hotkey`) and signals the daemon over `SIGUSR1`. Capture only
+//! suppresses the would-be [`Key::Reset`] that the chord's letter
+//! press would otherwise emit, so the buffer survives the chord and
+//! the trigger has a word to fix.
 //!
 //! One OS thread per keyboard device runs for the life of the process;
 //! [`start`] returns the channel they feed.
@@ -45,7 +45,7 @@ pub enum CaptureError {
 /// The trigger chord — a letter pressed while Ctrl, Alt, Shift, and
 /// Super are all held. Capture uses this only to *suppress* the
 /// would-be Reset the chord's letter press would otherwise emit; the
-/// portal (`hotkey`) is what actually fires the trigger.
+/// Hyprland keybind in `hotkey` is what actually fires the trigger.
 #[derive(Debug, Clone, Copy)]
 struct TriggerSpec {
     sym: u32,
@@ -214,9 +214,10 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, trigger: TriggerSpec) ->
         return None;
     }
 
-    // The trigger chord's letter press: ignored here. The portal fires
-    // the trigger separately; suppressing this prevents the buffer
-    // from being reset right when the user is about to ask for a fix.
+    // The trigger chord's letter press: ignored here. The Hyprland
+    // keybind fires the trigger separately (via SIGUSR1); suppressing
+    // this prevents the buffer from being reset right when the user
+    // is about to ask for a fix.
     let letter_match = trigger.sym != 0
         && (sym == trigger.sym || (trigger.alt_sym != 0 && sym == trigger.alt_sym));
     if letter_match && is_trigger_chord(state) {
