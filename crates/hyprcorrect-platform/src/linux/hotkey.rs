@@ -1,13 +1,21 @@
 //! Global trigger via a Hyprland inline keybind + signals.
 //!
-//! At startup the daemon adds an inline Hyprland keybind via
-//! `hyprctl keyword bind = …, exec, pkill -SIGUSR1 -x hyprcorrect`.
-//! Hyprland intercepts the chord — terminals and other focused apps
-//! never see it — and runs the `pkill`, which raises `SIGUSR1` on the
-//! daemon. `SIGUSR1` arrives on the channel as
-//! [`HotkeyEvent::Trigger`]; `SIGHUP` arrives as
-//! [`HotkeyEvent::Reload`] and is the prefs window's signal to the
-//! running daemon that the config has changed.
+//! At startup the daemon adds an inline Hyprland keybind whose `exec`
+//! reads the daemon's PID file and `kill -USR1`s that PID
+//! specifically. Hyprland intercepts the chord — terminals and other
+//! focused apps never see it — and the daemon catches the signal as
+//! [`HotkeyEvent::Trigger`].
+//!
+//! The PID-file-based targeting is deliberate: `pkill -x hyprcorrect`
+//! would match the prefs subprocess too (it shares the daemon's
+//! binary name and therefore its `/proc/PID/comm`) and silently
+//! terminate the prefs window when the user pressed the chord. The
+//! file is written by the daemon at startup and removed on shutdown
+//! — see [`hyprcorrect_core::runtime`].
+//!
+//! `SIGHUP` arrives as [`HotkeyEvent::Reload`] and is the prefs
+//! window's signal to the running daemon that the config has
+//! changed.
 //!
 //! Hyprland-specific. The cross-compositor route is the
 //! `GlobalShortcuts` portal (DESIGN.md); that has its own auto-bind
@@ -17,7 +25,7 @@
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use hyprcorrect_core::Chord;
+use hyprcorrect_core::{Chord, runtime};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::iterator::Signals;
 
@@ -62,10 +70,16 @@ pub enum HotkeyError {
 /// See [`HotkeyError`].
 pub fn install_bind(chord: &Chord) -> Result<(), HotkeyError> {
     let _ = uninstall_bind(chord); // dedup any stale prior bind
+    // Hyprland's `exec` dispatcher already runs the command through
+    // `sh -c`, so we lean on shell substitution to read the PID at
+    // chord-press time — that way the bind survives the daemon
+    // exiting and restarting (the new PID is in the file by then).
+    let pid_path = runtime::pid_path();
     let bind_value = format!(
-        "{mods}, {key}, exec, pkill -SIGUSR1 -x hyprcorrect",
+        "{mods}, {key}, exec, kill -USR1 $(cat \"{pid_path}\")",
         mods = chord.hyprland_modifiers(),
         key = chord.hyprland_key(),
+        pid_path = pid_path.display(),
     );
     let output = Command::new("hyprctl")
         .args(["keyword", "bind", &bind_value])
