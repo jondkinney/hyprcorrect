@@ -1,56 +1,77 @@
 //! System tray (ksni-based) for the hyprcorrect daemon.
 //!
-//! Publishes a StatusNotifierItem with a small menu. Menu activations
-//! arrive on the returned channel.
+//! Publishes a StatusNotifierItem with a small menu: Pause/Resume,
+//! Open Preferences…, Quit. Menu activations arrive on the returned
+//! channel. The pause state is shared with the daemon via an
+//! `Arc<AtomicBool>` — the tray reads it live to choose its icon,
+//! label, and SNI status — and [`TrayHandle::refresh`] pushes a
+//! property-change so SNI hosts pick up the new state immediately.
 
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 /// A menu event from the tray.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
-    /// The user picked "Quit" from the tray menu.
+    /// The user picked "Pause" or "Resume" — toggle the pause flag.
+    TogglePause,
+    /// The user picked "Open Preferences…".
+    OpenPrefs,
+    /// The user picked "Quit".
     Quit,
 }
 
 /// An error starting the tray.
 #[derive(Debug, thiserror::Error)]
 pub enum TrayError {
-    /// Could not spawn the tray thread.
-    #[error("could not spawn tray thread: {0}")]
-    Thread(String),
-    /// Could not start the ksni service (D-Bus / SNI publication).
+    /// The ksni service (D-Bus / SNI publication) could not start.
     #[error("ksni: {0}")]
     Ksni(String),
 }
 
-/// Start the tray icon. Returns a receiver of menu activations.
+/// A live handle to the running tray. Holding it keeps the SNI
+/// service registered; dropping it tears it down.
+pub struct TrayHandle {
+    inner: ksni::blocking::Handle<HyprcorrectTray>,
+}
+
+impl TrayHandle {
+    /// Re-publish the tray's properties so SNI hosts pick up changes
+    /// to pause state immediately. Cheap: the closure is a no-op —
+    /// state lives in the shared `Arc<AtomicBool>`.
+    pub fn refresh(&self) {
+        self.inner.update(|_| {});
+    }
+}
+
+/// Start the tray. Returns a [`TrayHandle`] (the caller must hold
+/// it for the life of the daemon) and a receiver of menu activations.
+///
+/// `paused` is the shared pause flag; the tray reads it live and
+/// changes its icon / label / SNI status to reflect it.
 ///
 /// # Errors
 ///
-/// See [`TrayError`] — thread spawn or ksni service failure.
-pub fn start() -> Result<Receiver<TrayEvent>, TrayError> {
-    let (tx, rx) = mpsc::channel();
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), TrayError>>(1);
-    let ready_tx_for_thread = ready_tx.clone();
+/// See [`TrayError`].
+pub fn start(paused: Arc<AtomicBool>) -> Result<(TrayHandle, Receiver<TrayEvent>), TrayError> {
+    use ksni::blocking::TrayMethods;
 
-    std::thread::Builder::new()
-        .name("hyprcorrect-tray".into())
-        .spawn(move || {
-            if let Err(e) = run_tray(tx, &ready_tx_for_thread) {
-                let _ = ready_tx_for_thread.send(Err(e));
-            }
-        })
-        .map_err(|e| TrayError::Thread(e.to_string()))?;
-
-    ready_rx
-        .recv()
-        .map_err(|_| TrayError::Thread("tray init failed".into()))??;
-
-    Ok(rx)
+    let (events_tx, events_rx) = mpsc::channel();
+    let tray = HyprcorrectTray { events_tx, paused };
+    let inner = tray.spawn().map_err(|e| TrayError::Ksni(e.to_string()))?;
+    Ok((TrayHandle { inner }, events_rx))
 }
 
 struct HyprcorrectTray {
     events_tx: Sender<TrayEvent>,
+    paused: Arc<AtomicBool>,
+}
+
+impl HyprcorrectTray {
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
 }
 
 impl ksni::Tray for HyprcorrectTray {
@@ -66,24 +87,59 @@ impl ksni::Tray for HyprcorrectTray {
         ksni::Category::ApplicationStatus
     }
 
+    fn status(&self) -> ksni::Status {
+        if self.is_paused() {
+            ksni::Status::Passive
+        } else {
+            ksni::Status::Active
+        }
+    }
+
     fn icon_name(&self) -> String {
-        // A built-in theme icon for now — bundling a proper hyprcorrect
-        // icon (SVG rendered via tiny-skia, vernier-style) is M3 polish.
+        // Bundling a proper hyprcorrect icon (SVG → tiny-skia,
+        // vernier-style) is M3-ish polish. For now, use the theme's
+        // spelling-check icon and lean on `Status::Passive` to indicate
+        // the paused state.
         "tools-check-spelling".to_string()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
+        let suffix = if self.is_paused() {
+            "currently paused"
+        } else {
+            "press Super+Ctrl+Shift+Alt+F to correct"
+        };
         ksni::ToolTip {
             title: "hyprcorrect".into(),
-            description: "Press Super+Ctrl+Shift+Alt+F to correct the last word".into(),
+            description: format!("hyprcorrect — {suffix}"),
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
         }
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::MenuItem;
         use ksni::menu::StandardItem;
+        let pause_label = if self.is_paused() { "Resume" } else { "Pause" };
         vec![
+            StandardItem {
+                label: pause_label.into(),
+                activate: Box::new(|this: &mut HyprcorrectTray| {
+                    let _ = this.events_tx.send(TrayEvent::TogglePause);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Open Preferences…".into(),
+                activate: Box::new(|this: &mut HyprcorrectTray| {
+                    let _ = this.events_tx.send(TrayEvent::OpenPrefs);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|this: &mut HyprcorrectTray| {
@@ -94,19 +150,4 @@ impl ksni::Tray for HyprcorrectTray {
             .into(),
         ]
     }
-}
-
-fn run_tray(
-    events_tx: Sender<TrayEvent>,
-    ready_tx: &SyncSender<Result<(), TrayError>>,
-) -> Result<(), TrayError> {
-    use ksni::blocking::TrayMethods;
-
-    let tray = HyprcorrectTray { events_tx };
-    let _handle = tray.spawn().map_err(|e| TrayError::Ksni(e.to_string()))?;
-    let _ = ready_tx.send(Ok(()));
-
-    // Keep the tray handle alive for the life of the process.
-    std::thread::park();
-    Ok(())
 }

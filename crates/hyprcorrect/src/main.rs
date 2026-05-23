@@ -53,6 +53,8 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn run_daemon() {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
 
@@ -65,6 +67,7 @@ fn run_daemon() {
     });
     let mut trigger_letter = effective_trigger_letter(&initial_config);
     let mut blocklist = build_blocklist(&initial_config);
+    let paused = Arc::new(AtomicBool::new(false));
 
     let provider = match OfflineProvider::en_us() {
         Ok(provider) => provider,
@@ -99,8 +102,8 @@ fn run_daemon() {
             return;
         }
     };
-    let tray_rx = match tray::start() {
-        Ok(rx) => rx,
+    let (tray_handle, tray_rx) = match tray::start(paused.clone()) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
             let _ = hotkey::uninstall_bind(&trigger_letter);
@@ -118,7 +121,7 @@ fn run_daemon() {
         Key(hyprcorrect_core::Key),
         Signal(hotkey::HotkeyEvent),
         Focus(focus::FocusEvent),
-        Quit,
+        Tray(tray::TrayEvent),
     }
 
     // Merge all four sources into one channel so the main loop can
@@ -157,9 +160,10 @@ fn run_daemon() {
     {
         let tx = tx.clone();
         thread::spawn(move || {
-            // The tray currently emits only Quit; M3 adds more.
-            if matches!(tray_rx.recv(), Ok(tray::TrayEvent::Quit)) {
-                let _ = tx.send(DaemonEvent::Quit);
+            while let Ok(event) = tray_rx.recv() {
+                if tx.send(DaemonEvent::Tray(event)).is_err() {
+                    break;
+                }
             }
         });
     }
@@ -174,12 +178,16 @@ fn run_daemon() {
     for event in rx {
         match event {
             DaemonEvent::Key(key) => {
-                if !current_blocked && let Some(addr) = current_address.as_deref() {
+                if !paused.load(Ordering::Relaxed)
+                    && !current_blocked
+                    && let Some(addr) = current_address.as_deref()
+                {
                     buffers.entry(addr.to_string()).or_default().push(key);
                 }
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Trigger) => {
-                if !current_blocked
+                if !paused.load(Ordering::Relaxed)
+                    && !current_blocked
                     && let Some(addr) = current_address.as_deref()
                     && let Some(buffer) = buffers.get_mut(addr)
                 {
@@ -223,9 +231,21 @@ fn run_daemon() {
                     current_blocked = false;
                 }
             }
-            DaemonEvent::Quit => break,
+            DaemonEvent::Tray(tray::TrayEvent::TogglePause) => {
+                let was_paused = paused.fetch_xor(true, Ordering::Relaxed);
+                tray_handle.refresh();
+                eprintln!(
+                    "hyprcorrect: {}",
+                    if was_paused { "resumed" } else { "paused" }
+                );
+            }
+            DaemonEvent::Tray(tray::TrayEvent::OpenPrefs) => {
+                spawn_prefs_window();
+            }
+            DaemonEvent::Tray(tray::TrayEvent::Quit) => break,
         }
     }
+    drop(tray_handle); // tear down the SNI service on exit
 
     // Clean up so the bind doesn't outlive the daemon.
     let _ = hotkey::uninstall_bind(&trigger_letter);
@@ -247,6 +267,28 @@ fn build_blocklist(config: &hyprcorrect_core::Config) -> std::collections::HashS
         .iter()
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// Launch `hyprcorrect prefs` as a detached subprocess (no stdio).
+/// Fire-and-forget; if a prefs window is already running, the new
+/// process short-circuits and focuses the existing one (the prefs
+/// entry handles the singleton lock).
+#[cfg(target_os = "linux")]
+fn spawn_prefs_window() {
+    use std::process::{Command, Stdio};
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("hyprcorrect: cannot find own executable to launch prefs");
+        return;
+    };
+    let result = Command::new(&exe)
+        .arg("prefs")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Err(e) = result {
+        eprintln!("hyprcorrect: could not launch prefs window: {e}");
+    }
 }
 
 /// Swap the Hyprland keybind from `old_letter` to `new_letter`. If
