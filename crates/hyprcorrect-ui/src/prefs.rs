@@ -786,29 +786,13 @@ fn install_glyph_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut shortcut_chain: Vec<String> = Vec::new();
 
-    // -- Omarchy / Hyprland logo at U+E900 ----------------------------
-    let mut omarchy_candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut p = std::path::PathBuf::from(home);
-        p.push(".local/share/fonts/omarchy.ttf");
-        omarchy_candidates.push(p);
-    }
-    omarchy_candidates.push("/usr/share/fonts/omarchy.ttf".into());
-    for path in omarchy_candidates {
-        if let Ok(bytes) = std::fs::read(&path) {
-            fonts.font_data.insert(
-                "omarchy".into(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            shortcut_chain.push("omarchy".into());
-            OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
-            break;
-        }
-    }
-
-    // -- Sans font with the standard modifier glyphs ------------------
-    // Adwaita Sans and DejaVu Sans both ship `⌃ ⇧ ⌥ ⌘`; Noto Sans
-    // Symbols is a guaranteed fallback. Take the first that loads.
+    // -- Highest priority: a sans font with the modifier glyphs -------
+    // Adwaita Sans and DejaVu Sans both ship `⌃ ⇧ ⌥ ⌘`; Noto Sans is
+    // a guaranteed fallback. Take the first that loads. This font
+    // also covers ASCII; coming first prevents a partial-coverage
+    // font like Omarchy (which has cmap entries for ASCII letters
+    // pointing at empty glyphs) from eating characters from the
+    // chip's text.
     let symbol_paths = [
         // Linux
         "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
@@ -833,9 +817,33 @@ fn install_glyph_fonts(ctx: &egui::Context) {
         }
     }
 
-    // -- Always-available fallback to whatever egui shipped -----------
+    // -- Then the egui defaults ---------------------------------------
     if let Some(default_chain) = fonts.families.get(&egui::FontFamily::Proportional) {
         shortcut_chain.extend(default_chain.iter().cloned());
+    }
+
+    // -- Last: Omarchy, used only for codepoints no earlier font has
+    // — that's the Hyprland logo at U+E900. We push it last because
+    // Omarchy's cmap claims most ASCII codepoints with empty glyphs,
+    // so putting it earlier would silently drop letters like 'c' / 'o'
+    // from the chip's text.
+    let mut omarchy_candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".local/share/fonts/omarchy.ttf");
+        omarchy_candidates.push(p);
+    }
+    omarchy_candidates.push("/usr/share/fonts/omarchy.ttf".into());
+    for path in omarchy_candidates {
+        if let Ok(bytes) = std::fs::read(&path) {
+            fonts.font_data.insert(
+                "omarchy".into(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            shortcut_chain.push("omarchy".into());
+            OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
+            break;
+        }
     }
 
     fonts
