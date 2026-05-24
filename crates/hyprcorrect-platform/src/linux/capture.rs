@@ -60,9 +60,11 @@ struct TriggerSpec {
 
 /// Start capturing keystrokes from every keyboard under `/dev/input`.
 ///
-/// `chord` is the trigger chord — capture uses it only to suppress
-/// the would-be [`Key::Reset`] that pressing the chord's key under
-/// its modifier set would otherwise emit.
+/// `chords` is the list of trigger chords the daemon has bound.
+/// Capture uses them to suppress the would-be [`Key::Reset`] that
+/// pressing one of those chords would otherwise emit — without this,
+/// pressing e.g. `Super+Ctrl+Shift+Alt+S` would wipe the buffer
+/// before the sentence-fix gets a chance to read it.
 ///
 /// Returns a channel of [`Key`] events. One detached OS thread per
 /// keyboard device feeds the channel for the life of the process;
@@ -71,7 +73,7 @@ struct TriggerSpec {
 /// # Errors
 ///
 /// See [`CaptureError`].
-pub fn start(chord: &Chord) -> Result<Receiver<Key>, CaptureError> {
+pub fn start(chords: &[Chord]) -> Result<Receiver<Key>, CaptureError> {
     // Compile the keymap once, up front, so a broken layout fails fast
     // with a clear error rather than a silent no-events daemon.
     let keymap_text = {
@@ -89,13 +91,14 @@ pub fn start(chord: &Chord) -> Result<Receiver<Key>, CaptureError> {
         keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
     };
 
-    let trigger = resolve_trigger(chord);
+    let triggers: Vec<TriggerSpec> = chords.iter().map(resolve_trigger).collect();
     let keyboards = keyboard_devices()?;
     let (tx, rx) = mpsc::channel();
     for device in keyboards {
         let tx = tx.clone();
         let keymap_text = keymap_text.clone();
-        thread::spawn(move || read_device(device, &keymap_text, trigger, &tx));
+        let triggers = triggers.clone();
+        thread::spawn(move || read_device(device, &keymap_text, &triggers, &tx));
     }
     Ok(rx)
 }
@@ -171,7 +174,7 @@ fn is_keyboard(device: &Device) -> bool {
 /// Read one device forever, translating key events into [`Key`]s and
 /// sending them to `tx`. Returns — ending the thread — when the device
 /// disappears or the receiver is dropped.
-fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: &Sender<Key>) {
+fn read_device(mut device: Device, keymap_text: &str, triggers: &[TriggerSpec], tx: &Sender<Key>) {
     // Each thread builds its own xkb state: Context/Keymap/State hold
     // raw pointers and are not Send, so they cannot cross the thread
     // boundary. The keymap text was already validated by `start`.
@@ -200,7 +203,7 @@ fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: 
             // key from the *current* state, before this key updates it
             // (the xkbcommon convention).
             if value != 0
-                && let Some(key) = translate(&state, keycode, trigger)
+                && let Some(key) = translate(&state, keycode, triggers)
                 && tx.send(key).is_err()
             {
                 return; // receiver dropped
@@ -222,7 +225,7 @@ fn read_device(mut device: Device, keymap_text: &str, trigger: TriggerSpec, tx: 
 
 /// Translate a pressed key into a [`Key`] for the buffer, or `None` to
 /// ignore it.
-fn translate(state: &xkb::State, keycode: xkb::Keycode, trigger: TriggerSpec) -> Option<Key> {
+fn translate(state: &xkb::State, keycode: xkb::Keycode, triggers: &[TriggerSpec]) -> Option<Key> {
     let sym = state.key_get_one_sym(keycode).raw();
 
     // Modifier keys themselves are never buffered and never reset —
@@ -232,13 +235,16 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, trigger: TriggerSpec) ->
         return None;
     }
 
-    // The trigger chord's letter press: ignored here. The Hyprland
-    // keybind fires the trigger separately (via SIGUSR1); suppressing
-    // this prevents the buffer from being reset right when the user
-    // is about to ask for a fix.
-    let letter_match = trigger.sym != 0
-        && (sym == trigger.sym || (trigger.alt_sym != 0 && sym == trigger.alt_sym));
-    if letter_match && is_trigger_chord(state, trigger) {
+    // Any of the daemon's bound chords match this key+modifier combo?
+    // Suppress so pressing the chord doesn't ALSO reset the buffer
+    // via the has_action_modifier branch below. Hyprland fires the
+    // trigger separately (via SIGUSR1).
+    let chord_match = triggers.iter().any(|trigger| {
+        let letter_match = trigger.sym != 0
+            && (sym == trigger.sym || (trigger.alt_sym != 0 && sym == trigger.alt_sym));
+        letter_match && is_trigger_chord(state, *trigger)
+    });
+    if chord_match {
         return None;
     }
 

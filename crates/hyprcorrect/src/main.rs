@@ -92,7 +92,7 @@ fn run_daemon() {
             return;
         }
     };
-    let key_rx = match capture::start(&chord) {
+    let key_rx = match capture::start(&active_chords(&chord, &sentence_chord, &review_chord)) {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
@@ -414,6 +414,25 @@ fn spawn_prefs_window() {
 /// Parse an optional chord string. Empty input → `None` (unbound);
 /// a non-empty string that fails to parse is reported and treated
 /// as unbound rather than killing the daemon.
+/// Collect every action chord into a single slice for `capture::start`'s
+/// suppression list. Chords that aren't bound (sentence/review unbound)
+/// don't show up.
+#[cfg(target_os = "linux")]
+fn active_chords(
+    word: &hyprcorrect_core::Chord,
+    sentence: &Option<hyprcorrect_core::Chord>,
+    review: &Option<hyprcorrect_core::Chord>,
+) -> Vec<hyprcorrect_core::Chord> {
+    let mut out = vec![word.clone()];
+    if let Some(c) = sentence {
+        out.push(c.clone());
+    }
+    if let Some(c) = review {
+        out.push(c.clone());
+    }
+    out
+}
+
 #[cfg(target_os = "linux")]
 fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
     let trimmed = raw.trim();
@@ -638,12 +657,27 @@ fn fix_last_sentence(
     use hyprcorrect_platform::linux::emit;
 
     let Some(last) = buffer.last_sentence() else {
+        eprintln!(
+            "hyprcorrect: sentence-fix skipped — focused window's keystroke buffer holds no sentence (try typing the sentence inside this window first)"
+        );
         return;
     };
+    eprintln!(
+        "hyprcorrect: sentence-fix on {:?} ({} chars; smart={smart:?}; llm={}; lt={})",
+        truncate(&last.sentence, 60),
+        last.sentence.chars().count(),
+        llm.is_some(),
+        languagetool.is_some(),
+    );
     let corrected = correct_sentence(&last.sentence, smart, llm, languagetool, provider);
     if corrected == last.sentence {
+        eprintln!("hyprcorrect: sentence-fix — provider returned the same text, nothing to emit");
         return;
     }
+    eprintln!(
+        "hyprcorrect: sentence-fix emitting → {:?}",
+        truncate(&corrected, 60)
+    );
     let backspaces = last.sentence.chars().count() + last.trailing.chars().count();
     let insert = format!("{corrected}{}", last.trailing);
     match emit::replace_with_delay(backspaces, &insert, inter_key_delay_ms) {
@@ -652,9 +686,20 @@ fn fix_last_sentence(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
 /// Route the sentence to whichever provider the user configured for
 /// the "smart" path. On any provider failure we drop back to the
-/// offline spellbook path so the chord never silently no-ops.
+/// offline spellbook path so the chord never silently no-ops, and
+/// fire a desktop toast so the user knows what failed instead of
+/// having to tail the daemon's stdout.
 #[cfg(target_os = "linux")]
 fn correct_sentence(
     text: &str,
@@ -669,26 +714,65 @@ fn correct_sentence(
             Some(llm) => match llm.rewrite(text) {
                 Ok(corrected) => corrected,
                 Err(e) => {
-                    eprintln!("hyprcorrect: LLM call failed ({e}) — falling back to spellbook");
+                    let msg = format!("LLM call failed: {e}");
+                    eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                    notify_warning("LLM unavailable", &msg);
                     apply_corrections(text, spell)
                 }
             },
-            None => apply_corrections(text, spell),
+            None => {
+                let msg = "Smart provider is set to LLM, but no API key is configured. \
+                           Open Preferences → Providers → LLM and paste your Anthropic key.";
+                eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                notify_warning("LLM key not set", msg);
+                apply_corrections(text, spell)
+            }
         },
         ProviderId::LanguageTool => match languagetool {
             Some(lt) => match lt.check_text(text) {
                 Ok(corrections) => apply_correction_list(text, corrections),
                 Err(e) => {
-                    eprintln!(
-                        "hyprcorrect: LanguageTool call failed ({e}) — falling back to spellbook"
-                    );
+                    let msg = format!("LanguageTool call failed: {e}");
+                    eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                    notify_warning("LanguageTool unavailable", &msg);
                     apply_corrections(text, spell)
                 }
             },
-            None => apply_corrections(text, spell),
+            None => {
+                let msg = "Smart provider is set to LanguageTool, but it is disabled or has \
+                           no URL configured. Open Preferences → Providers → LanguageTool.";
+                eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                notify_warning("LanguageTool not configured", msg);
+                apply_corrections(text, spell)
+            }
         },
         ProviderId::Spellbook => apply_corrections(text, spell),
     }
+}
+
+/// Fire a best-effort desktop notification via `notify-send` so the
+/// user sees provider failures without tailing logs. Silently skips
+/// when `notify-send` (libnotify) isn't installed.
+#[cfg(target_os = "linux")]
+fn notify_warning(title: &str, body: &str) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("notify-send")
+        .args([
+            "-a",
+            "hyprcorrect",
+            "-c",
+            "im",
+            "-u",
+            "normal",
+            "-i",
+            "tools-check-spelling",
+            &format!("hyprcorrect — {title}"),
+            body,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 /// Apply a precomputed list of corrections (from LanguageTool) to
