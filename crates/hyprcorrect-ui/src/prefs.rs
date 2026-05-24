@@ -526,8 +526,11 @@ impl PrefsApp {
         ui.heading("Behavior");
         ui.add_space(14.0);
 
-        field_label(ui, "Inter-key delay");
-        caption(ui, "Applied to synthetic typing.");
+        field_label(ui, "Inter-key delay (typing)");
+        caption(
+            ui,
+            "Applied between every keystroke of the replacement text.",
+        );
         ui.add_space(6.0);
         let response = ui.add(
             egui::Slider::new(&mut self.config.behavior.inter_key_delay_ms, 0..=50).suffix(" ms"),
@@ -540,6 +543,35 @@ impl PrefsApp {
             ui,
             "0 ms is fastest but some apps drop characters under that speed; \
              2 ms is the safe default.",
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Inter-key delay (backspaces)");
+        caption(
+            ui,
+            "Applied between every keystroke of the backspace burst that \
+             erases the original text before the correction is typed.",
+        );
+        ui.add_space(6.0);
+        let response = ui.add(
+            egui::Slider::new(
+                &mut self.config.behavior.backspace_inter_key_delay_ms,
+                0..=50,
+            )
+            .suffix(" ms"),
+        );
+        if response.changed() {
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "Slower than the typing delay on purpose — Wayland's \
+             virtual-keyboard pipeline drops backspaces under fast \
+             dispatch, leaving leftover characters of the original at \
+             the start. Raise this if you still see leftover prefix \
+             chars after a long-sentence fix. 6 ms default; try \
+             10–15 ms if the issue persists.",
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);

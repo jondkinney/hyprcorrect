@@ -145,9 +145,15 @@ impl Default for LanguageToolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Behavior {
-    /// Per-key delay applied to synthetic typing; mitigates the rare
-    /// dropped-character bug in some apps.
+    /// Per-key delay applied to synthetic *typing*; mitigates the
+    /// rare dropped-character bug in some apps.
     pub inter_key_delay_ms: u32,
+    /// Per-key delay applied to the *backspace* burst specifically.
+    /// Wayland's virtual-keyboard pipeline drops backspaces under
+    /// very fast dispatch, leaving leftover prefix characters at the
+    /// start of the corrected text — a slower backspace cadence
+    /// avoids this without making the new typing visibly slow.
+    pub backspace_inter_key_delay_ms: u32,
     /// Fixed pause inserted between the backspace burst and the
     /// replacement text. Acts as a floor for very short edits.
     pub post_backspace_pause_ms: u32,
@@ -161,6 +167,7 @@ impl Default for Behavior {
     fn default() -> Self {
         Self {
             inter_key_delay_ms: 2,
+            backspace_inter_key_delay_ms: 6,
             post_backspace_pause_ms: 30,
             post_backspace_pause_per_char_ms: 2,
         }

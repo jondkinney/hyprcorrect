@@ -29,13 +29,17 @@ pub enum EmitError {
 ///
 /// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
 pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
-    replace_with_delay(backspaces, text, 0, 0, 0)
+    replace_with_delay(backspaces, text, 0, 0, 0, 0)
 }
 
 /// Like [`replace`], but explicitly sets:
-/// - `inter_key_delay_ms`: per-key delay between *every* keystroke
-///   (passed to wtype's `-d` flag); raise for apps that drop chars
-///   under fast typing.
+/// - `text_inter_key_delay_ms`: per-key delay during the *typing*
+///   burst.
+/// - `backspace_inter_key_delay_ms`: per-key delay during the
+///   *backspace* burst. Separate from text so the deletes can run
+///   at a safer cadence — Wayland's virtual-keyboard pipeline drops
+///   backspaces under fast dispatch, leaving leftover prefix chars
+///   from the original after a fix.
 /// - `post_backspace_pause_ms`: fixed pause between the backspace
 ///   burst and the replacement-text burst.
 /// - `post_backspace_pause_per_char_ms`: additional pause per
@@ -52,14 +56,15 @@ pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
 pub fn replace_with_delay(
     backspaces: usize,
     text: &str,
-    inter_key_delay_ms: u32,
+    text_inter_key_delay_ms: u32,
+    backspace_inter_key_delay_ms: u32,
     post_backspace_pause_ms: u32,
     post_backspace_pause_per_char_ms: u32,
 ) -> Result<(), EmitError> {
     if backspaces > 0 {
         let mut cmd = Command::new("wtype");
-        if inter_key_delay_ms > 0 {
-            cmd.args(["-d", &inter_key_delay_ms.to_string()]);
+        if backspace_inter_key_delay_ms > 0 {
+            cmd.args(["-d", &backspace_inter_key_delay_ms.to_string()]);
         }
         for _ in 0..backspaces {
             cmd.args(["-P", "BackSpace", "-p", "BackSpace"]);
@@ -74,8 +79,8 @@ pub fn replace_with_delay(
     }
     if !text.is_empty() {
         let mut cmd = Command::new("wtype");
-        if inter_key_delay_ms > 0 {
-            cmd.args(["-d", &inter_key_delay_ms.to_string()]);
+        if text_inter_key_delay_ms > 0 {
+            cmd.args(["-d", &text_inter_key_delay_ms.to_string()]);
         }
         cmd.arg("--").arg(text);
         run(cmd)?;

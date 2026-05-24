@@ -69,6 +69,7 @@ fn run_daemon() {
     let mut languagetool = build_languagetool(&initial_config);
     let mut smart_provider_id = initial_config.providers.smart;
     let mut inter_key_delay_ms = initial_config.behavior.inter_key_delay_ms;
+    let mut backspace_inter_key_delay_ms = initial_config.behavior.backspace_inter_key_delay_ms;
     let mut post_backspace_pause_ms = initial_config.behavior.post_backspace_pause_ms;
     let mut post_backspace_pause_per_char_ms =
         initial_config.behavior.post_backspace_pause_per_char_ms;
@@ -229,6 +230,7 @@ fn run_daemon() {
                     "review-apply" => apply_review(
                         &mut buffers,
                         inter_key_delay_ms,
+                        backspace_inter_key_delay_ms,
                         post_backspace_pause_ms,
                         post_backspace_pause_per_char_ms,
                     ),
@@ -257,6 +259,7 @@ fn run_daemon() {
                                     llm.as_ref(),
                                     languagetool.as_ref(),
                                     inter_key_delay_ms,
+                                    backspace_inter_key_delay_ms,
                                     post_backspace_pause_ms,
                                     post_backspace_pause_per_char_ms,
                                 ),
@@ -264,6 +267,7 @@ fn run_daemon() {
                                     buffer,
                                     &provider,
                                     inter_key_delay_ms,
+                                    backspace_inter_key_delay_ms,
                                     post_backspace_pause_ms,
                                     post_backspace_pause_per_char_ms,
                                 ),
@@ -318,6 +322,8 @@ fn run_daemon() {
                             languagetool = build_languagetool(&new_config);
                             smart_provider_id = new_config.providers.smart;
                             inter_key_delay_ms = new_config.behavior.inter_key_delay_ms;
+                            backspace_inter_key_delay_ms =
+                                new_config.behavior.backspace_inter_key_delay_ms;
                             post_backspace_pause_ms = new_config.behavior.post_backspace_pause_ms;
                             post_backspace_pause_per_char_ms =
                                 new_config.behavior.post_backspace_pause_per_char_ms;
@@ -478,6 +484,7 @@ fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
     provider: &hyprcorrect_core::OfflineProvider,
     inter_key_delay_ms: u32,
+    backspace_inter_key_delay_ms: u32,
     post_backspace_pause_ms: u32,
     post_backspace_pause_per_char_ms: u32,
 ) {
@@ -498,6 +505,7 @@ fn fix_last_word(
             edit.backspaces,
             &edit.insert,
             inter_key_delay_ms,
+            backspace_inter_key_delay_ms,
             post_backspace_pause_ms,
             post_backspace_pause_per_char_ms,
         ) {
@@ -566,10 +574,20 @@ fn start_review(
         return;
     };
     let corrected = correct_sentence(&last.sentence, smart, llm, languagetool, provider);
+    eprintln!(
+        "hyprcorrect: review-build — original ({} chars): {:?}",
+        last.sentence.chars().count(),
+        last.sentence
+    );
     if corrected == last.sentence {
-        // Nothing to review — every provider said the sentence is fine.
+        eprintln!("hyprcorrect: review-build — provider returned the same text, nothing to review");
         return;
     }
+    eprintln!(
+        "hyprcorrect: review-build — corrected ({} chars): {:?}",
+        corrected.chars().count(),
+        corrected
+    );
     let request = ReviewRequest {
         original: last.sentence,
         corrected,
@@ -608,6 +626,7 @@ fn spawn_review_window() {
 fn apply_review(
     buffers: &mut std::collections::HashMap<String, hyprcorrect_core::Buffer>,
     inter_key_delay_ms: u32,
+    backspace_inter_key_delay_ms: u32,
     post_backspace_pause_ms: u32,
     post_backspace_pause_per_char_ms: u32,
 ) {
@@ -627,6 +646,7 @@ fn apply_review(
         backspaces,
         &insert,
         inter_key_delay_ms,
+        backspace_inter_key_delay_ms,
         post_backspace_pause_ms,
         post_backspace_pause_per_char_ms,
     ) {
@@ -692,6 +712,7 @@ fn fix_last_sentence(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     inter_key_delay_ms: u32,
+    backspace_inter_key_delay_ms: u32,
     post_backspace_pause_ms: u32,
     post_backspace_pause_per_char_ms: u32,
 ) {
@@ -725,6 +746,7 @@ fn fix_last_sentence(
         backspaces,
         &insert,
         inter_key_delay_ms,
+        backspace_inter_key_delay_ms,
         post_backspace_pause_ms,
         post_backspace_pause_per_char_ms,
     ) {
