@@ -526,37 +526,20 @@ impl PrefsApp {
         ui.heading("Behavior");
         ui.add_space(14.0);
 
-        field_label(ui, "Inter-key delay (typing)");
+        field_label(ui, "Backspace pacing");
         caption(
             ui,
-            "Applied between every keystroke of the replacement text.",
-        );
-        ui.add_space(6.0);
-        let response = ui.add(
-            egui::Slider::new(&mut self.config.behavior.inter_key_delay_ms, 0..=50).suffix(" ms"),
-        );
-        if response.changed() {
-            self.clear_status();
-        }
-        ui.add_space(6.0);
-        caption(
-            ui,
-            "0 ms is fastest but some apps drop characters under that speed; \
-             2 ms is the safe default.",
-        );
-
-        ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "Inter-key delay (backspaces)");
-        caption(
-            ui,
-            "Applied between every keystroke of the backspace burst that \
-             erases the original text before the correction is typed.",
+            "Per-key delay used when erasing the original text. This \
+             is the only emit-side knob most users need: raise it if \
+             you see leftover prefix characters from the original \
+             after a fix lands. The replacement text is always typed \
+             at a fixed 2 ms cadence.",
         );
         ui.add_space(6.0);
         let response = ui.add(
             egui::Slider::new(
                 &mut self.config.behavior.backspace_inter_key_delay_ms,
-                0..=50,
+                0..=30,
             )
             .suffix(" ms"),
         );
@@ -566,55 +549,12 @@ impl PrefsApp {
         ui.add_space(6.0);
         caption(
             ui,
-            "Slower than the typing delay on purpose — Wayland's \
-             virtual-keyboard pipeline drops backspaces under fast \
-             dispatch, leaving leftover characters of the original at \
-             the start. Raise this if you still see leftover prefix \
-             chars after a long-sentence fix. 6 ms default; try \
-             10–15 ms if the issue persists.",
-        );
-
-        ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "Pause after backspaces (base)");
-        caption(
-            ui,
-            "Fixed gap between erasing the original text and typing \
-             the correction. Acts as the floor for very short edits.",
-        );
-        ui.add_space(6.0);
-        let response = ui.add(
-            egui::Slider::new(&mut self.config.behavior.post_backspace_pause_ms, 0..=200)
-                .suffix(" ms"),
-        );
-        if response.changed() {
-            self.clear_status();
-        }
-
-        ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "Pause per backspace");
-        caption(
-            ui,
-            "Added once per backspace. A 50-char sentence waits \
-             longer than a 5-char word. Total wait = base + (per-char × count).",
-        );
-        ui.add_space(6.0);
-        let response = ui.add(
-            egui::Slider::new(
-                &mut self.config.behavior.post_backspace_pause_per_char_ms,
-                0..=10,
-            )
-            .suffix(" ms"),
-        );
-        if response.changed() {
-            self.clear_status();
-        }
-        ui.add_space(6.0);
-        caption(
-            ui,
-            "Defaults: 30 ms base + 2 ms/char. Raise the per-char \
-             value if longer sentences still show leftover prefix \
-             characters in slow apps like LibreOffice — that's the \
-             knob that scales with edit length.",
+            "8 ms is the default and works for most apps. Raise to \
+             12–15 ms for slow apps like LibreOffice Writer where \
+             Wayland's virtual-keyboard pipeline drops backspaces \
+             under fast dispatch. Lower to 4 ms only if your apps \
+             handle that cadence cleanly — corrections will feel \
+             snappier.",
         );
     }
 

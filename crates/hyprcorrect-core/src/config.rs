@@ -145,31 +145,19 @@ impl Default for LanguageToolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Behavior {
-    /// Per-key delay applied to synthetic *typing*; mitigates the
-    /// rare dropped-character bug in some apps.
-    pub inter_key_delay_ms: u32,
-    /// Per-key delay applied to the *backspace* burst specifically.
-    /// Wayland's virtual-keyboard pipeline drops backspaces under
-    /// very fast dispatch, leaving leftover prefix characters at the
-    /// start of the corrected text — a slower backspace cadence
-    /// avoids this without making the new typing visibly slow.
+    /// Per-key delay applied to the *backspace* burst that erases
+    /// the original text before the correction is typed. The only
+    /// emit-side knob most users need: raise it if you see leftover
+    /// prefix characters from the original after a fix (Wayland's
+    /// virtual-keyboard pipeline drops backspaces under very fast
+    /// dispatch). The replacement-text typing uses a fixed 2 ms
+    /// delay internally.
     pub backspace_inter_key_delay_ms: u32,
-    /// Fixed pause inserted between the backspace burst and the
-    /// replacement text. Acts as a floor for very short edits.
-    pub post_backspace_pause_ms: u32,
-    /// Additional pause added *per backspace*. Lets the gap scale
-    /// with edit length: a 50-character sentence has to wait longer
-    /// than a 5-character word. Total pause = `post_backspace_pause_ms`
-    /// + `post_backspace_pause_per_char_ms` × backspace count.
-    pub post_backspace_pause_per_char_ms: u32,
 }
 impl Default for Behavior {
     fn default() -> Self {
         Self {
-            inter_key_delay_ms: 2,
-            backspace_inter_key_delay_ms: 6,
-            post_backspace_pause_ms: 30,
-            post_backspace_pause_per_char_ms: 2,
+            backspace_inter_key_delay_ms: 8,
         }
     }
 }
@@ -271,7 +259,7 @@ fix_word = "CTRL+J"
         .unwrap();
         assert_eq!(cfg.hotkeys.fix_word, "CTRL+J");
         // Untouched sections still hold defaults.
-        assert_eq!(cfg.behavior.inter_key_delay_ms, 2);
+        assert_eq!(cfg.behavior.backspace_inter_key_delay_ms, 8);
         assert_eq!(cfg.providers.default, ProviderId::Spellbook);
         assert!(cfg.privacy.app_blocklist.is_empty());
     }

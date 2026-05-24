@@ -68,11 +68,7 @@ fn run_daemon() {
     let mut llm = build_llm(&initial_config);
     let mut languagetool = build_languagetool(&initial_config);
     let mut smart_provider_id = initial_config.providers.smart;
-    let mut inter_key_delay_ms = initial_config.behavior.inter_key_delay_ms;
     let mut backspace_inter_key_delay_ms = initial_config.behavior.backspace_inter_key_delay_ms;
-    let mut post_backspace_pause_ms = initial_config.behavior.post_backspace_pause_ms;
-    let mut post_backspace_pause_per_char_ms =
-        initial_config.behavior.post_backspace_pause_per_char_ms;
     let mut chord = match effective_chord(&initial_config) {
         Ok(c) => c,
         Err(e) => {
@@ -227,13 +223,7 @@ fn run_daemon() {
             DaemonEvent::Signal(hotkey::HotkeyEvent::Trigger) => {
                 let action = hyprcorrect_core::runtime::read_action();
                 match action.as_str() {
-                    "review-apply" => apply_review(
-                        &mut buffers,
-                        inter_key_delay_ms,
-                        backspace_inter_key_delay_ms,
-                        post_backspace_pause_ms,
-                        post_backspace_pause_per_char_ms,
-                    ),
+                    "review-apply" => apply_review(&mut buffers, backspace_inter_key_delay_ms),
                     "review-cancel" => {
                         hyprcorrect_core::runtime::clear_review();
                     }
@@ -258,19 +248,9 @@ fn run_daemon() {
                                     smart_provider_id,
                                     llm.as_ref(),
                                     languagetool.as_ref(),
-                                    inter_key_delay_ms,
                                     backspace_inter_key_delay_ms,
-                                    post_backspace_pause_ms,
-                                    post_backspace_pause_per_char_ms,
                                 ),
-                                _ => fix_last_word(
-                                    buffer,
-                                    &provider,
-                                    inter_key_delay_ms,
-                                    backspace_inter_key_delay_ms,
-                                    post_backspace_pause_ms,
-                                    post_backspace_pause_per_char_ms,
-                                ),
+                                _ => fix_last_word(buffer, &provider, backspace_inter_key_delay_ms),
                             }
                         }
                     }
@@ -321,12 +301,8 @@ fn run_daemon() {
                             llm = build_llm(&new_config);
                             languagetool = build_languagetool(&new_config);
                             smart_provider_id = new_config.providers.smart;
-                            inter_key_delay_ms = new_config.behavior.inter_key_delay_ms;
                             backspace_inter_key_delay_ms =
                                 new_config.behavior.backspace_inter_key_delay_ms;
-                            post_backspace_pause_ms = new_config.behavior.post_backspace_pause_ms;
-                            post_backspace_pause_per_char_ms =
-                                new_config.behavior.post_backspace_pause_per_char_ms;
                             eprintln!("hyprcorrect: config reloaded");
                         }
                         Err(e) => {
@@ -483,10 +459,7 @@ fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
 fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
     provider: &hyprcorrect_core::OfflineProvider,
-    inter_key_delay_ms: u32,
     backspace_inter_key_delay_ms: u32,
-    post_backspace_pause_ms: u32,
-    post_backspace_pause_per_char_ms: u32,
 ) {
     use hyprcorrect_core::plan_word_replacement;
     use hyprcorrect_platform::linux::emit;
@@ -501,14 +474,8 @@ fn fix_last_word(
         let Some(edit) = plan_word_replacement(&last, &fix) else {
             return;
         };
-        match emit::replace_with_delay(
-            edit.backspaces,
-            &edit.insert,
-            inter_key_delay_ms,
-            backspace_inter_key_delay_ms,
-            post_backspace_pause_ms,
-            post_backspace_pause_per_char_ms,
-        ) {
+        match emit::replace_with_delay(edit.backspaces, &edit.insert, backspace_inter_key_delay_ms)
+        {
             Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
             Err(e) => eprintln!("hyprcorrect: {e}"),
         }
@@ -625,10 +592,7 @@ fn spawn_review_window() {
 #[cfg(target_os = "linux")]
 fn apply_review(
     buffers: &mut std::collections::HashMap<String, hyprcorrect_core::Buffer>,
-    inter_key_delay_ms: u32,
     backspace_inter_key_delay_ms: u32,
-    post_backspace_pause_ms: u32,
-    post_backspace_pause_per_char_ms: u32,
 ) {
     use hyprcorrect_core::runtime::{clear_review, read_review_request};
     use hyprcorrect_platform::linux::emit;
@@ -642,14 +606,7 @@ fn apply_review(
         "hyprcorrect: review-apply — {backspaces} backspaces + {:?}",
         insert
     );
-    match emit::replace_with_delay(
-        backspaces,
-        &insert,
-        inter_key_delay_ms,
-        backspace_inter_key_delay_ms,
-        post_backspace_pause_ms,
-        post_backspace_pause_per_char_ms,
-    ) {
+    match emit::replace_with_delay(backspaces, &insert, backspace_inter_key_delay_ms) {
         Ok(()) => {
             if let Some(buf) = buffers.get_mut(&req.window_address) {
                 buf.apply(backspaces, &insert);
@@ -711,10 +668,7 @@ fn fix_last_sentence(
     smart: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
-    inter_key_delay_ms: u32,
     backspace_inter_key_delay_ms: u32,
-    post_backspace_pause_ms: u32,
-    post_backspace_pause_per_char_ms: u32,
 ) {
     use hyprcorrect_platform::linux::emit;
 
@@ -742,14 +696,7 @@ fn fix_last_sentence(
     );
     let backspaces = last.sentence.chars().count() + last.trailing.chars().count();
     let insert = format!("{corrected}{}", last.trailing);
-    match emit::replace_with_delay(
-        backspaces,
-        &insert,
-        inter_key_delay_ms,
-        backspace_inter_key_delay_ms,
-        post_backspace_pause_ms,
-        post_backspace_pause_per_char_ms,
-    ) {
+    match emit::replace_with_delay(backspaces, &insert, backspace_inter_key_delay_ms) {
         Ok(()) => buffer.apply(backspaces, &insert),
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }

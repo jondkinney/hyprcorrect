@@ -21,30 +21,25 @@ pub enum EmitError {
     WtypeFailed,
 }
 
+/// Per-key delay used for the *typing* burst. Fixed because there's
+/// almost never a reason to slow new-text typing in practice — the
+/// drops happen on the backspace burst, not on text.
+const TYPING_INTER_KEY_DELAY_MS: u32 = 2;
+
 /// Apply an edit at the caret: press Backspace `backspaces` times, then
-/// type `text`. Uses default timings (no inter-key delay, no post-
-/// backspace pause).
+/// type `text`. Uses the fixed default backspace delay.
 ///
 /// # Errors
 ///
 /// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
 pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
-    replace_with_delay(backspaces, text, 0, 0, 0, 0)
+    replace_with_delay(backspaces, text, 8)
 }
 
-/// Like [`replace`], but explicitly sets:
-/// - `text_inter_key_delay_ms`: per-key delay during the *typing*
-///   burst.
-/// - `backspace_inter_key_delay_ms`: per-key delay during the
-///   *backspace* burst. Separate from text so the deletes can run
-///   at a safer cadence — Wayland's virtual-keyboard pipeline drops
-///   backspaces under fast dispatch, leaving leftover prefix chars
-///   from the original after a fix.
-/// - `post_backspace_pause_ms`: fixed pause between the backspace
-///   burst and the replacement-text burst.
-/// - `post_backspace_pause_per_char_ms`: additional pause per
-///   backspace, so the gap scales with edit length. Total pause =
-///   `post_backspace_pause_ms` + per-char × backspace count.
+/// Like [`replace`], but lets the caller set the per-key delay for
+/// the backspace burst. Raise it if the focused app drops events
+/// under fast dispatch and leaves leftover prefix characters from
+/// the original after a fix.
 ///
 /// Backspaces and text are emitted as *two separate* `wtype`
 /// invocations so the focused app has a clean event boundary
@@ -56,10 +51,7 @@ pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
 pub fn replace_with_delay(
     backspaces: usize,
     text: &str,
-    text_inter_key_delay_ms: u32,
     backspace_inter_key_delay_ms: u32,
-    post_backspace_pause_ms: u32,
-    post_backspace_pause_per_char_ms: u32,
 ) -> Result<(), EmitError> {
     if backspaces > 0 {
         let mut cmd = Command::new("wtype");
@@ -70,18 +62,10 @@ pub fn replace_with_delay(
             cmd.args(["-P", "BackSpace", "-p", "BackSpace"]);
         }
         run(cmd)?;
-        let scaled_pause = u64::from(post_backspace_pause_ms).saturating_add(
-            u64::from(post_backspace_pause_per_char_ms).saturating_mul(backspaces as u64),
-        );
-        if scaled_pause > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(scaled_pause));
-        }
     }
     if !text.is_empty() {
         let mut cmd = Command::new("wtype");
-        if text_inter_key_delay_ms > 0 {
-            cmd.args(["-d", &text_inter_key_delay_ms.to_string()]);
-        }
+        cmd.args(["-d", &TYPING_INTER_KEY_DELAY_MS.to_string()]);
         cmd.arg("--").arg(text);
         run(cmd)?;
     }
