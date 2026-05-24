@@ -22,15 +22,34 @@ pub enum EmitError {
 }
 
 /// Apply an edit at the caret: press Backspace `backspaces` times, then
-/// type `text`.
+/// type `text`. With zero `inter_key_delay_ms`, no `-d` flag is added.
 ///
 /// # Errors
 ///
 /// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
 pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
+    replace_with_delay(backspaces, text, 0)
+}
+
+/// Like [`replace`], but explicitly sets the inter-key delay (in
+/// milliseconds) wtype waits between keystrokes. Higher values
+/// help apps that drop characters under wtype's default
+/// fast-typing speed — see `config.behavior.inter_key_delay_ms`.
+///
+/// # Errors
+///
+/// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
+pub fn replace_with_delay(
+    backspaces: usize,
+    text: &str,
+    inter_key_delay_ms: u32,
+) -> Result<(), EmitError> {
+    let mut cmd = Command::new("wtype");
+    if inter_key_delay_ms > 0 {
+        cmd.args(["-d", &inter_key_delay_ms.to_string()]);
+    }
     // wtype applies its arguments left to right: a press/release pair
     // per Backspace, then the replacement text as a literal argument.
-    let mut cmd = Command::new("wtype");
     for _ in 0..backspaces {
         cmd.args(["-P", "BackSpace", "-p", "BackSpace"]);
     }

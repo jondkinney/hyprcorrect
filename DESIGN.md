@@ -272,10 +272,23 @@ currently has focus.
 - After applying a correction the buffer is rewritten to the corrected
   text so fixes can chain; if anything is uncertain it resets instead.
 
-**Known limitations:** IME composition (the listener sees raw keys, not
-composed text — macOS's unicode events soften this; flagged for
-non-Latin input), and very fast synthetic typing occasionally dropping
-characters in some apps (mitigated by a configurable inter-key delay).
+**Known limitations:**
+
+- **IME composition.** The Linux capture path reads raw keys via
+  `evdev` and translates them through `xkbcommon`. For IME-composed
+  input (CJK preedit, dead-key sequences for Latin scripts) the buffer
+  records the *physical* keys, not the *composed* glyph the user
+  actually committed. Until M5+ wires a per-platform composition
+  observer (`text-input-v3` on Wayland, `NSTextInputClient` on macOS),
+  the buffer state for IME input is unreliable and `fix-last-word` /
+  `fix-last-sentence` can over-backspace or replace the wrong text.
+  The blocklist is the practical escape hatch: add your IME-using
+  apps to it so the daemon doesn't try.
+- **Synthetic-typing drops.** Very fast `wtype` runs occasionally lose
+  characters in some apps. `config.behavior.inter_key_delay_ms`
+  (Preferences → Behavior) sets a per-key delay applied to every
+  wtype call — 2 ms is the safe default; raise it for any app that
+  drops characters.
 
 ## Replacement mechanics
 
