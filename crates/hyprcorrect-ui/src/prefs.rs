@@ -1084,7 +1084,14 @@ fn capture_outcome(i: &mut egui::InputState) -> Option<CaptureOutcome> {
 /// [`hyprcorrect_core::Chord::parse`].
 fn format_accelerator(key: egui::Key, modifiers: egui::Modifiers) -> String {
     let mut parts: Vec<&'static str> = Vec::new();
-    if modifiers.command || modifiers.mac_cmd {
+    // egui-winit aliases `Modifiers::command` to `ctrl` on non-macOS,
+    // so checking `command || mac_cmd` for SUPER would push SUPER
+    // anytime Ctrl is held — silently adding Super to every Ctrl
+    // recording. Only honor mac_cmd here; the Linux/Wayland Super
+    // key is invisible to egui-winit, so a SUPER-containing chord
+    // has to be entered through config.toml until daemon-side
+    // chord capture lands.
+    if modifiers.mac_cmd {
         parts.push("SUPER");
     }
     if modifiers.ctrl {

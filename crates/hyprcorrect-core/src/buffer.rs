@@ -96,19 +96,33 @@ impl Buffer {
     }
 
     /// The last sentence in the buffer with the whitespace that
-    /// follows it, or `None` when the buffer holds no sentence.
+    /// follows it, or `None` when the buffer holds no sentence
+    /// (empty / only whitespace).
     ///
-    /// "Sentence" means the run of text after the most recent
-    /// `.`/`!`/`?` (skipping the punctuation and any whitespace right
-    /// after it). If no sentence ender appears the entire buffer
-    /// content is treated as one sentence.
+    /// "Sentence" means the run of text bounded by sentence-enders
+    /// (`.`/`!`/`?`). The buffer's final sentence-ender, if any, is
+    /// included — so pressing the chord right after typing
+    /// `"The quick brown fox."` operates on `"The quick brown fox."`
+    /// rather than no-opping. If the buffer doesn't end with an
+    /// ender the sentence is the in-progress text after the previous
+    /// one.
     pub fn last_sentence(&self) -> Option<LastSentence> {
         let trimmed = self.text.trim_end();
         if trimmed.is_empty() {
             return None;
         }
-        // Find the previous sentence ender, scanning backwards.
-        let after_ender = trimmed
+        // Look for the previous sentence boundary — the ender BEFORE
+        // the current sentence. If trimmed ends in an ender, that one
+        // closes the current sentence, so we search the slice before
+        // it; otherwise we search the whole trimmed text.
+        let last_char = trimmed.chars().next_back().expect("non-empty");
+        let ends_with_ender = matches!(last_char, '.' | '!' | '?');
+        let search_end = if ends_with_ender {
+            trimmed.len() - last_char.len_utf8()
+        } else {
+            trimmed.len()
+        };
+        let after_prev_ender = trimmed[..search_end]
             .char_indices()
             .rev()
             .find_map(|(i, c)| {
@@ -119,19 +133,20 @@ impl Buffer {
                 }
             })
             .unwrap_or(0);
-        // Skip whitespace after the ender to find the sentence's start.
-        let sentence_start = trimmed[after_ender..]
+        // Skip whitespace after the boundary to find the sentence's
+        // first character.
+        let sentence_start = trimmed[after_prev_ender..]
             .char_indices()
             .find_map(|(i, c)| {
                 if !c.is_whitespace() {
-                    Some(after_ender + i)
+                    Some(after_prev_ender + i)
                 } else {
                     None
                 }
             })
             .unwrap_or(trimmed.len());
         if sentence_start >= trimmed.len() {
-            return None; // only an ender + trailing whitespace
+            return None;
         }
         Some(LastSentence {
             sentence: trimmed[sentence_start..].to_string(),
@@ -304,10 +319,30 @@ mod tests {
     }
 
     #[test]
-    fn last_sentence_returns_none_for_trailing_ender_only() {
+    fn last_sentence_includes_the_trailing_ender() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "Hello there.");
-        assert!(buf.last_sentence().is_none());
+        let last = buf.last_sentence().unwrap();
+        assert_eq!(last.sentence, "Hello there.");
+        assert_eq!(last.trailing, "");
+    }
+
+    #[test]
+    fn last_sentence_picks_the_final_of_multiple_complete_sentences() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "First sentence. Second sentence!");
+        let last = buf.last_sentence().unwrap();
+        assert_eq!(last.sentence, "Second sentence!");
+        assert_eq!(last.trailing, "");
+    }
+
+    #[test]
+    fn last_sentence_after_complete_one_then_trailing_ws() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hello there.   ");
+        let last = buf.last_sentence().unwrap();
+        assert_eq!(last.sentence, "Hello there.");
+        assert_eq!(last.trailing, "   ");
     }
 
     #[test]
