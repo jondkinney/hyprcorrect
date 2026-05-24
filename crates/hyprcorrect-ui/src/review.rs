@@ -11,6 +11,9 @@ use hyprcorrect_core::runtime::{self, ReviewRequest};
 
 const APP_ID: &str = "hyprcorrect-review";
 const REFOCUS_DELAY_MS: u64 = 150;
+const WINDOW_WIDTH: f32 = 560.0;
+const MIN_WINDOW_HEIGHT: f32 = 240.0;
+const MAX_WINDOW_HEIGHT: f32 = 900.0;
 
 /// Run the review popup. Reads the pending review request from the
 /// runtime file; if there isn't one, returns immediately (the
@@ -26,12 +29,14 @@ pub(crate) fn run() {
         }
     };
 
+    let estimated_height = estimate_window_height(&request);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
             .with_title("hyprcorrect — Review")
-            .with_inner_size([560.0, 280.0])
-            .with_resizable(false),
+            .with_inner_size([WINDOW_WIDTH, estimated_height])
+            .with_min_inner_size([WINDOW_WIDTH, MIN_WINDOW_HEIGHT])
+            .with_resizable(true),
         vsync: false,
         ..Default::default()
     };
@@ -79,23 +84,12 @@ impl eframe::App for ReviewApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::central_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(20, 18)),
-            )
+        // Pin the action row to the bottom of the window so it's
+        // always reachable no matter how tall the text grows.
+        egui::TopBottomPanel::bottom("review_actions")
+            .resizable(false)
             .show(ctx, |ui| {
-                ui.heading("Review correction");
-                ui.add_space(12.0);
-
-                section_label(ui, "Original");
-                show_block(ui, &self.request.original, egui::Color32::from_gray(170));
-
-                ui.add_space(14.0);
-                section_label(ui, "Proposed");
-                show_block(ui, &self.request.corrected, egui::Color32::from_gray(230));
-
-                ui.add_space(20.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel  (Esc)").clicked() {
                         self.decision = Some("cancel");
@@ -108,6 +102,30 @@ impl eframe::App for ReviewApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                ui.add_space(8.0);
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(20, 18)),
+            )
+            .show(ctx, |ui| {
+                // ScrollArea is a fallback in case the height
+                // estimate is off — long sentences still fit cleanly.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("Review correction");
+                        ui.add_space(12.0);
+
+                        section_label(ui, "Original");
+                        show_block(ui, &self.request.original, egui::Color32::from_gray(170));
+
+                        ui.add_space(14.0);
+                        section_label(ui, "Proposed");
+                        show_block(ui, &self.request.corrected, egui::Color32::from_gray(230));
+                    });
             });
     }
 
@@ -134,6 +152,30 @@ impl eframe::App for ReviewApp {
         std::thread::sleep(Duration::from_millis(REFOCUS_DELAY_MS));
         notify_daemon();
     }
+}
+
+/// Pick a window height that fits the original + proposed text
+/// without truncation. Lightweight estimate based on average chars
+/// per line at our 14 pt body font; the surrounding `ScrollArea`
+/// covers any miss.
+fn estimate_window_height(request: &ReviewRequest) -> f32 {
+    // Body font is 14 pt, line height ~22 px. The text blocks are
+    // ~520 px wide after panel margins; egui wraps at ~9 chars per
+    // 100 px at this font, so ~7 px per char is the working width.
+    const CHARS_PER_LINE: usize = 65;
+    const LINE_HEIGHT: f32 = 22.0;
+    // heading + two section labels + two block paddings + the
+    // bottom action row + paint margins — a generous chrome floor.
+    const CHROME: f32 = 200.0;
+    let lines = |s: &str| -> usize {
+        s.lines()
+            .map(|line| line.chars().count().max(1).div_ceil(CHARS_PER_LINE))
+            .sum::<usize>()
+            .max(1)
+    };
+    let total_lines = lines(&request.original) + lines(&request.corrected);
+    let body_height = total_lines as f32 * LINE_HEIGHT;
+    (CHROME + body_height).clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT)
 }
 
 fn section_label(ui: &mut egui::Ui, text: &str) {
