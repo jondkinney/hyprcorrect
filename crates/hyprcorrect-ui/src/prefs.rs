@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui;
 use hyprcorrect_core::{Config, LlmConfig, ProviderId, runtime, secrets};
 
+use crate::apps::AppRegistry;
 use crate::icon;
 
 const APP_ID: &str = "hyprcorrect-prefs";
@@ -107,6 +108,10 @@ struct PrefsApp {
     last_apps_refresh: Instant,
     /// Currently-selected entry in the Privacy "Add app" dropdown.
     selected_app: Option<String>,
+    /// Search filter for the Privacy app dropdown.
+    app_filter: String,
+    /// Cached `.desktop` registry — display names + icons.
+    app_registry: AppRegistry,
 }
 
 impl PrefsApp {
@@ -127,6 +132,8 @@ impl PrefsApp {
             running_apps: Vec::new(),
             last_apps_refresh: Instant::now() - Duration::from_secs(60),
             selected_app: None,
+            app_filter: String::new(),
+            app_registry: AppRegistry::discover(),
         }
     }
 
@@ -545,24 +552,32 @@ impl PrefsApp {
         field_label(ui, "App blocklist");
         caption(
             ui,
-            "Windows whose class is on this list never have their keys buffered. \
-             Match is case-insensitive.",
+            "Apps in this list never have their keys buffered. Match is \
+             case-insensitive against the window class.",
         );
         ui.add_space(12.0);
 
-        // -- Currently blocked entries ------------------------------------
+        // -- Currently blocked entries: render with icon + display name ---
+        let blocked_ids: Vec<String> = self.config.privacy.app_blocklist.clone();
         let mut remove: Option<usize> = None;
-        if self.config.privacy.app_blocklist.is_empty() {
+        if blocked_ids.is_empty() {
             caption(ui, "(none yet — pick a running app below)");
             ui.add_space(8.0);
         } else {
-            for (i, entry) in self.config.privacy.app_blocklist.iter().enumerate() {
+            for (i, identifier) in blocked_ids.iter().enumerate() {
+                let meta = self.app_registry.lookup(ui.ctx(), identifier);
                 ui.horizontal(|ui| {
-                    ui.label(entry);
+                    if let Some(handle) = &meta.icon {
+                        ui.add(egui::Image::new(handle).fit_to_exact_size(egui::vec2(20.0, 20.0)));
+                    } else {
+                        ui.add_space(20.0);
+                    }
+                    ui.add_space(6.0);
+                    ui.label(&meta.display_name);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(egui::Button::new("Remove").frame(false))
-                            .on_hover_text("Remove from the blocklist")
+                            .on_hover_text(format!("Remove {} from the blocklist", meta.identifier))
                             .clicked()
                         {
                             remove = Some(i);
@@ -574,8 +589,6 @@ impl PrefsApp {
         }
         if let Some(i) = remove {
             let removed = self.config.privacy.app_blocklist.remove(i);
-            // If the removed class was the selected picker entry,
-            // clear it so the dropdown re-opens cleanly.
             if self.selected_app.as_deref() == Some(removed.as_str()) {
                 self.selected_app = None;
             }
@@ -597,32 +610,78 @@ impl PrefsApp {
             .iter()
             .map(|s| s.to_ascii_lowercase())
             .collect();
-        let candidates: Vec<String> = self
+        let candidate_ids: Vec<String> = self
             .running_apps
             .iter()
             .filter(|c| !already_blocked.contains(&c.to_ascii_lowercase()))
             .cloned()
             .collect();
 
+        // Resolve each candidate to its display name + icon ahead of the
+        // closure so we don't borrow `self` twice.
+        let candidates: Vec<crate::apps::AppMeta> = candidate_ids
+            .iter()
+            .map(|id| self.app_registry.lookup(ui.ctx(), id))
+            .collect();
+
         ui.horizontal(|ui| {
-            let placeholder = if candidates.is_empty() {
-                "(no running apps detected)".to_string()
-            } else {
-                self.selected_app
-                    .clone()
-                    .unwrap_or_else(|| "Choose an app…".to_string())
-            };
+            let selected_display = self
+                .selected_app
+                .as_deref()
+                .and_then(|id| candidates.iter().find(|c| c.identifier == id))
+                .map(|c| c.display_name.clone())
+                .unwrap_or_else(|| {
+                    if candidates.is_empty() {
+                        "(no running apps detected)".to_string()
+                    } else {
+                        "Choose an app…".to_string()
+                    }
+                });
             let selected_ref = &mut self.selected_app;
+            let filter = &mut self.app_filter;
             egui::ComboBox::from_id_salt("blocklist_app_picker")
-                .selected_text(placeholder)
+                .selected_text(selected_display)
                 .width(ui.available_width() - 80.0)
                 .show_ui(ui, |ui| {
-                    for class in &candidates {
-                        let is_selected = selected_ref.as_deref() == Some(class.as_str());
-                        if ui.selectable_label(is_selected, class).clicked() {
-                            *selected_ref = Some(class.clone());
-                        }
-                    }
+                    ui.add(
+                        egui::TextEdit::singleline(filter)
+                            .hint_text("Search")
+                            .margin(egui::Margin::symmetric(8, 4))
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.separator();
+                    let needle = filter.to_ascii_lowercase();
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for c in &candidates {
+                                if !needle.is_empty()
+                                    && !c.display_name.to_ascii_lowercase().contains(&needle)
+                                    && !c.identifier.to_ascii_lowercase().contains(&needle)
+                                {
+                                    continue;
+                                }
+                                let is_selected =
+                                    selected_ref.as_deref() == Some(c.identifier.as_str());
+                                let row = ui
+                                    .horizontal(|ui| {
+                                        if let Some(handle) = &c.icon {
+                                            ui.add(
+                                                egui::Image::new(handle)
+                                                    .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                                            );
+                                        } else {
+                                            ui.add_space(20.0);
+                                        }
+                                        ui.add_space(6.0);
+                                        ui.selectable_label(is_selected, &c.display_name)
+                                    })
+                                    .inner;
+                                if row.clicked() {
+                                    *selected_ref = Some(c.identifier.clone());
+                                }
+                            }
+                        });
                 });
             let can_add = self.selected_app.as_ref().is_some_and(|s| {
                 !s.is_empty() && !already_blocked.contains(&s.to_ascii_lowercase())
@@ -631,6 +690,7 @@ impl PrefsApp {
                 && let Some(class) = self.selected_app.take()
             {
                 self.config.privacy.app_blocklist.push(class);
+                self.app_filter.clear();
                 self.clear_status();
             }
         });

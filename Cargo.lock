@@ -1340,6 +1340,7 @@ dependencies = [
  "eframe",
  "egui",
  "hyprcorrect-core",
+ "image",
  "resvg",
  "tiny-skia",
  "usvg",

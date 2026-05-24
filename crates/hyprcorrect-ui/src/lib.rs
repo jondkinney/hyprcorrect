@@ -8,6 +8,7 @@
 //!
 //! See the "Configuration & GUI" section of `DESIGN.md`.
 
+mod apps;
 mod icon;
 mod prefs;
 mod review;
