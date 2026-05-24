@@ -423,6 +423,11 @@ fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
 }
 
 /// Correct the buffer's last word in place via the offline provider.
+/// When the buffer has nothing to work with (focus moved, caret-
+/// moving key, app autocorrect, paste, …) we fall back to the
+/// clipboard path: simulate "select previous word", read it from
+/// the clipboard, correct, and overwrite the still-active
+/// selection. Per `DESIGN.md`'s secondary mode.
 #[cfg(target_os = "linux")]
 fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
@@ -431,21 +436,60 @@ fn fix_last_word(
     use hyprcorrect_core::plan_word_replacement;
     use hyprcorrect_platform::linux::emit;
 
-    let Some(last) = buffer.last_word() else {
-        return;
+    if let Some(last) = buffer.last_word() {
+        let Some(correction) = provider.check_text(&last.word).into_iter().next() else {
+            return;
+        };
+        let Some(fix) = correction.suggestions.into_iter().next() else {
+            return;
+        };
+        let Some(edit) = plan_word_replacement(&last, &fix) else {
+            return;
+        };
+        match emit::replace(edit.backspaces, &edit.insert) {
+            Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
+            Err(e) => eprintln!("hyprcorrect: {e}"),
+        }
+    } else {
+        fix_via_clipboard(provider);
+    }
+}
+
+/// Clipboard fallback for the empty-buffer case. Best-effort —
+/// doesn't work in terminals, and only in apps where
+/// `Ctrl+Shift+Left` selects the previous word. Failures are
+/// logged but never fatal.
+#[cfg(target_os = "linux")]
+fn fix_via_clipboard(provider: &hyprcorrect_core::OfflineProvider) {
+    use hyprcorrect_platform::linux::clipboard;
+    let word = match clipboard::copy_previous_word() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("hyprcorrect: clipboard fallback skipped — {e}");
+            return;
+        }
     };
-    let Some(correction) = provider.check_text(&last.word).into_iter().next() else {
+    let trimmed = word.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Some(correction) = provider.check_text(trimmed).into_iter().next() else {
         return;
     };
     let Some(fix) = correction.suggestions.into_iter().next() else {
         return;
     };
-    let Some(edit) = plan_word_replacement(&last, &fix) else {
-        return;
-    };
-    match emit::replace(edit.backspaces, &edit.insert) {
-        Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
-        Err(e) => eprintln!("hyprcorrect: {e}"),
+    // The selection is still live — typing replaces it in place.
+    // We restore any leading/trailing whitespace from the original
+    // wl-paste payload so we don't trim the user's spacing.
+    let leading_ws_len = word.len() - word.trim_start().len();
+    let trailing_ws_len = word.len() - word.trim_end().len();
+    let mut replacement = String::with_capacity(word.len());
+    replacement.push_str(&word[..leading_ws_len]);
+    replacement.push_str(&fix);
+    replacement.push_str(&word[word.len() - trailing_ws_len..]);
+    if let Err(e) = clipboard::type_replacement(&replacement) {
+        eprintln!("hyprcorrect: clipboard fallback type-back failed: {e}");
     }
 }
 

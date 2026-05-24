@@ -14,6 +14,7 @@
 //! Implemented from milestone M1. See `DESIGN.md`.
 
 pub mod capture;
+pub mod clipboard;
 pub mod emit;
 pub mod focus;
 pub mod hotkey;
