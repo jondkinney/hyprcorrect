@@ -66,6 +66,7 @@ fn run_daemon() {
         Config::default()
     });
     let mut llm = build_llm(&initial_config);
+    let mut languagetool = build_languagetool(&initial_config);
     let mut smart_provider_id = initial_config.providers.smart;
     let mut chord = match effective_chord(&initial_config) {
         Ok(c) => c,
@@ -238,12 +239,14 @@ fn run_daemon() {
                                     &provider,
                                     smart_provider_id,
                                     llm.as_ref(),
+                                    languagetool.as_ref(),
                                 ),
                                 "sentence" => fix_last_sentence(
                                     buffer,
                                     &provider,
                                     smart_provider_id,
                                     llm.as_ref(),
+                                    languagetool.as_ref(),
                                 ),
                                 _ => fix_last_word(buffer, &provider),
                             }
@@ -294,6 +297,7 @@ fn run_daemon() {
 
                             blocklist = build_blocklist(&new_config);
                             llm = build_llm(&new_config);
+                            languagetool = build_languagetool(&new_config);
                             smart_provider_id = new_config.providers.smart;
                             eprintln!("hyprcorrect: config reloaded");
                         }
@@ -505,12 +509,13 @@ fn start_review(
     provider: &hyprcorrect_core::OfflineProvider,
     smart: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
 ) {
     use hyprcorrect_core::runtime::{ReviewRequest, write_review_request};
     let Some(last) = buffer.last_sentence() else {
         return;
     };
-    let corrected = correct_sentence(&last.sentence, smart, llm, provider);
+    let corrected = correct_sentence(&last.sentence, smart, llm, languagetool, provider);
     if corrected == last.sentence {
         // Nothing to review — every provider said the sentence is fine.
         return;
@@ -589,6 +594,26 @@ fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmP
     }
 }
 
+/// Build the LanguageTool provider when the user has the smart path
+/// set to it and the URL is non-empty. Same non-fatal contract as
+/// `build_llm`.
+#[cfg(target_os = "linux")]
+fn build_languagetool(
+    config: &hyprcorrect_core::Config,
+) -> Option<hyprcorrect_core::LanguageToolProvider> {
+    use hyprcorrect_core::{LanguageToolProvider, ProviderId};
+    if config.providers.smart != ProviderId::LanguageTool {
+        return None;
+    }
+    match LanguageToolProvider::from_config(&config.providers.languagetool) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("hyprcorrect: LanguageTool provider unavailable — {e}");
+            None
+        }
+    }
+}
+
 /// Correct the buffer's last sentence in place. If the user routed
 /// the "smart" path to the LLM and the provider initialized cleanly,
 /// the sentence goes through the LLM; otherwise (or on LLM failure)
@@ -600,13 +625,14 @@ fn fix_last_sentence(
     provider: &hyprcorrect_core::OfflineProvider,
     smart: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
 ) {
     use hyprcorrect_platform::linux::emit;
 
     let Some(last) = buffer.last_sentence() else {
         return;
     };
-    let corrected = correct_sentence(&last.sentence, smart, llm, provider);
+    let corrected = correct_sentence(&last.sentence, smart, llm, languagetool, provider);
     if corrected == last.sentence {
         return;
     }
@@ -619,14 +645,14 @@ fn fix_last_sentence(
 }
 
 /// Route the sentence to whichever provider the user configured for
-/// the "smart" path. LanguageTool stays on the offline fallback for
-/// now (M5 wires it up). On LLM failure (network, bad key) we drop
-/// back to the offline path so the chord never silently no-ops.
+/// the "smart" path. On any provider failure we drop back to the
+/// offline spellbook path so the chord never silently no-ops.
 #[cfg(target_os = "linux")]
 fn correct_sentence(
     text: &str,
     smart: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
 ) -> String {
     use hyprcorrect_core::ProviderId;
@@ -641,8 +667,38 @@ fn correct_sentence(
             },
             None => apply_corrections(text, spell),
         },
-        ProviderId::Spellbook | ProviderId::LanguageTool => apply_corrections(text, spell),
+        ProviderId::LanguageTool => match languagetool {
+            Some(lt) => match lt.check_text(text) {
+                Ok(corrections) => apply_correction_list(text, corrections),
+                Err(e) => {
+                    eprintln!(
+                        "hyprcorrect: LanguageTool call failed ({e}) — falling back to spellbook"
+                    );
+                    apply_corrections(text, spell)
+                }
+            },
+            None => apply_corrections(text, spell),
+        },
+        ProviderId::Spellbook => apply_corrections(text, spell),
     }
+}
+
+/// Apply a precomputed list of corrections (from LanguageTool) to
+/// `text`. Sorted right-to-left so byte offsets stay valid through
+/// later replacements.
+#[cfg(target_os = "linux")]
+fn apply_correction_list(text: &str, mut corrections: Vec<hyprcorrect_core::Correction>) -> String {
+    if corrections.is_empty() {
+        return text.to_string();
+    }
+    corrections.sort_by_key(|c| std::cmp::Reverse(c.span.start));
+    let mut out = text.to_string();
+    for c in corrections {
+        if let Some(fix) = c.suggestions.first() {
+            out.replace_range(c.span.clone(), fix);
+        }
+    }
+    out
 }
 
 /// Run the provider over `text` and apply each correction's top
