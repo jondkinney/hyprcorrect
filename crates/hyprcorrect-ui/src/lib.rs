@@ -10,6 +10,7 @@
 
 mod icon;
 mod prefs;
+mod review;
 
 /// Open the preferences window. Blocks until the user closes it.
 ///
@@ -17,4 +18,12 @@ mod prefs;
 /// after best-effort asking the existing one to focus itself.
 pub fn run_preferences() {
     prefs::run();
+}
+
+/// Open the review popup for the daemon's pending review request.
+/// Reads the request from the runtime file, shows the popup, and
+/// signals the daemon on exit so the apply happens against the
+/// originating window. Blocks until the user closes the popup.
+pub fn run_review() {
+    review::run();
 }

@@ -40,8 +40,8 @@ fn main() {
                  corrects the last word when you press the trigger chord"
             );
         }
-        Some(Command::FixSentence) => not_yet("fix-sentence", "M4"),
-        Some(Command::Review) => not_yet("the review popup", "M4"),
+        Some(Command::FixSentence) => not_yet("fix-sentence as a CLI subcommand", "M5"),
+        Some(Command::Review) => hyprcorrect_ui::run_review(),
         Some(Command::Prefs) => hyprcorrect_ui::run_preferences(),
     }
 }
@@ -75,6 +75,7 @@ fn run_daemon() {
         }
     };
     let mut sentence_chord = parse_optional_chord(&initial_config.hotkeys.fix_sentence);
+    let mut review_chord = parse_optional_chord(&initial_config.hotkeys.review);
     let mut blocklist = build_blocklist(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
 
@@ -113,6 +114,12 @@ fn run_daemon() {
         eprintln!("hyprcorrect: sentence bind failed: {e}");
         // Non-fatal — fall through with the word chord still bound.
         sentence_chord = None;
+    }
+    if let Some(ref rc) = review_chord
+        && let Err(e) = hotkey::install_bind(rc, "review")
+    {
+        eprintln!("hyprcorrect: review bind failed: {e}");
+        review_chord = None;
     }
     let (initial_window, focus_rx) = match focus::start() {
         Ok(pair) => pair,
@@ -212,16 +219,35 @@ fn run_daemon() {
                 }
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Trigger) => {
-                if !paused.load(Ordering::Relaxed)
-                    && !current_blocked
-                    && let Some(addr) = current_address.as_deref()
-                    && let Some(buffer) = buffers.get_mut(addr)
-                {
-                    match hyprcorrect_core::runtime::read_action().as_str() {
-                        "sentence" => {
-                            fix_last_sentence(buffer, &provider, smart_provider_id, llm.as_ref());
+                let action = hyprcorrect_core::runtime::read_action();
+                match action.as_str() {
+                    "review-apply" => apply_review(&mut buffers),
+                    "review-cancel" => {
+                        hyprcorrect_core::runtime::clear_review();
+                    }
+                    _ => {
+                        if !paused.load(Ordering::Relaxed)
+                            && !current_blocked
+                            && let Some(addr) = current_address.as_deref()
+                            && let Some(buffer) = buffers.get_mut(addr)
+                        {
+                            match action.as_str() {
+                                "review" => start_review(
+                                    addr,
+                                    buffer,
+                                    &provider,
+                                    smart_provider_id,
+                                    llm.as_ref(),
+                                ),
+                                "sentence" => fix_last_sentence(
+                                    buffer,
+                                    &provider,
+                                    smart_provider_id,
+                                    llm.as_ref(),
+                                ),
+                                _ => fix_last_word(buffer, &provider),
+                            }
                         }
-                        _ => fix_last_word(buffer, &provider),
                     }
                 }
             }
@@ -241,8 +267,6 @@ fn run_daemon() {
                             }
                             let new_sentence_chord =
                                 parse_optional_chord(&new_config.hotkeys.fix_sentence);
-                            // Drop the old sentence bind if the chord
-                            // changed or was cleared.
                             if let Some(ref old) = sentence_chord
                                 && new_sentence_chord.as_ref() != Some(old)
                             {
@@ -254,6 +278,20 @@ fn run_daemon() {
                                 eprintln!("hyprcorrect: sentence rebind failed: {e}");
                             }
                             sentence_chord = new_sentence_chord;
+
+                            let new_review_chord = parse_optional_chord(&new_config.hotkeys.review);
+                            if let Some(ref old) = review_chord
+                                && new_review_chord.as_ref() != Some(old)
+                            {
+                                let _ = hotkey::uninstall_bind(old);
+                            }
+                            if let Some(ref rc) = new_review_chord
+                                && let Err(e) = hotkey::install_bind(rc, "review")
+                            {
+                                eprintln!("hyprcorrect: review rebind failed: {e}");
+                            }
+                            review_chord = new_review_chord;
+
                             blocklist = build_blocklist(&new_config);
                             llm = build_llm(&new_config);
                             smart_provider_id = new_config.providers.smart;
@@ -276,6 +314,9 @@ fn run_daemon() {
                 let _ = hotkey::uninstall_bind(&chord);
                 if let Some(ref sc) = sentence_chord {
                     let _ = hotkey::uninstall_bind(sc);
+                }
+                if let Some(ref rc) = review_chord {
+                    let _ = hotkey::uninstall_bind(rc);
                 }
                 eprintln!("hyprcorrect: trigger released for capture");
             }
@@ -312,7 +353,11 @@ fn run_daemon() {
     if let Some(ref sc) = sentence_chord {
         let _ = hotkey::uninstall_bind(sc);
     }
+    if let Some(ref rc) = review_chord {
+        let _ = hotkey::uninstall_bind(rc);
+    }
     hyprcorrect_core::runtime::clear_pid();
+    hyprcorrect_core::runtime::clear_review();
 }
 
 /// Resolve the trigger chord the daemon should bind. `$HYPRCORRECT_CHORD`
@@ -402,6 +447,83 @@ fn fix_last_word(
         Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
+}
+
+/// Compute the smart provider's suggestion for the focused window's
+/// last sentence, write a review request, and spawn the popup. The
+/// daemon does no emit here — the popup's exit signals back with a
+/// `review-apply` / `review-cancel` action and the apply path below
+/// finishes the job.
+#[cfg(target_os = "linux")]
+fn start_review(
+    address: &str,
+    buffer: &hyprcorrect_core::Buffer,
+    provider: &hyprcorrect_core::OfflineProvider,
+    smart: hyprcorrect_core::ProviderId,
+    llm: Option<&hyprcorrect_core::LlmProvider>,
+) {
+    use hyprcorrect_core::runtime::{ReviewRequest, write_review_request};
+    let Some(last) = buffer.last_sentence() else {
+        return;
+    };
+    let corrected = correct_sentence(&last.sentence, smart, llm, provider);
+    if corrected == last.sentence {
+        // Nothing to review — every provider said the sentence is fine.
+        return;
+    }
+    let request = ReviewRequest {
+        original: last.sentence,
+        corrected,
+        trailing: last.trailing,
+        window_address: address.to_string(),
+    };
+    if let Err(e) = write_review_request(&request) {
+        eprintln!("hyprcorrect: could not write review request: {e}");
+        return;
+    }
+    spawn_review_window();
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_review_window() {
+    use std::process::{Command, Stdio};
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("hyprcorrect: cannot find own executable to launch review");
+        return;
+    };
+    let result = Command::new(&exe)
+        .arg("review")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Err(e) = result {
+        eprintln!("hyprcorrect: could not launch review window: {e}");
+    }
+}
+
+/// Honor a `review-apply` signal: emit the proposed correction to the
+/// originating window (the popup already slept ~150 ms after closing
+/// itself, so Hyprland has had a chance to refocus the source).
+#[cfg(target_os = "linux")]
+fn apply_review(buffers: &mut std::collections::HashMap<String, hyprcorrect_core::Buffer>) {
+    use hyprcorrect_core::runtime::{clear_review, read_review_request};
+    use hyprcorrect_platform::linux::emit;
+
+    let Ok(Some(req)) = read_review_request() else {
+        return;
+    };
+    let backspaces = req.original.chars().count() + req.trailing.chars().count();
+    let insert = format!("{}{}", req.corrected, req.trailing);
+    match emit::replace(backspaces, &insert) {
+        Ok(()) => {
+            if let Some(buf) = buffers.get_mut(&req.window_address) {
+                buf.apply(backspaces, &insert);
+            }
+        }
+        Err(e) => eprintln!("hyprcorrect: review emit failed: {e}"),
+    }
+    clear_review();
 }
 
 /// Try to build the LLM provider from the current config. Returns

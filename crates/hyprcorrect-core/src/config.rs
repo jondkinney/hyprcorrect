@@ -53,16 +53,19 @@ pub struct Config {
 pub struct Hotkeys {
     /// Accelerator for `fix-last-word`. Example: `"SUPER+CTRL+SHIFT+ALT+F"`.
     pub fix_word: String,
-    /// Accelerator for `fix-last-sentence`. Empty = unbound; the
-    /// daemon ignores it until milestone M4 wires the sentence
-    /// action.
+    /// Accelerator for `fix-last-sentence`. Empty = unbound.
     pub fix_sentence: String,
+    /// Accelerator for the review popup — shows the proposed
+    /// correction in a small egui window and waits for Apply / Cancel
+    /// before emitting. Empty = unbound.
+    pub review: String,
 }
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
             fix_word: "SUPER+CTRL+SHIFT+ALT+F".into(),
             fix_sentence: String::new(),
+            review: String::new(),
         }
     }
 }

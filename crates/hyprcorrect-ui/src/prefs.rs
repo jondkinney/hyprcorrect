@@ -24,6 +24,7 @@ const LLM_ANTHROPIC_KEY: &str = "llm.anthropic";
 enum HotkeyTarget {
     FixWord,
     FixSentence,
+    Review,
 }
 
 /// Sections in the left sidebar.
@@ -235,6 +236,7 @@ impl eframe::App for PrefsApp {
                     match target {
                         HotkeyTarget::FixWord => self.config.hotkeys.fix_word = s,
                         HotkeyTarget::FixSentence => self.config.hotkeys.fix_sentence = s,
+                        HotkeyTarget::Review => self.config.hotkeys.review = s,
                     }
                     self.capturing_chord = None;
                     self.clear_status();
@@ -423,9 +425,41 @@ impl PrefsApp {
         ui.add_space(6.0);
         caption(
             ui,
-            "Corrects the previous sentence in one keypress. Bind it if \
-             you want it now — the daemon ignores this chord until \
-             milestone M4 wires up the sentence action.",
+            "Corrects the previous sentence in one keypress. Routes to \
+             whichever provider you picked as `Smart` in Providers.",
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        // -- Review popup -------------------------------------------------
+        field_label(ui, "Review correction");
+        ui.add_space(4.0);
+        let review_value = self.config.hotkeys.review.clone();
+        if hotkey_chord_row(
+            ui,
+            HotkeyTarget::Review,
+            &review_value,
+            self.capturing_chord,
+        ) {
+            self.capturing_chord = Some(HotkeyTarget::Review);
+            self.clear_status();
+            notify_daemon_release();
+        }
+        if !self.config.hotkeys.review.is_empty()
+            && ui
+                .add(egui::Button::new("Clear").frame(false))
+                .on_hover_text("Unbind this chord")
+                .clicked()
+        {
+            self.config.hotkeys.review.clear();
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "Shows the proposed correction in a small popup; press Enter \
+             to apply or Esc to cancel. Useful for eyeballing LLM \
+             suggestions before they land.",
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
@@ -779,7 +813,7 @@ static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
 /// fails on a desktop Linux system.
 ///
 /// Mirrors `vernier`'s `install_glyph_fonts` pattern.
-fn install_glyph_fonts(ctx: &egui::Context) {
+pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
@@ -1203,6 +1237,10 @@ fn validate(config: &Config) -> Result<(), String> {
     if !config.hotkeys.fix_sentence.is_empty() {
         hyprcorrect_core::Chord::parse(&config.hotkeys.fix_sentence)
             .map_err(|e| format!("Fix-last-sentence chord is invalid ({e})."))?;
+    }
+    if !config.hotkeys.review.is_empty() {
+        hyprcorrect_core::Chord::parse(&config.hotkeys.review)
+            .map_err(|e| format!("Review chord is invalid ({e})."))?;
     }
     Ok(())
 }
