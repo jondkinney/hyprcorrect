@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=hyprcorrect
+GenericName=Spelling corrector
+Comment=Keyboard-driven desktop spelling and typo correction
+Exec=hyprcorrect
+Icon=tools-check-spelling
+Terminal=false
+Categories=Utility;TextTools;
+Keywords=spell;spellcheck;autocorrect;typo;correction;keyboard;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
