@@ -543,11 +543,11 @@ impl PrefsApp {
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "Pause after backspaces");
+        field_label(ui, "Pause after backspaces (base)");
         caption(
             ui,
-            "Gap between erasing the original text and typing the \
-             correction.",
+            "Fixed gap between erasing the original text and typing \
+             the correction. Acts as the floor for very short edits.",
         );
         ui.add_space(6.0);
         let response = ui.add(
@@ -557,14 +557,32 @@ impl PrefsApp {
         if response.changed() {
             self.clear_status();
         }
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Pause per backspace");
+        caption(
+            ui,
+            "Added once per backspace. A 50-char sentence waits \
+             longer than a 5-char word. Total wait = base + (per-char × count).",
+        );
+        ui.add_space(6.0);
+        let response = ui.add(
+            egui::Slider::new(
+                &mut self.config.behavior.post_backspace_pause_per_char_ms,
+                0..=10,
+            )
+            .suffix(" ms"),
+        );
+        if response.changed() {
+            self.clear_status();
+        }
         ui.add_space(6.0);
         caption(
             ui,
-            "Raise this for apps that still show a few leftover \
-             characters from the original after a fix — typically \
-             LibreOffice or Electron editors that need a moment to \
-             finish processing the backspace burst. 30 ms is the \
-             default; 60–100 ms is safe for very slow apps.",
+            "Defaults: 30 ms base + 2 ms/char. Raise the per-char \
+             value if longer sentences still show leftover prefix \
+             characters in slow apps like LibreOffice — that's the \
+             knob that scales with edit length.",
         );
     }
 

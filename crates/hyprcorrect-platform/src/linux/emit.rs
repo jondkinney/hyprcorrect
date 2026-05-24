@@ -29,18 +29,18 @@ pub enum EmitError {
 ///
 /// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
 pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
-    replace_with_delay(backspaces, text, 0, 0)
+    replace_with_delay(backspaces, text, 0, 0, 0)
 }
 
 /// Like [`replace`], but explicitly sets:
 /// - `inter_key_delay_ms`: per-key delay between *every* keystroke
 ///   (passed to wtype's `-d` flag); raise for apps that drop chars
 ///   under fast typing.
-/// - `post_backspace_pause_ms`: pause between the backspace burst
-///   and the replacement-text burst; raise for apps (e.g.
-///   LibreOffice on Wayland) that don't finish processing the
-///   backspaces before new typing starts to land, leaving leftover
-///   prefix chars from the original.
+/// - `post_backspace_pause_ms`: fixed pause between the backspace
+///   burst and the replacement-text burst.
+/// - `post_backspace_pause_per_char_ms`: additional pause per
+///   backspace, so the gap scales with edit length. Total pause =
+///   `post_backspace_pause_ms` + per-char × backspace count.
 ///
 /// Backspaces and text are emitted as *two separate* `wtype`
 /// invocations so the focused app has a clean event boundary
@@ -54,6 +54,7 @@ pub fn replace_with_delay(
     text: &str,
     inter_key_delay_ms: u32,
     post_backspace_pause_ms: u32,
+    post_backspace_pause_per_char_ms: u32,
 ) -> Result<(), EmitError> {
     if backspaces > 0 {
         let mut cmd = Command::new("wtype");
@@ -64,10 +65,11 @@ pub fn replace_with_delay(
             cmd.args(["-P", "BackSpace", "-p", "BackSpace"]);
         }
         run(cmd)?;
-        if post_backspace_pause_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(
-                post_backspace_pause_ms.into(),
-            ));
+        let scaled_pause = u64::from(post_backspace_pause_ms).saturating_add(
+            u64::from(post_backspace_pause_per_char_ms).saturating_mul(backspaces as u64),
+        );
+        if scaled_pause > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(scaled_pause));
         }
     }
     if !text.is_empty() {
