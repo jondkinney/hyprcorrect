@@ -101,7 +101,7 @@ impl eframe::App for ReviewApp {
                         self.decision = Some("cancel");
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    let apply_label = egui::RichText::new("Apply  (↵)")
+                    let apply_label = egui::RichText::new("Apply  (Enter)")
                         .color(egui::Color32::from_rgb(90, 200, 120));
                     if ui.button(apply_label).clicked() {
                         self.decision = Some("apply");

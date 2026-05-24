@@ -541,6 +541,31 @@ impl PrefsApp {
             "0 ms is fastest but some apps drop characters under that speed; \
              2 ms is the safe default.",
         );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Pause after backspaces");
+        caption(
+            ui,
+            "Gap between erasing the original text and typing the \
+             correction.",
+        );
+        ui.add_space(6.0);
+        let response = ui.add(
+            egui::Slider::new(&mut self.config.behavior.post_backspace_pause_ms, 0..=200)
+                .suffix(" ms"),
+        );
+        if response.changed() {
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "Raise this for apps that still show a few leftover \
+             characters from the original after a fix — typically \
+             LibreOffice or Electron editors that need a moment to \
+             finish processing the backspace burst. 30 ms is the \
+             default; 60–100 ms is safe for very slow apps.",
+        );
     }
 
     fn privacy_panel(&mut self, ui: &mut egui::Ui) {

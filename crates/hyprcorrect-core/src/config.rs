@@ -148,11 +148,19 @@ pub struct Behavior {
     /// Per-key delay applied to synthetic typing; mitigates the rare
     /// dropped-character bug in some apps.
     pub inter_key_delay_ms: u32,
+    /// Pause inserted between the backspace burst and the replacement
+    /// text. Raise this for slower apps (LibreOffice / Electron-based
+    /// editors) that don't finish processing the backspaces before the
+    /// new typing arrives — symptoms include leftover prefix
+    /// characters from the original sentence still on screen after a
+    /// fix.
+    pub post_backspace_pause_ms: u32,
 }
 impl Default for Behavior {
     fn default() -> Self {
         Self {
             inter_key_delay_ms: 2,
+            post_backspace_pause_ms: 30,
         }
     }
 }
