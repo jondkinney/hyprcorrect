@@ -526,22 +526,21 @@ impl PrefsApp {
         ui.heading("Behavior");
         ui.add_space(14.0);
 
-        field_label(ui, "Backspace pacing");
+        field_label(ui, "Pause per backspace");
         caption(
             ui,
-            "Per-key delay used when erasing the original text. This \
-             is the only emit-side knob most users need: raise it if \
-             you see leftover prefix characters from the original \
-             after a fix lands. The replacement text is always typed \
-             at a fixed 2 ms cadence.",
+            "After hyprcorrect dispatches the backspaces, it waits \
+             this long per backspace before typing the replacement. \
+             That pause gives the focused app time to actually apply \
+             the deletes through its own event loop — without it, \
+             the typing burst can race ahead and leave a prefix of \
+             the original on screen. Raise it if you see leftover \
+             characters after a fix lands.",
         );
         ui.add_space(6.0);
         let response = ui.add(
-            egui::Slider::new(
-                &mut self.config.behavior.backspace_inter_key_delay_ms,
-                0..=30,
-            )
-            .suffix(" ms"),
+            egui::Slider::new(&mut self.config.behavior.pause_per_backspace_ms, 0..=30)
+                .suffix(" ms"),
         );
         if response.changed() {
             self.clear_status();
@@ -550,11 +549,10 @@ impl PrefsApp {
         caption(
             ui,
             "8 ms is the default and works for most apps. Raise to \
-             12–15 ms for slow apps like LibreOffice Writer where \
-             Wayland's virtual-keyboard pipeline drops backspaces \
-             under fast dispatch. Lower to 4 ms only if your apps \
-             handle that cadence cleanly — corrections will feel \
-             snappier.",
+             12–15 ms for slow apps like LibreOffice Writer that \
+             need longer to drain a big backspace burst. Lower to \
+             4 ms if your apps keep up cleanly — corrections will \
+             feel snappier.",
         );
     }
 

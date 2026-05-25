@@ -145,19 +145,25 @@ impl Default for LanguageToolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Behavior {
-    /// Per-key delay applied to the *backspace* burst that erases
-    /// the original text before the correction is typed. The only
-    /// emit-side knob most users need: raise it if you see leftover
-    /// prefix characters from the original after a fix (Wayland's
-    /// virtual-keyboard pipeline drops backspaces under very fast
-    /// dispatch). The replacement-text typing uses a fixed 2 ms
-    /// delay internally.
-    pub backspace_inter_key_delay_ms: u32,
+    /// Wait time per backspace, applied as a single pause between
+    /// the backspace burst and the replacement-text burst. Total
+    /// pause = `pause_per_backspace_ms` × backspace count.
+    ///
+    /// The only emit-side knob most users need. The reason behind
+    /// it: Wayland delivers all dispatched backspaces reliably, but
+    /// the focused app drains them through its own event loop at
+    /// its own pace — if the daemon's next `wtype` (the typing
+    /// burst) starts before the app has finished applying the
+    /// backspaces, those text events queue behind the still-
+    /// processing deletes and visually leave a prefix of the
+    /// original on screen. This pause covers that drain time.
+    /// Raise it if you still see leftover prefix characters.
+    pub pause_per_backspace_ms: u32,
 }
 impl Default for Behavior {
     fn default() -> Self {
         Self {
-            backspace_inter_key_delay_ms: 8,
+            pause_per_backspace_ms: 8,
         }
     }
 }
@@ -259,7 +265,7 @@ fix_word = "CTRL+J"
         .unwrap();
         assert_eq!(cfg.hotkeys.fix_word, "CTRL+J");
         // Untouched sections still hold defaults.
-        assert_eq!(cfg.behavior.backspace_inter_key_delay_ms, 8);
+        assert_eq!(cfg.behavior.pause_per_backspace_ms, 8);
         assert_eq!(cfg.providers.default, ProviderId::Spellbook);
         assert!(cfg.privacy.app_blocklist.is_empty());
     }
