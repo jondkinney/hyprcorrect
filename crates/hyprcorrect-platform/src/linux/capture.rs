@@ -19,12 +19,15 @@
 //! not yet read — that is M5 polish.
 
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use evdev::{Device, EventSummary, KeyCode};
 use hyprcorrect_core::{Chord, Key};
 use xkbcommon::xkb;
+
+use crate::linux::chord_capture::ChordCaptureSlot;
 
 /// An error starting keystroke capture.
 #[derive(Debug, thiserror::Error)]
@@ -73,7 +76,10 @@ struct TriggerSpec {
 /// # Errors
 ///
 /// See [`CaptureError`].
-pub fn start(chords: &[Chord]) -> Result<Receiver<Key>, CaptureError> {
+pub fn start(
+    chords: &[Chord],
+    chord_capture: Arc<ChordCaptureSlot>,
+) -> Result<Receiver<Key>, CaptureError> {
     // Compile the keymap once, up front, so a broken layout fails fast
     // with a clear error rather than a silent no-events daemon.
     let keymap_text = {
@@ -98,7 +104,8 @@ pub fn start(chords: &[Chord]) -> Result<Receiver<Key>, CaptureError> {
         let tx = tx.clone();
         let keymap_text = keymap_text.clone();
         let triggers = triggers.clone();
-        thread::spawn(move || read_device(device, &keymap_text, &triggers, &tx));
+        let chord_capture = chord_capture.clone();
+        thread::spawn(move || read_device(device, &keymap_text, &triggers, &chord_capture, &tx));
     }
     Ok(rx)
 }
@@ -174,7 +181,13 @@ fn is_keyboard(device: &Device) -> bool {
 /// Read one device forever, translating key events into [`Key`]s and
 /// sending them to `tx`. Returns — ending the thread — when the device
 /// disappears or the receiver is dropped.
-fn read_device(mut device: Device, keymap_text: &str, triggers: &[TriggerSpec], tx: &Sender<Key>) {
+fn read_device(
+    mut device: Device,
+    keymap_text: &str,
+    triggers: &[TriggerSpec],
+    chord_capture: &ChordCaptureSlot,
+    tx: &Sender<Key>,
+) {
     // Each thread builds its own xkb state: Context/Keymap/State hold
     // raw pointers and are not Send, so they cannot cross the thread
     // boundary. The keymap text was already validated by `start`.
@@ -202,11 +215,20 @@ fn read_device(mut device: Device, keymap_text: &str, triggers: &[TriggerSpec], 
             // value: 0 = release, 1 = press, 2 = auto-repeat. Read the
             // key from the *current* state, before this key updates it
             // (the xkbcommon convention).
-            if value != 0
-                && let Some(key) = translate(&state, keycode, triggers)
-                && tx.send(key).is_err()
-            {
-                return; // receiver dropped
+            if value != 0 {
+                // Chord-record mode pre-empts normal Key handling so
+                // pressing the chord doesn't reset the buffer or fire
+                // any trigger while prefs is recording.
+                if chord_capture.is_armed()
+                    && let Some(chord) = chord_from_state(&state, keycode)
+                    && chord_capture.try_emit(chord)
+                {
+                    // Modifier state still needs to update below.
+                } else if let Some(key) = translate(&state, keycode, triggers)
+                    && tx.send(key).is_err()
+                {
+                    return; // receiver dropped
+                }
             }
 
             // Track modifiers on press and release; an auto-repeat is
@@ -256,6 +278,89 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, triggers: &[TriggerSpec]
     }
 
     classify(sym, &state.key_get_utf8(keycode))
+}
+
+/// Build the chord string for a key pressed in chord-record mode:
+/// the currently-held SUPER/CTRL/SHIFT/ALT modifiers, plus the
+/// canonical name of the non-modifier key. Returns `None` for
+/// modifier-only presses so prefs can keep recording until the user
+/// hits a real key.
+///
+/// Format matches [`hyprcorrect_core::Chord::parse`] exactly, e.g.
+/// `"SUPER+CTRL+SHIFT+ALT+F"` or `"CTRL+SPACE"` or bare `"F1"`.
+fn chord_from_state(state: &xkb::State, keycode: xkb::Keycode) -> Option<String> {
+    let sym = state.key_get_one_sym(keycode).raw();
+    if is_modifier_keysym(sym) {
+        return None;
+    }
+    let key_token = chord_key_token(sym)?;
+
+    let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
+    let mut parts: Vec<&str> = Vec::new();
+    if active(xkb::MOD_NAME_SHIFT) {
+        parts.push("SHIFT");
+    }
+    if active(xkb::MOD_NAME_CTRL) {
+        parts.push("CTRL");
+    }
+    if active(xkb::MOD_NAME_ALT) {
+        parts.push("ALT");
+    }
+    if active(xkb::MOD_NAME_LOGO) {
+        parts.push("SUPER");
+    }
+    Some(if parts.is_empty() {
+        key_token
+    } else {
+        format!("{}+{key_token}", parts.join("+"))
+    })
+}
+
+/// The token used in chord strings for a non-modifier keysym.
+/// Letters become uppercase ASCII; common named keys (Space, F-row,
+/// arrows, etc.) use the same UPPERCASE tokens
+/// [`hyprcorrect_core::Chord::parse`] accepts; anything else falls
+/// back to xkb's canonical keysym name uppercased.
+fn chord_key_token(sym: u32) -> Option<String> {
+    // Canonical chord tokens. Match the form used by vernier and
+    // the rest of the hyprcorrect UI so the recorded chord round-
+    // trips cleanly and the chip renderer doesn't need a second
+    // translation layer. Hyprland accepts the long xkb keysym
+    // names (Escape, Return, BackSpace, ...) case-insensitively,
+    // so the only tokens that need translation back to xkb names
+    // at hyprctl-bind time are ESC and ENTER — handled in
+    // `Chord::hyprland_key`.
+    let named = match sym {
+        0xff1b => Some("ESC"),       // Escape
+        0xff0d | 0xff8d => Some("ENTER"), // Return / KP_Enter
+        0xff09 => Some("TAB"),       // Tab
+        0xff08 => Some("BACKSPACE"), // BackSpace
+        0xffff => Some("DELETE"),    // Delete
+        0xff52 => Some("UP"),        // Up
+        0xff54 => Some("DOWN"),      // Down
+        0xff51 => Some("LEFT"),      // Left
+        0xff53 => Some("RIGHT"),     // Right
+        0x20 => Some("SPACE"),       // space
+        0x2b => Some("PLUS"),        // +  (avoid colliding with the modifier separator)
+        0x2d => Some("MINUS"),       // -
+        0x3d => Some("EQUAL"),       // =
+        _ => None,
+    };
+    if let Some(token) = named {
+        return Some(token.to_string());
+    }
+    if (0x21..=0x7E).contains(&sym) {
+        // Printable ASCII keysyms (letters, digits, punctuation) are
+        // identical to their codepoint; lowercase letters get folded
+        // up so `Chord::parse` round-trips.
+        let ch = char::from_u32(sym)?.to_ascii_uppercase();
+        return Some(ch.to_string());
+    }
+    let name = xkb::keysym_get_name(xkb::Keysym::from(sym));
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_ascii_uppercase())
 }
 
 /// `true` when the currently-held modifier set matches the trigger

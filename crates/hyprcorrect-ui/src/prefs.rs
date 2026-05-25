@@ -13,9 +13,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use hyprcorrect_core::{Config, LlmConfig, ProviderId, runtime, secrets};
+use hyprcorrect_platform::linux::chord_capture::{self, ChordRecording, ClientError};
 
 use crate::apps::AppRegistry;
 use crate::icon;
+
+type ChordRecorder = ChordRecording;
 
 const APP_ID: &str = "hyprcorrect-prefs";
 const LLM_ANTHROPIC_KEY: &str = "llm.anthropic";
@@ -98,6 +101,11 @@ struct PrefsApp {
     /// Which hotkey row, if any, is recording. The next non-modifier
     /// key press becomes the new chord for that target.
     capturing_chord: Option<HotkeyTarget>,
+    /// In-flight chord-capture IPC. egui-winit on Linux discards
+    /// Super, so all chord recording goes through the daemon's
+    /// evdev-based capture loop instead. `Some` while a recording
+    /// is in flight; `None` otherwise.
+    chord_recorder: Option<ChordRecorder>,
     /// Window classes detected on the desktop right now, sorted and
     /// deduplicated. Populated lazily and refreshed when the privacy
     /// panel is opened so the picker reflects whatever's running.
@@ -129,6 +137,7 @@ impl PrefsApp {
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
             capturing_chord: None,
+            chord_recorder: None,
             running_apps: Vec::new(),
             last_apps_refresh: Instant::now() - Duration::from_secs(60),
             selected_app: None,
@@ -227,27 +236,59 @@ impl eframe::App for PrefsApp {
         apply_style(ctx);
         self.refresh_stale_check();
 
-        // While recording a chord, drain key events from egui's input
-        // queue (so other widgets don't act on them) and commit the
-        // first non-modifier key press with whatever modifiers are
-        // currently held. Esc cancels.
-        if let Some(target) = self.capturing_chord
-            && let Some(outcome) = ctx.input_mut(capture_outcome)
-        {
-            match outcome {
-                CaptureOutcome::Cancel => {
-                    self.capturing_chord = None;
-                    notify_daemon_reload();
-                }
-                CaptureOutcome::Commit(s) => {
-                    match target {
-                        HotkeyTarget::FixWord => self.config.hotkeys.fix_word = s,
-                        HotkeyTarget::FixSentence => self.config.hotkeys.fix_sentence = s,
-                        HotkeyTarget::Review => self.config.hotkeys.review = s,
+        // Chord recording happens through the daemon (see
+        // `hyprcorrect-platform/src/linux/chord_capture.rs`): egui
+        // on Linux discards Super out of its `Modifiers`, so we
+        // can't honestly record SUPER-containing chords here.
+        // Open the IPC the first frame after a row is clicked,
+        // then poll non-blockingly until the user releases a key.
+        if let Some(target) = self.capturing_chord {
+            if self.chord_recorder.is_none() {
+                match chord_capture::record_chord() {
+                    Ok(rec) => self.chord_recorder = Some(rec),
+                    Err(e) => {
+                        self.capturing_chord = None;
+                        self.err(chord_record_error(&e));
+                        notify_daemon_reload();
                     }
-                    self.capturing_chord = None;
-                    self.clear_status();
-                    notify_daemon_reload();
+                }
+            }
+            // Esc cancels — read it from egui's input queue and
+            // shutdown the IPC so the daemon's slot also clears.
+            let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            if esc_pressed && let Some(rec) = &self.chord_recorder {
+                rec.abort();
+            }
+            if let Some(rec) = &self.chord_recorder {
+                match rec.try_recv() {
+                    Ok(None) => {
+                        // Still waiting — request a repaint soon so
+                        // the next try_recv lands quickly when the
+                        // user does press a key.
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                    }
+                    Ok(Some(chord)) => {
+                        match target {
+                            HotkeyTarget::FixWord => self.config.hotkeys.fix_word = chord,
+                            HotkeyTarget::FixSentence => self.config.hotkeys.fix_sentence = chord,
+                            HotkeyTarget::Review => self.config.hotkeys.review = chord,
+                        }
+                        self.capturing_chord = None;
+                        self.chord_recorder = None;
+                        self.clear_status();
+                        notify_daemon_reload();
+                    }
+                    Err(ClientError::Cancelled) => {
+                        self.capturing_chord = None;
+                        self.chord_recorder = None;
+                        notify_daemon_reload();
+                    }
+                    Err(e) => {
+                        self.capturing_chord = None;
+                        self.chord_recorder = None;
+                        self.err(chord_record_error(&e));
+                        notify_daemon_reload();
+                    }
                 }
             }
         }
@@ -991,6 +1032,14 @@ fn chord_glyphs(stored: &str) -> String {
             "RIGHT" => "→".to_string(),
             "PRIOR" => "PgUp".to_string(),
             "NEXT" => "PgDn".to_string(),
+            // Punctuation that chord-capture spells out so the
+            // saved string can't collide with the `+` modifier
+            // separator. Render them as the ASCII characters
+            // they represent.
+            "PLUS" => "+".to_string(),
+            "MINUS" => "-".to_string(),
+            "EQUAL" => "=".to_string(),
+            "UNDERSCORE" => "_".to_string(),
             other => other.to_string(),
         })
         .collect::<Vec<_>>()
@@ -1050,104 +1099,17 @@ fn shortcut_font(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("shortcut".into()))
 }
 
-/// Outcome of one frame of chord capture.
-enum CaptureOutcome {
-    /// User pressed Escape — exit capture without changing anything.
-    Cancel,
-    /// User pressed a non-modifier key — `String` is the accelerator
-    /// (e.g. `"SUPER+CTRL+SHIFT+ALT+F"`).
-    Commit(String),
-}
-
-/// Drain the input queue for one frame of chord capture. Eats any
-/// key events so they don't reach other widgets.
-fn capture_outcome(i: &mut egui::InputState) -> Option<CaptureOutcome> {
-    // Esc with no modifiers cancels.
-    let escaped = i.events.iter().any(|ev| {
-        matches!(
-            ev,
-            egui::Event::Key {
-                key: egui::Key::Escape,
-                pressed: true,
-                modifiers,
-                ..
-            } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt
-                && !modifiers.command && !modifiers.mac_cmd
-        )
-    });
-    if escaped {
-        i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
-        return Some(CaptureOutcome::Cancel);
-    }
-    let result = i.events.iter().find_map(|ev| match ev {
-        egui::Event::Key {
-            key,
-            pressed: true,
-            modifiers,
-            ..
-        } => Some(format_accelerator(*key, *modifiers)),
-        _ => None,
-    });
-    i.events.retain(|ev| !matches!(ev, egui::Event::Key { .. }));
-    result.map(CaptureOutcome::Commit)
-}
-
-/// Format an egui (key, modifiers) pair as an UPPERCASE
-/// `+`-separated accelerator that round-trips through
-/// [`hyprcorrect_core::Chord::parse`].
-fn format_accelerator(key: egui::Key, modifiers: egui::Modifiers) -> String {
-    let mut parts: Vec<&'static str> = Vec::new();
-    // egui-winit aliases `Modifiers::command` to `ctrl` on non-macOS,
-    // so checking `command || mac_cmd` for SUPER would push SUPER
-    // anytime Ctrl is held — silently adding Super to every Ctrl
-    // recording. Only honor mac_cmd here; the Linux/Wayland Super
-    // key is invisible to egui-winit, so a SUPER-containing chord
-    // has to be entered through config.toml until daemon-side
-    // chord capture lands.
-    if modifiers.mac_cmd {
-        parts.push("SUPER");
-    }
-    if modifiers.ctrl {
-        parts.push("CTRL");
-    }
-    if modifiers.shift {
-        parts.push("SHIFT");
-    }
-    if modifiers.alt {
-        parts.push("ALT");
-    }
-    let key_str = match key {
-        egui::Key::Space => "space".to_string(),
-        egui::Key::Enter => "Return".to_string(),
-        egui::Key::Escape => "Escape".to_string(),
-        egui::Key::Tab => "Tab".to_string(),
-        egui::Key::Backspace => "BackSpace".to_string(),
-        egui::Key::Delete => "Delete".to_string(),
-        egui::Key::Insert => "Insert".to_string(),
-        egui::Key::Home => "Home".to_string(),
-        egui::Key::End => "End".to_string(),
-        egui::Key::PageUp => "Prior".to_string(),
-        egui::Key::PageDown => "Next".to_string(),
-        egui::Key::ArrowUp => "Up".to_string(),
-        egui::Key::ArrowDown => "Down".to_string(),
-        egui::Key::ArrowLeft => "Left".to_string(),
-        egui::Key::ArrowRight => "Right".to_string(),
-        // Punctuation: spell out so the saved string can't collide
-        // with the `+` modifier separator.
-        egui::Key::Plus => "PLUS".to_string(),
-        egui::Key::Minus => "MINUS".to_string(),
-        egui::Key::Equals => "EQUAL".to_string(),
-        egui::Key::Comma => "COMMA".to_string(),
-        egui::Key::Period => "PERIOD".to_string(),
-        egui::Key::Slash => "SLASH".to_string(),
-        egui::Key::Backslash => "BACKSLASH".to_string(),
-        egui::Key::Semicolon => "SEMICOLON".to_string(),
-        other => other.name().to_uppercase(),
-    };
-    if parts.is_empty() {
-        key_str
-    } else {
-        format!("{}+{}", parts.join("+"), key_str)
+/// Build a user-facing message for a chord-capture IPC failure.
+/// Translates the rare-but-possible "daemon not running" case into
+/// a clear hint instead of a raw error string.
+fn chord_record_error(err: &ClientError) -> String {
+    match err {
+        ClientError::DaemonOffline => {
+            "Daemon not running — start hyprcorrect, then try recording again.".to_string()
+        }
+        ClientError::Cancelled => "Recording cancelled.".to_string(),
+        ClientError::Daemon(msg) => format!("Daemon error: {msg}"),
+        ClientError::Io(msg) => format!("Chord-capture IPC failed: {msg}"),
     }
 }
 

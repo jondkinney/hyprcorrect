@@ -59,7 +59,7 @@ fn run_daemon() {
     use std::thread;
 
     use hyprcorrect_core::{Buffer, Chord, Config, OfflineProvider};
-    use hyprcorrect_platform::linux::{capture, focus, hotkey, tray};
+    use hyprcorrect_platform::linux::{capture, chord_capture, focus, hotkey, tray};
 
     let initial_config = Config::load().unwrap_or_else(|e| {
         eprintln!("hyprcorrect: could not load config ({e}) — using defaults");
@@ -92,7 +92,16 @@ fn run_daemon() {
             return;
         }
     };
-    let key_rx = match capture::start(&active_chords(&chord, &sentence_chord, &review_chord)) {
+    let chord_slot = chord_capture::ChordCaptureSlot::new();
+    if let Err(e) = chord_capture::start_listener(chord_slot.clone()) {
+        eprintln!(
+            "hyprcorrect: could not start chord-capture listener ({e}) — prefs won't be able to record SUPER chords"
+        );
+    }
+    let key_rx = match capture::start(
+        &active_chords(&chord, &sentence_chord, &review_chord),
+        chord_slot.clone(),
+    ) {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");

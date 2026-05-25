@@ -34,6 +34,16 @@ pub fn action_path() -> PathBuf {
     runtime_dir().join("hyprcorrect.action")
 }
 
+/// Path to the chord-capture Unix socket. The prefs window connects
+/// here and writes `capture\n` to ask the daemon to deliver the
+/// next non-modifier key press (with full modifier mask, including
+/// Super) as a chord string. The socket exists because egui-winit
+/// on Linux discards Super from `Modifiers`, so the prefs UI cannot
+/// record SUPER-containing chords on its own.
+pub fn chord_socket_path() -> PathBuf {
+    runtime_dir().join("hyprcorrect-chord.sock")
+}
+
 /// Path to the review-request file. The daemon writes the original
 /// sentence + the proposed correction + trailing whitespace + the
 /// originating window's address here when the review chord fires;
