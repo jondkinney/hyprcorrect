@@ -396,15 +396,19 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         KEY_Insert, KEY_KP_Enter, KEY_Left, KEY_Linefeed, KEY_Next, KEY_Prior, KEY_Return,
         KEY_Right, KEY_Tab, KEY_Up,
     };
-    const RESET_KEYS: [u32; 16] = [
+    // Left/Right arrow press translates to a buffer caret move so
+    // editing in-place during typing (jumping into earlier text to
+    // fix a typo, then continuing) keeps the buffer intact. Other
+    // caret movers (Up/Down/Home/End) and the cursor-modifying
+    // keys (Return/Tab/Esc/Delete/Insert/Prior/Next) still reset:
+    // we can't track them from raw evdev.
+    const RESET_KEYS: [u32; 14] = [
         KEY_Return,
         KEY_KP_Enter,
         KEY_Linefeed,
         KEY_Tab,
         KEY_ISO_Left_Tab,
         KEY_Escape,
-        KEY_Left,
-        KEY_Right,
         KEY_Up,
         KEY_Down,
         KEY_Home,
@@ -417,6 +421,10 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
 
     if sym == KEY_BackSpace {
         Some(Key::Backspace)
+    } else if sym == KEY_Left {
+        Some(Key::MoveLeft)
+    } else if sym == KEY_Right {
+        Some(Key::MoveRight)
     } else if RESET_KEYS.contains(&sym) {
         Some(Key::Reset)
     } else {
@@ -431,7 +439,9 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xkb::keysyms::{KEY_BackSpace, KEY_End, KEY_Escape, KEY_Left, KEY_Return, KEY_Tab, KEY_Up};
+    use xkb::keysyms::{
+        KEY_BackSpace, KEY_End, KEY_Escape, KEY_Left, KEY_Return, KEY_Right, KEY_Tab, KEY_Up,
+    };
 
     #[test]
     fn backspace_keysym_maps_to_backspace() {
@@ -439,8 +449,14 @@ mod tests {
     }
 
     #[test]
-    fn caret_moving_keys_reset_the_buffer() {
-        for sym in [KEY_Return, KEY_Tab, KEY_Escape, KEY_Left, KEY_Up, KEY_End] {
+    fn left_right_arrows_move_the_caret() {
+        assert_eq!(classify(KEY_Left, ""), Some(Key::MoveLeft));
+        assert_eq!(classify(KEY_Right, ""), Some(Key::MoveRight));
+    }
+
+    #[test]
+    fn other_navigation_keys_reset_the_buffer() {
+        for sym in [KEY_Return, KEY_Tab, KEY_Escape, KEY_Up, KEY_End] {
             assert_eq!(classify(sym, ""), Some(Key::Reset), "keysym {sym:#x}");
         }
     }
