@@ -10,7 +10,7 @@ use eframe::egui;
 use hyprcorrect_core::runtime::{self, ReviewRequest};
 
 const APP_ID: &str = "hyprcorrect-review";
-const REFOCUS_DELAY_MS: u64 = 150;
+const REFOCUS_DELAY_MS: u64 = 280;
 const WINDOW_WIDTH: f32 = 560.0;
 const MIN_WINDOW_HEIGHT: f32 = 240.0;
 const MAX_WINDOW_HEIGHT: f32 = 900.0;

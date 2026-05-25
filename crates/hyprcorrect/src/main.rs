@@ -620,6 +620,13 @@ fn apply_review(
     let Ok(Some(req)) = read_review_request() else {
         return;
     };
+    // Extra settle pause before the emit. The popup just closed and
+    // Hyprland is delivering the focus event to the source window;
+    // the receiving app (terminal TUIs especially) needs a beat to
+    // drain its first input batch before the backspace burst lands.
+    // The popup-side `REFOCUS_DELAY_MS` covers the focus-handoff
+    // proper; this covers the app's post-focus settling.
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let backspaces = req.original.chars().count() + req.trailing.chars().count();
     let insert = format!("{}{}", req.corrected, req.trailing);
     eprintln!(
