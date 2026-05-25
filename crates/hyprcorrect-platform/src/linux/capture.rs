@@ -331,19 +331,19 @@ fn chord_key_token(sym: u32) -> Option<String> {
     // at hyprctl-bind time are ESC and ENTER — handled in
     // `Chord::hyprland_key`.
     let named = match sym {
-        0xff1b => Some("ESC"),       // Escape
+        0xff1b => Some("ESC"),            // Escape
         0xff0d | 0xff8d => Some("ENTER"), // Return / KP_Enter
-        0xff09 => Some("TAB"),       // Tab
-        0xff08 => Some("BACKSPACE"), // BackSpace
-        0xffff => Some("DELETE"),    // Delete
-        0xff52 => Some("UP"),        // Up
-        0xff54 => Some("DOWN"),      // Down
-        0xff51 => Some("LEFT"),      // Left
-        0xff53 => Some("RIGHT"),     // Right
-        0x20 => Some("SPACE"),       // space
-        0x2b => Some("PLUS"),        // +  (avoid colliding with the modifier separator)
-        0x2d => Some("MINUS"),       // -
-        0x3d => Some("EQUAL"),       // =
+        0xff09 => Some("TAB"),            // Tab
+        0xff08 => Some("BACKSPACE"),      // BackSpace
+        0xffff => Some("DELETE"),         // Delete
+        0xff52 => Some("UP"),             // Up
+        0xff54 => Some("DOWN"),           // Down
+        0xff51 => Some("LEFT"),           // Left
+        0xff53 => Some("RIGHT"),          // Right
+        0x20 => Some("SPACE"),            // space
+        0x2b => Some("PLUS"),             // +  (avoid colliding with the modifier separator)
+        0x2d => Some("MINUS"),            // -
+        0x3d => Some("EQUAL"),            // =
         _ => None,
     };
     if let Some(token) = named {

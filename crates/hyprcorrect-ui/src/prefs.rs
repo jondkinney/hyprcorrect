@@ -13,11 +13,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use hyprcorrect_core::{Config, LlmConfig, ProviderId, runtime, secrets};
+#[cfg(target_os = "linux")]
 use hyprcorrect_platform::linux::chord_capture::{self, ChordRecording, ClientError};
 
 use crate::apps::AppRegistry;
 use crate::icon;
 
+#[cfg(target_os = "linux")]
 type ChordRecorder = ChordRecording;
 
 const APP_ID: &str = "hyprcorrect-prefs";
@@ -104,7 +106,10 @@ struct PrefsApp {
     /// In-flight chord-capture IPC. egui-winit on Linux discards
     /// Super, so all chord recording goes through the daemon's
     /// evdev-based capture loop instead. `Some` while a recording
-    /// is in flight; `None` otherwise.
+    /// is in flight; `None` otherwise. Linux-only — the daemon's
+    /// chord-capture endpoint reads evdev; macOS will grow its own
+    /// recorder when the M2 macOS platform work lands.
+    #[cfg(target_os = "linux")]
     chord_recorder: Option<ChordRecorder>,
     /// Window classes detected on the desktop right now, sorted and
     /// deduplicated. Populated lazily and refreshed when the privacy
@@ -137,6 +142,7 @@ impl PrefsApp {
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
             capturing_chord: None,
+            #[cfg(target_os = "linux")]
             chord_recorder: None,
             running_apps: Vec::new(),
             last_apps_refresh: Instant::now() - Duration::from_secs(60),
@@ -242,6 +248,10 @@ impl eframe::App for PrefsApp {
         // can't honestly record SUPER-containing chords here.
         // Open the IPC the first frame after a row is clicked,
         // then poll non-blockingly until the user releases a key.
+        // macOS gets its own recorder when the M2 platform work
+        // lands; until then chord rows just stay in "capture mode"
+        // until cancelled via Save / Cancel / Revert.
+        #[cfg(target_os = "linux")]
         if let Some(target) = self.capturing_chord {
             if self.chord_recorder.is_none() {
                 match chord_capture::record_chord() {
@@ -940,8 +950,7 @@ pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
     // key glyphs (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣ ↑↓←→), so the chip renders
     // identically on any system without depending on whatever
     // fonts happen to be installed.
-    const ADWAITA_SANS: &[u8] =
-        include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+    const ADWAITA_SANS: &[u8] = include_bytes!("../assets/AdwaitaSans-Regular.ttf");
     fonts.font_data.insert(
         "shortcut_symbols".into(),
         Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
@@ -1094,6 +1103,7 @@ fn shortcut_font(size: f32) -> egui::FontId {
 /// Build a user-facing message for a chord-capture IPC failure.
 /// Translates the rare-but-possible "daemon not running" case into
 /// a clear hint instead of a raw error string.
+#[cfg(target_os = "linux")]
 fn chord_record_error(err: &ClientError) -> String {
     match err {
         ClientError::DaemonOffline => {

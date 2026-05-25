@@ -256,19 +256,13 @@ impl Buffer {
 /// Return the byte offset of the char that ENDS at `pos` in `s`.
 /// `pos` must be > 0 and a char boundary.
 fn prev_char_boundary(s: &str, pos: usize) -> usize {
-    s[..pos]
-        .char_indices()
-        .next_back()
-        .map_or(0, |(i, _)| i)
+    s[..pos].char_indices().next_back().map_or(0, |(i, _)| i)
 }
 
 /// Return the byte offset that ENDS the char STARTING at `pos` in `s`.
 /// `pos` must be < `s.len()` and a char boundary.
 fn next_char_boundary(s: &str, pos: usize) -> usize {
-    s[pos..]
-        .chars()
-        .next()
-        .map_or(pos, |c| pos + c.len_utf8())
+    s[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
 }
 
 #[cfg(test)]
