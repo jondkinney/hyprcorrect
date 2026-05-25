@@ -934,36 +934,19 @@ pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut shortcut_chain: Vec<String> = Vec::new();
 
-    // -- Highest priority: a sans font with the modifier glyphs -------
-    // Adwaita Sans and DejaVu Sans both ship `⌃ ⇧ ⌥ ⌘`; Noto Sans is
-    // a guaranteed fallback. Take the first that loads. This font
-    // also covers ASCII; coming first prevents a partial-coverage
-    // font like Omarchy (which has cmap entries for ASCII letters
-    // pointing at empty glyphs) from eating characters from the
-    // chip's text.
-    let symbol_paths = [
-        // Linux
-        "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols-Black.ttf",
-        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-        // macOS
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial Bold.ttf",
-    ];
-    for path in symbol_paths {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "shortcut_symbols".into(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            shortcut_chain.push("shortcut_symbols".into());
-            break;
-        }
-    }
+    // -- Highest priority: the bundled sans with the modifier glyphs --
+    // Adwaita Sans Regular ships with the app under `crates/
+    // hyprcorrect-ui/assets/`. It covers ASCII plus the macOS-style
+    // key glyphs (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣ ↑↓←→), so the chip renders
+    // identically on any system without depending on whatever
+    // fonts happen to be installed.
+    const ADWAITA_SANS: &[u8] =
+        include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+    fonts.font_data.insert(
+        "shortcut_symbols".into(),
+        Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
+    );
+    shortcut_chain.push("shortcut_symbols".into());
 
     // -- Then the egui defaults ---------------------------------------
     if let Some(default_chain) = fonts.families.get(&egui::FontFamily::Proportional) {
@@ -984,10 +967,19 @@ pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
     omarchy_candidates.push("/usr/share/fonts/omarchy.ttf".into());
     for path in omarchy_candidates {
         if let Ok(bytes) = std::fs::read(&path) {
-            fonts.font_data.insert(
-                "omarchy".into(),
-                Arc::new(egui::FontData::from_owned(bytes)),
-            );
+            let mut data = egui::FontData::from_owned(bytes);
+            // The omarchy glyph fills its full em square; at scale=1
+            // it towers over the Adwaita letters / modifier symbols
+            // at the same point size. 0.85 lands the logo at the
+            // letters' visual cap height; positive y_offset_factor
+            // nudges it DOWN so it sits on the same baseline as the F.
+            // Mirrors vernier's tweak.
+            data.tweak = egui::FontTweak {
+                scale: 0.75,
+                y_offset_factor: 0.09,
+                ..Default::default()
+            };
+            fonts.font_data.insert("omarchy".into(), Arc::new(data));
             shortcut_chain.push("omarchy".into());
             OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
             break;
@@ -1089,7 +1081,7 @@ fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Respon
         resp.rect.center(),
         egui::Align2::CENTER_CENTER,
         display,
-        shortcut_font(14.0),
+        shortcut_font(17.0),
         egui::Color32::WHITE,
     );
     resp
