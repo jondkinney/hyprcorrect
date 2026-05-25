@@ -577,8 +577,21 @@ fn start_review(
 
 #[cfg(target_os = "linux")]
 fn spawn_review_window() {
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
-    let Ok(exe) = std::env::current_exe() else {
+    // Prefer /proc/self/exe — the kernel-maintained symlink to
+    // the running binary's inode. `current_exe()` returns the
+    // resolved on-disk path, which can be marked `(deleted)`
+    // after a `cargo build` overwrites it; spawning that path
+    // fails with ENOENT. /proc/self/exe always resolves to the
+    // still-running binary so `cargo build && SIGUSR1 the
+    // running daemon` keeps working without a daemon restart.
+    let exe_proc = PathBuf::from("/proc/self/exe");
+    let exe = if exe_proc.exists() {
+        exe_proc
+    } else if let Ok(p) = std::env::current_exe() {
+        p
+    } else {
         eprintln!("hyprcorrect: cannot find own executable to launch review");
         return;
     };
