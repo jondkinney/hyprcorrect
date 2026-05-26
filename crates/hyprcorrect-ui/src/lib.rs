@@ -9,6 +9,8 @@
 //! See the "Configuration & GUI" section of `DESIGN.md`.
 
 mod apps;
+#[cfg(target_os = "linux")]
+mod autostart;
 mod icon;
 mod prefs;
 mod review;

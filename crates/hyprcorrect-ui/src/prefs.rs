@@ -17,6 +17,8 @@ use hyprcorrect_core::{Config, LlmConfig, ProviderId, runtime, secrets};
 use hyprcorrect_platform::linux::chord_capture::{self, ChordRecording, ClientError};
 
 use crate::apps::AppRegistry;
+#[cfg(target_os = "linux")]
+use crate::autostart;
 use crate::icon;
 
 #[cfg(target_os = "linux")]
@@ -84,6 +86,14 @@ struct PrefsApp {
     saved_api_key: String,
     /// Current LLM API key field.
     api_key_field: String,
+    /// "Start at login" — true when a `~/.config/autostart/
+    /// hyprcorrect.desktop` exists. Linux-only; on macOS the same
+    /// box will eventually map to a LaunchAgent.
+    #[cfg(target_os = "linux")]
+    autostart_enabled: bool,
+    /// Snapshot of `autostart_enabled` at load, for dirty-detection.
+    #[cfg(target_os = "linux")]
+    saved_autostart_enabled: bool,
     section: Section,
     status: Status,
     /// New-entry text for the privacy blocklist's "Add" row.
@@ -129,11 +139,17 @@ struct PrefsApp {
 
 impl PrefsApp {
     fn new(saved: Config, saved_api_key: String, shutdown_tx: Sender<()>) -> Self {
+        #[cfg(target_os = "linux")]
+        let autostart_enabled = autostart::is_enabled();
         Self {
             config: saved.clone(),
             saved,
             api_key_field: saved_api_key.clone(),
             saved_api_key,
+            #[cfg(target_os = "linux")]
+            autostart_enabled,
+            #[cfg(target_os = "linux")]
+            saved_autostart_enabled: autostart_enabled,
             section: Section::Hotkeys,
             status: Status::default(),
             blocklist_entry: String::new(),
@@ -183,7 +199,13 @@ impl PrefsApp {
     }
 
     fn dirty(&self) -> bool {
-        self.config != self.saved || self.api_key_field != self.saved_api_key
+        #[cfg(target_os = "linux")]
+        let autostart_changed = self.autostart_enabled != self.saved_autostart_enabled;
+        #[cfg(not(target_os = "linux"))]
+        let autostart_changed = false;
+        self.config != self.saved
+            || self.api_key_field != self.saved_api_key
+            || autostart_changed
     }
 
     fn ok(&mut self, text: impl Into<String>) {
@@ -225,6 +247,21 @@ impl PrefsApp {
             }
             self.saved_api_key = self.api_key_field.clone();
         }
+        #[cfg(target_os = "linux")]
+        if self.autostart_enabled != self.saved_autostart_enabled {
+            let result = if self.autostart_enabled {
+                std::env::current_exe()
+                    .map_err(|e| std::io::Error::other(format!("current_exe: {e}")))
+                    .and_then(|exe| autostart::enable(&exe.to_string_lossy()))
+            } else {
+                autostart::disable()
+            };
+            if let Err(e) = result {
+                self.err(format!("autostart write failed: {e}"));
+                return;
+            }
+            self.saved_autostart_enabled = self.autostart_enabled;
+        }
         self.saved = self.config.clone();
         notify_daemon_reload();
         self.ok("Saved.");
@@ -233,6 +270,10 @@ impl PrefsApp {
     fn cancel(&mut self) {
         self.config = self.saved.clone();
         self.api_key_field = self.saved_api_key.clone();
+        #[cfg(target_os = "linux")]
+        {
+            self.autostart_enabled = self.saved_autostart_enabled;
+        }
         self.clear_status();
     }
 }
@@ -576,6 +617,24 @@ impl PrefsApp {
     fn behavior_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Behavior");
         ui.add_space(14.0);
+
+        #[cfg(target_os = "linux")]
+        {
+            field_label(ui, "Start at login");
+            ui.add_space(4.0);
+            let resp = ui.checkbox(&mut self.autostart_enabled, "Launch hyprcorrect when I log in");
+            if resp.changed() {
+                self.clear_status();
+            }
+            ui.add_space(6.0);
+            caption(
+                ui,
+                "Drops a `hyprcorrect.desktop` into `~/.config/\
+                 autostart/` so the daemon starts with your session. \
+                 Takes effect on save.",
+            );
+            ui.add_space(SETTING_BLOCK_SPACING);
+        }
 
         field_label(ui, "Pause per backspace");
         caption(
