@@ -21,35 +21,43 @@ rust-version = "1.85"
 hyprcorrect-core = { path = "crates/hyprcorrect-core", version = "0.1.0" }
 hyprcorrect-platform = { path = "crates/hyprcorrect-platform", version = "0.1.0" }
 hyprcorrect-ui = { path = "crates/hyprcorrect-ui", version = "0.1.0" }
-
-# Errors / logging.
-anyhow = "1"
 thiserror = "2"
-log = "0.4"
 env_logger = "0.11"
-
-# Config / serialization.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-directories = "5"
 
 # CLI.
 clap = { version = "4", features = ["derive"] }
-
-# Async runtime — the daemon (M1+).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 async-trait = "0.1"
 
-# GUI (M3+).
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wayland", "x11", "glow"] }
+# Config (toml on disk, OS-resolved paths) and secrets.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+keyring = { version = "3", features = ["linux-native", "apple-native", "windows-native"] }
+
+# HTTP — used by the LLM provider (Anthropic Messages API, M4) and the
+# LanguageTool HTTP provider (M5). `ureq` is sync + small (no tokio).
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+# GUI.
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "wayland",
+    "x11",
+    "glow",
+] }
 egui = "0.32"
 
-# Correction providers / secrets (M1, M4). `harper-core` is added when
-# the Harper provider is wired up in M1, so its version can be pinned
-# against a build that actually exercises it.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-keyring = "3"
+# Icon rasterization for the prefs sidebar.
+# Default features enable text shaping so the bundled SVG can render
+# `<text>` elements through a fontdb populated with system fonts.
+resvg = "0.45"
+tiny-skia = "0.11"
+usvg = "0.45"
+# PNG decode for the system app icons (lots of theme icons still ship
+# as PNGs at fixed sizes). Default features pull in JPEG/GIF/etc; we
+# only need PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 lto = "thin"

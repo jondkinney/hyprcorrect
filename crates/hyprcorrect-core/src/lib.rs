@@ -5,11 +5,25 @@
 //! the repository root for the architecture.
 
 pub mod buffer;
+pub mod chord;
 pub mod config;
+pub mod languagetool;
+pub mod llm;
 pub mod providers;
 pub mod replace;
+pub mod runtime;
+pub mod secrets;
 
-pub use providers::{Context, Correction, CorrectionProvider};
+pub use buffer::{Buffer, Key, LastSentence, LastWord};
+pub use chord::{Chord, ChordError};
+pub use config::{
+    Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,
+    Providers,
+};
+pub use languagetool::{LanguageToolError, LanguageToolProvider};
+pub use llm::{LlmError, LlmProvider};
+pub use providers::{Context, Correction, CorrectionProvider, OfflineProvider};
+pub use replace::{Edit, plan_word_replacement};
 
 /// hyprcorrect's version string, surfaced by the CLI and the About pane.
 pub fn version() -> &'static str {

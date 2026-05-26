@@ -83,7 +83,7 @@ hyprcorrect/
   crates/
     hyprcorrect-core/         # config, keystroke buffer, replacement
                               #   planning, CorrectionProvider trait +
-                              #   Harper / LLM / LanguageTool impls
+                              #   spellbook / LLM / LanguageTool impls
     hyprcorrect-platform/     # per-OS capture, synthetic input, hotkeys,
                               #   frontmost-app, tray
                               #   (src/linux/ src/macos/ src/windows/)
@@ -107,7 +107,7 @@ with a per-OS backend:
 |---|---|---|---|
 | Key capture (observe-only) | `evdev` `/dev/input` + `xkbcommon` for keycode→char | `CGEventTap` (listen) | `WH_KEYBOARD_LL` |
 | Synthetic input | `virtual-keyboard-v1` protocol (wtype-style) | `CGEvent` + unicode string | `SendInput` |
-| Global hotkey | `ashpd` GlobalShortcuts portal | `RegisterEventHotKey` (Carbon) | `RegisterHotKey` |
+| Global hotkey | Hyprland `hyprctl keyword bind` + `SIGUSR1` (today); `ashpd` GlobalShortcuts portal once compositor auto-bind matures | `RegisterEventHotKey` (Carbon) | `RegisterHotKey` |
 | Focused app | Hyprland IPC (`activewindow`) | `NSWorkspace.frontmostApplication` | `GetForegroundWindow` |
 | Tray / menu bar | `ksni` | `NSStatusItem` | — |
 
@@ -123,44 +123,172 @@ Notes:
   compositors. `ydotool`/uinput is a documented fallback for non-wlroots.
   `enigo` is evaluated as a single cross-platform emulation crate; if its
   Wayland path is insufficient we keep the direct protocol impl.
-- **Hotkeys:** the `ashpd` GlobalShortcuts portal is the primary,
-  in-app-configurable path (`vernier` already uses this). Power users can
-  instead bind a key in `hyprland.conf` to signal the daemon; the GUI's
-  hotkey picker writes whichever mechanism is active.
+- **Hotkeys:** on Hyprland today the daemon adds an inline
+  `hyprctl keyword bind` whose `exec` raises `SIGUSR1` on itself —
+  Hyprland intercepts the chord so terminals never see it, and the
+  daemon manages its own keybind (no `hyprland.conf` edit required).
+  The `ashpd` GlobalShortcuts portal is the planned cross-compositor
+  route; `xdg-desktop-portal-hyprland` 1.3 doesn't yet honor
+  `preferred_trigger`, so we'll revisit it together with other
+  compositors. The GUI's hotkey picker writes whichever mechanism is
+  active.
 - **macOS** uses the OS-provided unicode for both capture
   (`CGEventKeyboardGetUnicodeString`) and typing
   (`CGEventKeyboardSetUnicodeString`), so no manual keymap handling.
   Needs Accessibility + Input Monitoring (TCC); the daemon
   detects/prompts (`mousehop`'s TCC probe/watch are the pattern).
 - All backends use **permissively-licensed crates only** (`evdev`,
-  `xkbcommon`, `wayland-client`, `ashpd`, `objc2-*`, `windows`, `enigo`).
-  No lan-mouse/GPL-derived code — hyprcorrect is MIT/Apache like
-  `vernier`.
+  `xkbcommon`, `wayland-client`, `signal-hook`, `ksni`, `ashpd`,
+  `objc2-*`, `windows`, `enigo`). No lan-mouse/GPL-derived code —
+  hyprcorrect is MIT/Apache like `vernier`.
+
+### Platform interface — M2 macOS surface
+
+M3 froze the module-level API the daemon and prefs subprocess expect.
+The Linux backend already satisfies it; macOS M2 fills the same shape
+under `crates/hyprcorrect-platform/src/macos/`, after which `main.rs`
+only needs an `#[cfg(target_os = "macos")]` clone of `run_daemon`
+calling `platform::macos::*` instead of `platform::linux::*`.
+
+```rust
+// capture
+pub fn start(chord: &core::Chord) -> Result<Receiver<core::Key>, CaptureError>;
+
+// emit
+pub fn replace(backspaces: usize, insert: &str) -> Result<(), EmitError>;
+
+// hotkey
+pub fn install_bind(chord: &core::Chord)   -> Result<(), HotkeyError>;
+pub fn uninstall_bind(chord: &core::Chord) -> Result<(), HotkeyError>;
+pub fn signal_channel()                    -> Result<Receiver<HotkeyEvent>, HotkeyError>;
+// HotkeyEvent::{Trigger, Reload, Release, Shutdown}.
+
+// focus
+pub struct InitialFocus { pub address: String, pub class: String }
+pub enum FocusEvent { Focused { address, class }, Closed { address } }
+pub fn start() -> Result<(Option<InitialFocus>, Receiver<FocusEvent>), FocusError>;
+
+// tray
+pub fn start(paused: Arc<AtomicBool>)
+    -> Result<(TrayHandle, Receiver<TrayEvent>), TrayError>;
+// TrayHandle::refresh() — re-publishes properties; called after pause toggle.
+// TrayEvent::{TogglePause, OpenPrefs, Quit}.
+```
+
+The `Chord` type (`core::Chord`) is the parsed accelerator —
+modifier flags + uppercase key name. `Chord::hyprland_modifiers()` /
+`hyprland_key()` produce the Linux bind syntax; the macOS hotkey
+backend uses the same struct to translate to `RegisterEventHotKey`
+parameters.
+
+**Signal contract** (Unix-portable, shared by both backends):
+
+| Signal | Sender | `HotkeyEvent`  | Daemon action |
+|---|---|---|---|
+| `SIGUSR1` | hyprctl bind / Carbon callback | `Trigger`  | Run `fix-last-word` against the active window's buffer. |
+| `SIGUSR2` | prefs subprocess | `Release`  | `uninstall_bind(&chord)`; keep running so the prefs window can capture the chord's key press. `Reload` re-installs. |
+| `SIGHUP`  | prefs subprocess after Save / Cancel | `Reload`   | Re-read `config.toml`; `install_bind(&chord)` (idempotent — also covers post-`Release`). |
+| `SIGTERM` / `SIGINT` | user, systemd, pkill | `Shutdown` | Run cleanup: `uninstall_bind`, drop tray handle, `runtime::clear_pid`, exit loop. |
+
+**Runtime PID file** (`core::runtime`): the daemon writes its PID to
+`$XDG_RUNTIME_DIR/hyprcorrect.pid` (or `$TMPDIR/...` on macOS) at
+startup and removes it on clean shutdown. Both the hyprctl bind's
+`exec` (`kill -USR1 $(cat …)`) and the prefs subprocess's
+`signal_daemon` lookup read from this file. Targeting by PID avoids
+the `pkill -x hyprcorrect` trap where the prefs subprocess shares
+the daemon's binary name and would receive the signal too.
+
+**Prefs subprocess singleton.** `acquire_singleton` binds
+`UnixListener` at `$XDG_RUNTIME_DIR/hyprcorrect-prefs.sock`. If
+already bound, the new invocation best-effort tells the desktop to
+focus the existing window and exits. The cfg-gated focus call is
+`hyprctl dispatch focuswindow class:hyprcorrect-prefs` on Linux;
+macOS M2 adds a sibling branch via `NSRunningApplication.activate`
+or `osascript -e 'tell app "hyprcorrect-prefs" to activate'`.
+
+**UI / chord chip** uses a `shortcut` egui font family chained as
+`[symbol-sans, egui-defaults, omarchy.ttf]` (Omarchy last so its
+partial-coverage cmap doesn't eat letters). The chip's display goes
+through `chord_glyphs()` which maps `SUPER → \u{e900}` (or `⌘`
+fallback) / `CTRL → ⌃` / `SHIFT → ⇧` / `ALT → ⌥` plus named-key
+glyphs (`SPACE → ␣`, `RETURN → ↵`, arrows, …). Storage in
+`config.hotkeys` stays as plain `+`-separated UPPERCASE strings.
+
+**Privacy app-picker.** `linux::list_running_classes` shells out to
+`hyprctl clients -j` to populate the prefs ComboBox; macOS M2's
+equivalent should enumerate `NSWorkspace.runningApplications` and
+return bundle identifiers (so the blocklist on macOS is a list of
+`com.apple.Safari`-style strings rather than X11/Wayland classes).
+The app-picker UI itself is platform-independent egui.
+
+macOS-specific extras M2 will need on top of the shared interface:
+
+- **TCC permission flow.** Capture (`CGEventTap`) needs Input
+  Monitoring; emit + hotkey may need Accessibility. The daemon probes
+  on startup and surfaces the system prompts (mirror `mousehop`'s TCC
+  probe/watch).
+- **Trigger under Carbon.** `RegisterEventHotKey` registers a global
+  chord and the Carbon runloop dispatches it. The simplest wiring is
+  for the macOS hotkey callback to `raise(SIGUSR1)` on the current
+  process, so `signal_channel` can stay the same shape — the
+  `Trigger` branch fires on SIGUSR1 either way. `SIGUSR2` (`Release`)
+  on macOS just means "stop dispatching the Carbon hotkey to the
+  app" until the next `Reload`; the simplest form is to call
+  `UnregisterEventHotKey` and re-register on Reload, mirroring the
+  Linux `uninstall_bind` / `install_bind` pair.
+- **Per-window focus.** macOS's `NSWorkspace.frontmostApplication`
+  gives app-level focus, not window-level. App-level addressing
+  (bundle identifier as `address`) is acceptable for M2; per-window
+  buffers degrade to per-app buffers, which is still a strict
+  improvement over the M1 "single global buffer" the Linux side had.
 
 ## The keystroke buffer
 
-A bounded, in-memory rolling buffer of characters typed in the currently
-focused element.
+A bounded, in-memory rolling buffer of characters typed in each focused
+element. The daemon keeps **one buffer per window**, keyed by the
+compositor's window address; the active buffer is whichever window
+currently has focus.
 
-- Printable keys append; Backspace pops.
+- Printable keys append to the active window's buffer; Backspace pops.
 - Queries: last word, last N words, last sentence (sentence = split on
   `.!?` with simple boundary rules — trivial since we hold the literal
   text).
-- **Reset triggers** — anything meaning the caret may no longer sit at
-  the buffer's end: focus/window change, mouse click,
+- **Reset triggers** — anything within the focused window that means
+  the caret may no longer sit at the buffer's end:
   arrow/Home/End/PageUp-Down, Ctrl+arrows, Enter, Tab, Esc, undo/redo.
-  After a reset the buffer is empty and "fix last word" does nothing
-  until typing resumes — correct and safe (better than corrupting text).
-  The selection fallback covers "fix something I didn't just type."
-- Single buffer, reset on focus change (the use case is always the
-  current focus).
+  Only the active window's buffer is cleared; other windows' buffers
+  are untouched. After a reset "fix last word" does nothing until
+  typing resumes — correct and safe (better than corrupting text). The
+  selection fallback covers "fix something I didn't just type."
+- **Per-window storage:** switching focus does *not* clear buffers, so
+  returning to a window and triggering can still fix the last word you
+  typed there. Buffers are dropped when their window closes.
+- **Inherent limit of the keystroke model:** events the daemon cannot
+  observe — mouse clicks inside the window, app-driven edits
+  (autocomplete, autocorrect, paste), undo/redo done with a mouse — can
+  leave a window's buffer out of sync with what is actually on screen.
+  In that state the chord will garble text. The review popup (M4) is
+  the safety net: it shows the planned edit before it lands.
 - After applying a correction the buffer is rewritten to the corrected
   text so fixes can chain; if anything is uncertain it resets instead.
 
-**Known limitations:** IME composition (the listener sees raw keys, not
-composed text — macOS's unicode events soften this; flagged for
-non-Latin input), and very fast synthetic typing occasionally dropping
-characters in some apps (mitigated by a configurable inter-key delay).
+**Known limitations:**
+
+- **IME composition.** The Linux capture path reads raw keys via
+  `evdev` and translates them through `xkbcommon`. For IME-composed
+  input (CJK preedit, dead-key sequences for Latin scripts) the buffer
+  records the *physical* keys, not the *composed* glyph the user
+  actually committed. Until M5+ wires a per-platform composition
+  observer (`text-input-v3` on Wayland, `NSTextInputClient` on macOS),
+  the buffer state for IME input is unreliable and `fix-last-word` /
+  `fix-last-sentence` can over-backspace or replace the wrong text.
+  The blocklist is the practical escape hatch: add your IME-using
+  apps to it so the daemon doesn't try.
+- **Synthetic-typing drops.** Very fast `wtype` runs occasionally lose
+  characters in some apps. `config.behavior.inter_key_delay_ms`
+  (Preferences → Behavior) sets a per-key delay applied to every
+  wtype call — 2 ms is the safe default; raise it for any app that
+  drops characters.
 
 ## Replacement mechanics
 
@@ -199,17 +327,17 @@ Shipped implementations:
 
 | Provider | Locality | Use | Notes |
 |---|---|---|---|
-| **Harper** | in-process, offline | bundled default | Pure-Rust spell/grammar checker; instant; English-focused. Great at obvious typos, not at context. |
+| **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
 | **LLM** (Claude/OpenAI) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. |
 | **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL. Off until a URL is set — for when you run your own server. No bundled Java. |
 
-**Routing:** "fix last word" → Harper (instant, local). "fix last
+**Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key
-is set, else Harper). Harper-first-then-LLM-on-demand is a config
-option. This Harper+LLM split is deliberate: Harper kills obvious typos
-with zero latency and zero network; the LLM handles genuinely ambiguous
-corrections that need context — the cases the Google-search prototype
-was really being used for.
+is set, else spellbook). Offline-first-then-LLM-on-demand is a config
+option. This offline+LLM split is deliberate: spellbook kills obvious
+typos with zero latency and zero network; the LLM handles genuinely
+ambiguous corrections that need context — the cases the Google-search
+prototype was really being used for.
 
 ## Interaction modes
 
@@ -243,11 +371,11 @@ is a borderless `NSPanel`.
 ```toml
 # config.toml sketch
 [hotkeys]
-fix-last-word = "..."          # portal / Carbon binding descriptor
+fix-last-word = "..."          # hyprctl chord / Carbon binding descriptor
 review        = "..."
 
 [providers]
-default = "harper"
+default = "spellbook"
 smart   = "llm"                # used by fix-last-sentence / review
 
 [providers.llm]
@@ -282,7 +410,7 @@ defensively:
   indicator showing capture state.
 - Typed text leaves the machine only when a network provider (LLM,
   remote LanguageTool) is the active backend, and only the snippet being
-  corrected. The Harper default keeps everything local. The GUI states
+  corrected. The spellbook default keeps everything local. The GUI states
   this plainly per provider.
 
 ## Licensing
@@ -297,9 +425,9 @@ Wayland protocols.
 | Milestone | Deliverable |
 |---|---|
 | **M0 — Scaffold** | `git init`; 4-crate workspace, edition 2024, shared deps, `rust-toolchain.toml`, dual license, CI + `release-plz` skeleton. Mirrors `vernier`. |
-| **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → buffer; Harper provider; virtual-keyboard emulation; one hardcoded portal hotkey; `fix-last-word` working end-to-end on Hyprland incl. a terminal. No GUI. Proves the riskiest path. |
+| **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → per-window buffers driven by Hyprland focus events; offline spell-check provider (spellbook); `wtype`-based synthetic input; one hyprctl-bound hotkey signaling `SIGUSR1`; ksni tray; `fix-last-word` working end-to-end on Hyprland incl. terminals. No GUI. Proves the riskiest path. |
 | **M2 — macOS parity** | `CGEventTap` capture, `CGEvent` emulation, Carbon hotkey, TCC permission flow. `fix-last-word` on macOS. Core now runs on both. |
-| **M3 — Config GUI + tray** | egui prefs (hotkeys/providers/behavior/privacy), `config.toml`, `keyring`, `ksni`/`NSStatusItem` tray, pause control. Hotkeys user-configurable. |
+| **M3 — Config GUI + tray** | egui prefs (Hotkeys / Providers / Behavior / Privacy / About) running standalone via `hyprcorrect prefs`; `config.toml` with serde defaults; `keyring`-backed LLM API key storage; ksni tray expanded with Pause/Resume + Open Preferences + Quit, live status refresh; pause control gates the daemon; `SIGHUP` config reload with safe trigger rebind; daemon PID file for targeted reload. (Linux landed first; the macOS side is a `NSStatusItem` tray + a cfg-gated focus call — the UI itself is platform-independent.) |
 | **M4 — Review popup + sentence mode** | egui popup with keyboard nav; `fix-last-sentence`; multi-word review/apply; LLM provider wired in. |
 | **M5 — Selection fallback + polish** | Clipboard/selection secondary mode; per-app behavior; inter-key delay tuning; LanguageTool-HTTP provider; IME caveats handled. |
 | **M6 — Packaging** | AUR (source/-bin/-git like `vernier`), macOS dmg (ad-hoc signed), GitHub releases via `release-plz`. Windows remains a stub. |

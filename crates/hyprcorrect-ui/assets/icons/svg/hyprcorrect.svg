@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="56" fill="#6b46c1"/>
+  <text x="128" y="170"
+        font-family="DejaVu Serif, Liberation Serif, Noto Serif, Times New Roman, serif"
+        font-size="148"
+        font-weight="700"
+        fill="#ffffff"
+        text-anchor="middle">Ab</text>
+  <line x1="56" y1="208" x2="200" y2="208"
+        stroke="#ffffff"
+        stroke-width="14"
+        stroke-linecap="round"/>
+</svg>

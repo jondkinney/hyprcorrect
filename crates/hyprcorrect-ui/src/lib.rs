@@ -1,12 +1,30 @@
-//! The hyprcorrect GUI: the egui preferences window and the
-//! keyboard-navigable suggestion popup.
+//! The hyprcorrect GUI: the egui preferences window and (later, M4)
+//! the keyboard-navigable suggestion popup.
 //!
-//! Built on `egui` / `eframe` from milestone M3. See the "Configuration
-//! & GUI" and "Interaction modes" sections of `DESIGN.md`.
+//! All UI in this crate is platform-independent egui — Linux and
+//! macOS share the same code. The `run_preferences` entry handles a
+//! best-effort singleton lock so double-clicking "Open Preferences…"
+//! in the tray doesn't open two windows.
+//!
+//! See the "Configuration & GUI" section of `DESIGN.md`.
 
-/// Open the preferences window.
+mod apps;
+mod icon;
+mod prefs;
+mod review;
+
+/// Open the preferences window. Blocks until the user closes it.
 ///
-/// Not implemented until milestone M3.
+/// If another prefs window is already open, this returns immediately
+/// after best-effort asking the existing one to focus itself.
 pub fn run_preferences() {
-    eprintln!("hyprcorrect: the preferences window is not implemented yet (M3)");
+    prefs::run();
+}
+
+/// Open the review popup for the daemon's pending review request.
+/// Reads the request from the runtime file, shows the popup, and
+/// signals the daemon on exit so the apply happens against the
+/// originating window. Blocks until the user closes the popup.
+pub fn run_review() {
+    review::run();
 }

@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# egui / eframe and a dependency on hyprcorrect-core are added in
-# milestone M3, when the preferences window is built.
 [dependencies]
+hyprcorrect-core.workspace = true
+hyprcorrect-platform.workspace = true
+eframe.workspace = true
+egui.workspace = true
+resvg.workspace = true
+tiny-skia.workspace = true
+usvg.workspace = true
+image.workspace = true
