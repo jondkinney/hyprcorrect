@@ -100,6 +100,14 @@ fn run_daemon() {
         eprintln!("hyprcorrect: could not write PID file ({e}) — prefs reload won't work");
     }
 
+    // Register the review-popup's Wayland class as a floating window
+    // in Hyprland. Tiled, the popup would push the source window
+    // around mid-edit and the user has nowhere to put it; floating
+    // (+ centered) keeps the prefs/review experience inline with how
+    // most native correction overlays behave. Best-effort — if
+    // hyprctl isn't available we still work, just tiled by default.
+    install_window_rules();
+
     let provider = match OfflineProvider::en_us() {
         Ok(provider) => provider,
         Err(e) => {
@@ -588,6 +596,52 @@ fn start_review(
         return;
     }
     spawn_review_window();
+}
+
+/// Install per-class Hyprland windowrules so the review popup
+/// always opens floating (and centered). Uses `hyprctl keyword
+/// windowrule` — the rules persist for the running Hyprland
+/// session, just like our `hyprctl keyword bind`. Idempotent:
+/// re-registering the same rule on a daemon restart is a no-op.
+#[cfg(target_os = "linux")]
+fn install_window_rules() {
+    use std::process::Command;
+    // The review popup's Wayland app_id (set via egui's
+    // `ViewportBuilder::with_app_id`). Hyprland sees it as the
+    // window's `class:`. Prefs intentionally stays tile-managed —
+    // it's a regular standalone window that's fine to dock.
+    const REVIEW_CLASS: &str = "hyprcorrect-review";
+    const PREFS_CLASS: &str = "hyprcorrect-prefs";
+    // Hyprland's current syntax (post-deprecation of windowrulev2):
+    // `windowrule = <rule>, match:class <CLASS>`. State-bearing
+    // rules require the `on` suffix (`float on`, not bare `float`).
+    //
+    // The two `float off` lines neutralize any leftover rules a
+    // previous daemon may have keyword-injected before we narrowed
+    // the float to review-only. Runtime keyword rules persist
+    // until Hyprland restarts, so without these overrides the
+    // prefs window would keep floating on subsequent daemon
+    // restarts. Cheap to send on every startup.
+    for rule in [
+        format!("float on, match:class {REVIEW_CLASS}"),
+        format!("center on, match:class {REVIEW_CLASS}"),
+        format!("float off, match:class {PREFS_CLASS}"),
+        format!("center off, match:class {PREFS_CLASS}"),
+    ] {
+        let result = Command::new("hyprctl")
+            .args(["keyword", "windowrule", &rule])
+            .output();
+        match result {
+            Ok(output) if !output.status.success() => {
+                eprintln!(
+                    "hyprcorrect: windowrule install failed for {rule:?}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                );
+            }
+            Err(e) => eprintln!("hyprcorrect: hyprctl not available for windowrules: {e}"),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
