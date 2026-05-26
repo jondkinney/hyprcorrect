@@ -1421,6 +1421,36 @@ fn focus_existing_prefs() {
     }
 }
 
+/// Linux: if the daemon's chord-capture socket isn't responding,
+/// spawn the daemon detached. The daemon's own singleton check
+/// (in `run_daemon`) prevents two daemons from racing; we just
+/// want one to be alive so prefs hotkey-record IPC works.
+#[cfg(target_os = "linux")]
+fn ensure_daemon_running() {
+    use hyprcorrect_core::runtime::chord_socket_path;
+    if std::os::unix::net::UnixStream::connect(chord_socket_path()).is_ok() {
+        return; // daemon up
+    }
+    // Use `/proc/self/exe` first so a `cargo build`-replaced
+    // binary still works (matches the review-popup spawn fix).
+    let exe = if std::path::PathBuf::from("/proc/self/exe").exists() {
+        std::path::PathBuf::from("/proc/self/exe")
+    } else if let Ok(p) = std::env::current_exe() {
+        p
+    } else {
+        eprintln!("hyprcorrect: can't find own executable to spawn daemon");
+        return;
+    };
+    let result = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = result {
+        eprintln!("hyprcorrect: failed to spawn daemon: {e}");
+    }
+}
+
 /// Run the prefs window. Acquires the singleton lock, loads config +
 /// secrets, then runs eframe to completion.
 pub(crate) fn run() {
@@ -1428,6 +1458,13 @@ pub(crate) fn run() {
         eprintln!("hyprcorrect: preferences are already open");
         return;
     };
+    // Best-effort: if the daemon isn't already running, spawn it
+    // detached so opening prefs from a launcher (walker / menus /
+    // the AUR-installed `.desktop`) brings up a fully functional
+    // app rather than just the prefs window with dead chords.
+    // Matches vernier's `run_prefs_window` behavior.
+    #[cfg(target_os = "linux")]
+    ensure_daemon_running();
     // The listener owns the socket file; keep it alive for the life
     // of this process. A separate thread holds it and exits when prefs
     // closes.

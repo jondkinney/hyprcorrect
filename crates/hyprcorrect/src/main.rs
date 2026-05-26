@@ -61,6 +61,21 @@ fn run_daemon() {
     use hyprcorrect_core::{Buffer, Chord, Config, OfflineProvider};
     use hyprcorrect_platform::linux::{capture, chord_capture, focus, hotkey, tray};
 
+    // Daemon singleton: the chord-capture socket is bound by the
+    // running daemon. If we can connect, another daemon owns it —
+    // exit cleanly so a stray `hyprcorrect` from the launcher /
+    // autostart / a debug rerun doesn't spin up a duplicate that
+    // would race for evdev events and for hyprctl bind ownership.
+    if std::os::unix::net::UnixStream::connect(hyprcorrect_core::runtime::chord_socket_path())
+        .is_ok()
+    {
+        eprintln!(
+            "hyprcorrect: another daemon instance is already running — exiting. \
+             Open Preferences with `hyprcorrect prefs`."
+        );
+        return;
+    }
+
     let initial_config = Config::load().unwrap_or_else(|e| {
         eprintln!("hyprcorrect: could not load config ({e}) — using defaults");
         Config::default()
