@@ -1,0 +1,103 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/flatpak/flatpak-builder/refs/heads/main/data/flatpak-manifest.schema.json
+#
+# Flatpak manifest for hyprcorrect. The app-id mirrors the live domain
+# (hyprcorrect.com) — see https://docs.flathub.org/docs/for-app-authors/requirements
+# for why reverse-DNS of a domain you actually control is the safe
+# choice for Flathub publication.
+#
+# Built in CI by .github/workflows/release-flatpak.yml on every
+# published Release; the resulting .flatpak bundle is uploaded as a
+# Release asset for sideloading and for any future Flathub submission.
+#
+# Note: hyprcorrect's daemon model leans hard on evdev + global hot-
+# keys + synthetic input, which the freedesktop sandbox restricts.
+# This manifest produces a runnable bundle for sideloading and
+# AppStream listing, but the daemon's correction loop needs
+# host-level access (evdev devices, hyprctl bind) that a strict
+# Flatpak grant cannot provide. The Flatpak target is primarily for
+# the prefs/review GUI and AppStream metadata; "Start at login"
+# users will install from the AUR (or Cargo) for the daemon.
+app-id: com.hyprcorrect.Hyprcorrect
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm18
+command: /app/bin/hyprcorrect
+build-options:
+  append-path: "/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin"
+  prepend-ld-library-path: "/usr/lib/sdk/llvm18/lib"
+  build-args:
+    - "--share=network"
+  env:
+    # Sparse registry shaves multiple minutes off the cold dep fetch.
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": "sparse"
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "clang"
+    # `-Wl,-z,now` forces immediate symbol resolution at load so
+    # full-RELRO actually applies; combined with mold for link speed.
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold -C link-arg=-Wl,-z,now"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "clang"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=/usr/lib/sdk/rust-stable/bin/mold -C link-arg=-Wl,-z,now"
+
+# Permissions, in order of decreasing-blastradius. See
+# https://docs.flatpak.org/en/latest/sandbox-permissions.html.
+finish-args:
+  - "--socket=wayland"
+  - "--socket=fallback-x11"
+  - "--share=ipc"
+  # Network for the LanguageTool HTTP provider and the LLM provider.
+  - "--share=network"
+  # The keyring crate stores the LLM API key in libsecret over D-Bus.
+  - "--talk-name=org.freedesktop.secrets"
+  # SNI tray publication (the daemon's `Pause/Resume/Quit` menu).
+  - "--talk-name=org.kde.StatusNotifierWatcher"
+  - "--talk-name=org.freedesktop.Notifications"
+  # Per-app config scope — settings.toml lives in
+  # $XDG_CONFIG_HOME/hyprcorrect/. The daemon reads + reloads it.
+  - "--filesystem=xdg-config/hyprcorrect:rw"
+  - "--env=RUST_BACKTRACE=1"
+
+modules:
+  - name: hyprcorrect
+    buildsystem: simple
+    build-options:
+      build-args:
+        - "--share=network"
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin
+      env:
+        CARGO_HOME: /run/build/hyprcorrect/cargo
+    build-commands:
+      - cargo fetch --manifest-path Cargo.toml --verbose
+      - cargo build --release --bin hyprcorrect
+      - install -Dm0755 target/release/hyprcorrect /app/bin/hyprcorrect
+      - install -Dm0644 crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      # Render a hicolor PNG ladder from the source SVG so hosts that
+      # prefer fixed-size raster icons get a sharp render without
+      # scaling the SVG at runtime. rsvg-convert ships with the
+      # freedesktop runtime.
+      - |
+        for size in 16 22 24 32 48 64 128 256 512; do
+          install -d ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps
+          rsvg-convert -w $size -h $size \
+            crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect.svg \
+            -o ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
+        done
+      - install -Dm0644 packaging/hyprcorrect.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      # The shipped desktop file uses `Icon=hyprcorrect` and `Exec=hyprcorrect prefs`
+      # because that's how it's consumed in non-Flatpak contexts (the
+      # AUR tarballs install the binary at /usr/bin/hyprcorrect and
+      # the icon as hyprcorrect.svg). Inside the Flatpak sandbox, the
+      # icon is installed as ${FLATPAK_ID}.svg and the binary at
+      # /app/bin/hyprcorrect, so rewrite Icon= and Exec= here at
+      # install time — without this, the icon shows a generic
+      # placeholder in GNOME Software / KDE Discover and clicks may
+      # fail to launch.
+      - sed -i 's|^Icon=hyprcorrect$|Icon=com.hyprcorrect.Hyprcorrect|' ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - sed -i 's|^Exec=hyprcorrect |Exec=/app/bin/hyprcorrect |' ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      # AppStream metainfo — required by Flathub, also picked up by
+      # GNOME Software / KDE Discover for sideloaded bundles.
+      - install -Dm0644 build-aux/com.hyprcorrect.Hyprcorrect.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
+    sources:
+      - type: dir
+        path: ..

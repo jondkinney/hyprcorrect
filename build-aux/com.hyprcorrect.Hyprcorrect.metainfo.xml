@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.hyprcorrect.Hyprcorrect</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Hyprcorrect</name>
+  <summary>Keyboard-driven desktop spelling and typo correction</summary>
+  <icon type="stock">com.hyprcorrect.Hyprcorrect</icon>
+  <launchable type="desktop-id">com.hyprcorrect.Hyprcorrect.desktop</launchable>
+  <description>
+    <p>
+      Hyprcorrect is a keyboard-driven spelling and typo corrector for the whole
+      desktop. Press a hotkey and the word or sentence you just typed is checked
+      and fixed in place, in any focused app including terminals.
+    </p>
+    <p>
+      Pluggable providers — Spellbook (offline, bundled), LanguageTool (self-
+      hosted), and an LLM (Claude / OpenAI) — let you choose between instant
+      offline corrections and context-aware fixes for homonyms and grammar.
+      A privacy blocklist keeps password fields and other sensitive apps
+      untouched.
+    </p>
+  </description>
+  <categories>
+    <category>Utility</category>
+    <category>TextTools</category>
+  </categories>
+  <!-- OARS: every age-rating attribute defaults to "none", which is
+       correct for a text-correction utility. Self-closing element is
+       the Flathub shorthand for an all-clean rating. -->
+  <content_rating type="oars-1.1"/>
+  <!-- Per-release entries: prepend a new <release> at the top when
+       release-plz cuts a new tag. Required by Flathub for the
+       Version history section on the listing page; the latest
+       release is the only one strictly required. -->
+  <releases>
+    <release version="0.1.0" date="2026-05-27"/>
+  </releases>
+  <url type="homepage">https://hyprcorrect.com</url>
+  <url type="bugtracker">https://github.com/jondkinney/hyprcorrect/issues</url>
+  <developer_name>Jon Kinney</developer_name>
+</component>
