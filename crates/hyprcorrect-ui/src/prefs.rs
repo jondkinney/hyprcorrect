@@ -669,7 +669,7 @@ impl PrefsApp {
         let mut touched = false;
 
         field_label(ui, "Default provider");
-        caption(ui, "Used for fix-last-word — instant, ideally local.");
+        caption(ui, "Used for fix-last-word.");
         ui.add_space(4.0);
         touched |= provider_radio(
             ui,
