@@ -936,12 +936,34 @@ impl PrefsApp {
             }
         });
         ui.add_space(4.0);
-        caption(
-            ui,
-            "Pulls the erikvl87/languagetool image and runs it locally, \
-             mapped to the port in your URL above. Use this if you don't \
-             already self-host LanguageTool elsewhere.",
-        );
+        ui.horizontal_wrapped(|ui| {
+            // Tighten inline spacing so "Pulls the <link> image" reads as
+            // one sentence rather than three widgets with default gaps.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let muted = egui::Color32::from_gray(170);
+            ui.label(
+                egui::RichText::new("Pulls the ")
+                    .size(CAPTION_SIZE)
+                    .line_height(Some(CAPTION_LINE_HEIGHT))
+                    .color(muted),
+            );
+            ui.hyperlink_to(
+                egui::RichText::new("erikvl87/languagetool")
+                    .size(CAPTION_SIZE)
+                    .line_height(Some(CAPTION_LINE_HEIGHT)),
+                "https://hub.docker.com/r/erikvl87/languagetool",
+            );
+            ui.label(
+                egui::RichText::new(
+                    " image and runs it locally, mapped to the port in your \
+                     URL above. Use this if you don't already self-host \
+                     LanguageTool elsewhere.",
+                )
+                .size(CAPTION_SIZE)
+                .line_height(Some(CAPTION_LINE_HEIGHT))
+                .color(muted),
+            );
+        });
     }
 
     fn behavior_panel(&mut self, ui: &mut egui::Ui) {
@@ -1230,7 +1252,7 @@ impl PrefsApp {
         ui.add_space(SETTING_BLOCK_SPACING);
 
         field_label(ui, "Source");
-        caption(ui, "https://github.com/jondkinney/hyprcorrect");
+        ui.hyperlink("https://github.com/jondkinney/hyprcorrect");
         ui.add_space(SETTING_BLOCK_SPACING);
 
         field_label(ui, "License");
@@ -1268,13 +1290,17 @@ fn provider_radio(
     llm_tooltip: Option<&str>,
 ) -> bool {
     let before = *selection;
+    // Order: simplest → most complex, and offline → potentially-online.
+    // Spellbook is always offline (bundled dictionary). LanguageTool is
+    // offline when self-hosted at localhost; the URL field next door
+    // is where its locality is configured. LLM is always a network call.
     ui.horizontal(|ui| {
         ui.radio_value(selection, ProviderId::Spellbook, "Spellbook (offline)");
+        ui.radio_value(selection, ProviderId::LanguageTool, "LanguageTool");
         ui.radio_value(selection, ProviderId::Llm, "LLM");
         if let Some(tip) = llm_tooltip {
             info_icon(ui).on_hover_text(tip);
         }
-        ui.radio_value(selection, ProviderId::LanguageTool, "LanguageTool");
     });
     *selection != before
 }
@@ -1395,14 +1421,20 @@ fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response 
 /// Bold-ish label introducing a setting. Slightly larger than the
 /// caption text below the input.
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).strong().size(14.0));
+    ui.label(egui::RichText::new(text).strong().size(15.0));
 }
 
-/// Muted explainer text under inputs or checkboxes.
+/// Muted explainer text under inputs or checkboxes. Sized for
+/// comfortable wrapped reading — larger than egui's default body
+/// with extra line-height so multi-line captions don't feel cramped.
+const CAPTION_SIZE: f32 = 13.5;
+const CAPTION_LINE_HEIGHT: f32 = 20.0;
+
 fn caption(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
-            .size(12.0)
+            .size(CAPTION_SIZE)
+            .line_height(Some(CAPTION_LINE_HEIGHT))
             .color(egui::Color32::from_gray(170)),
     );
 }
