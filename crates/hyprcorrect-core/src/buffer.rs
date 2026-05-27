@@ -265,7 +265,6 @@ impl Buffer {
     pub fn word_at_caret(&self) -> Option<WordAtCaret> {
         let caret = self.caret;
         let text = &self.text;
-        let is_word_char = |c: char| !c.is_whitespace() && !matches!(c, '.' | '!' | '?');
 
         let prev_is_word = text[..caret].chars().next_back().is_some_and(is_word_char);
         if prev_is_word {
@@ -293,11 +292,13 @@ impl Buffer {
                 chars_after_caret: text[caret..word_end].chars().count(),
             });
         }
-        // Caret follows whitespace / sits at position 0. Look LEFT
-        // for the previous word, skipping any whitespace between
-        // the caret and that word's right edge.
+        // Caret follows whitespace or punctuation, or sits at
+        // position 0. Look LEFT for the previous word, skipping
+        // anything that isn't a word char (commas, periods,
+        // whitespace, …) so the captured "trailing" carries the
+        // punctuation back through the replacement intact.
         let before = &text[..caret];
-        let trimmed_right = before.trim_end_matches(|c: char| c.is_whitespace());
+        let trimmed_right = before.trim_end_matches(|c: char| !is_word_char(c));
         if trimmed_right.is_empty() {
             return None;
         }
@@ -377,10 +378,14 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     s[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
 }
 
-/// Same "word char" rule `word_at_caret` uses: not whitespace and
-/// not a sentence-ender.
+/// The "word char" rule shared by `word_at_caret`, `Ctrl+Left`,
+/// and `Ctrl+Right`. Alphanumerics plus apostrophe — so
+/// contractions like `don't` stay one word, but commas, periods,
+/// quotes, and brackets are word boundaries. Matches what bash
+/// readline and most terminals/editors do for Ctrl+arrow, which
+/// is what the buffer's caret needs to mirror.
 fn is_word_char(c: char) -> bool {
-    !c.is_whitespace() && !matches!(c, '.' | '!' | '?')
+    c.is_alphanumeric() || c == '\''
 }
 
 /// Where the caret lands on `Ctrl+Left`. Walk past any non-word
@@ -728,5 +733,34 @@ mod tests {
         assert_eq!(buf.text_before_caret(), "hello wo");
         buf.push(Key::WordLeft);
         assert_eq!(buf.text_before_caret(), "hello ");
+    }
+
+    #[test]
+    fn ctrl_left_skips_commas_like_a_typical_editor() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "hello, world");
+        buf.push(Key::WordLeft);
+        assert_eq!(buf.text_before_caret(), "hello, ");
+        buf.push(Key::WordLeft);
+        // Should land at start of "hello", not start of "hello,"
+        // — punctuation isn't part of the word.
+        assert_eq!(buf.text_before_caret(), "");
+    }
+
+    #[test]
+    fn word_at_caret_excludes_trailing_punctuation() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "recieve,");
+        let at = buf.word_at_caret().expect("word at caret");
+        assert_eq!(at.word, "recieve");
+        assert_eq!(at.trailing, ",");
+    }
+
+    #[test]
+    fn word_at_caret_keeps_apostrophes_for_contractions() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "don't");
+        let at = buf.word_at_caret().expect("word at caret");
+        assert_eq!(at.word, "don't");
     }
 }
