@@ -265,3 +265,4 @@ jobs:
             "${{ steps.dmg.outputs.path }}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+
