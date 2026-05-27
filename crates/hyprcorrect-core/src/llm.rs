@@ -28,6 +28,14 @@ const SYSTEM_PROMPT: &str = "You are a spelling, typo, and minor-grammar correct
      quotation marks. Preserve the user's voice, register, and punctuation \
      style. If the text is already fine, return it unchanged.";
 
+const WORD_SYSTEM_PROMPT: &str = "You correct ONE word at a time using sentence context. The \
+     user gives you a SENTENCE and one WORD from it to correct. Return ONLY the corrected \
+     version of that word — nothing else: no quotes, no punctuation, no commentary, no rest \
+     of the sentence. Use the rest of the sentence to disambiguate homophones \
+     (their/there/they're, its/it's, your/you're, etc.) and to pick the right fix for typos. \
+     Preserve the original casing of the word's first letter. If the word is already correct \
+     in context, return it unchanged.";
+
 /// Errors from an LLM correction request.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -95,16 +103,45 @@ impl LlmProvider {
         if text.trim().is_empty() {
             return Ok(text.to_string());
         }
+        self.request(SYSTEM_PROMPT, text.to_string())
+    }
+
+    /// Correct a single word using the surrounding sentence as
+    /// context. The LLM is told to return ONLY the corrected word,
+    /// not the rest of the sentence — callers splice it back in at
+    /// the caret. Good for homophones and context-dependent typos
+    /// where the offline spellbook either can't see the error
+    /// (their/there) or picks the wrong nearest neighbor.
+    ///
+    /// # Errors
+    ///
+    /// See [`LlmError`].
+    pub fn fix_word_in_context(&self, sentence: &str, word: &str) -> Result<String, LlmError> {
+        if word.trim().is_empty() {
+            return Ok(word.to_string());
+        }
+        let content = format!("SENTENCE: {sentence}\nWORD: {word}");
+        let corrected = self.request(WORD_SYSTEM_PROMPT, content)?;
+        // Defensive: strip any wrapping whitespace or quotation
+        // marks the LLM may include despite the system prompt
+        // telling it not to.
+        Ok(corrected
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '\'')
+            .to_string())
+    }
+
+    fn request(&self, system: &str, content: String) -> Result<String, LlmError> {
         let agent: ureq::Agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
             .build();
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": DEFAULT_MAX_TOKENS,
-            "system": SYSTEM_PROMPT,
+            "system": system,
             "messages": [{
                 "role": "user",
-                "content": text,
+                "content": content,
             }],
         });
         let response = agent

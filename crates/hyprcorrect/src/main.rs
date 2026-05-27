@@ -82,6 +82,7 @@ fn run_daemon() {
     });
     let mut llm = build_llm(&initial_config);
     let mut languagetool = build_languagetool(&initial_config);
+    let mut default_provider_id = initial_config.providers.default;
     let mut smart_provider_id = initial_config.providers.smart;
     let mut pause_per_backspace_ms = initial_config.behavior.pause_per_backspace_ms;
     let mut chord = match effective_chord(&initial_config) {
@@ -282,7 +283,13 @@ fn run_daemon() {
                                     languagetool.as_ref(),
                                     pause_per_backspace_ms,
                                 ),
-                                _ => fix_last_word(buffer, &provider, pause_per_backspace_ms),
+                                _ => fix_last_word(
+                                    buffer,
+                                    default_provider_id,
+                                    llm.as_ref(),
+                                    &provider,
+                                    pause_per_backspace_ms,
+                                ),
                             }
                         }
                     }
@@ -332,6 +339,7 @@ fn run_daemon() {
                             blocklist = build_blocklist(&new_config);
                             llm = build_llm(&new_config);
                             languagetool = build_languagetool(&new_config);
+                            default_provider_id = new_config.providers.default;
                             smart_provider_id = new_config.providers.smart;
                             pause_per_backspace_ms = new_config.behavior.pause_per_backspace_ms;
                             eprintln!("hyprcorrect: config reloaded");
@@ -480,15 +488,18 @@ fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
     }
 }
 
-/// Correct the buffer's last word in place via the offline provider.
-/// When the buffer has nothing to work with (focus moved, caret-
-/// moving key, app autocorrect, paste, …) we fall back to the
-/// clipboard path: simulate "select previous word", read it from
-/// the clipboard, correct, and overwrite the still-active
-/// selection. Per `DESIGN.md`'s secondary mode.
+/// Correct the buffer's last word in place. Routes through the
+/// configured default provider: Spellbook for fast offline lookups,
+/// LLM when the user wants context-aware fixes (homophones, typos
+/// that depend on the surrounding sentence). When the buffer has
+/// nothing to work with (focus moved, caret-moving key, paste, …)
+/// we fall back to the clipboard path. Per `DESIGN.md`'s secondary
+/// mode.
 #[cfg(target_os = "linux")]
 fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
+    default: hyprcorrect_core::ProviderId,
+    llm: Option<&hyprcorrect_core::LlmProvider>,
     provider: &hyprcorrect_core::OfflineProvider,
     pause_per_backspace_ms: u32,
 ) {
@@ -501,26 +512,11 @@ fn fix_last_word(
         return;
     };
     eprintln!(
-        "hyprcorrect: word-fix on {:?} (before={}, after={})",
+        "hyprcorrect: word-fix on {:?} (before={}, after={}; default={default:?})",
         at.word, at.chars_before_caret, at.chars_after_caret,
     );
     let bracketed = format_word_with_caret(&at.word, at.chars_before_caret, at.chars_after_caret);
-    let Some(correction) = provider.check_text(&at.word).into_iter().next() else {
-        eprintln!(
-            "hyprcorrect: word-fix — spellbook found no error in {:?}",
-            at.word
-        );
-        notify_warning(
-            "Nothing to correct",
-            &format!("Spellbook didn't find an error in {bracketed}."),
-        );
-        return;
-    };
-    let Some(fix) = correction.suggestions.into_iter().next() else {
-        eprintln!(
-            "hyprcorrect: word-fix — spellbook flagged {:?} but offered no suggestions",
-            at.word
-        );
+    let Some(fix) = pick_word_fix(buffer, &at, &bracketed, default, llm, provider) else {
         return;
     };
     let Some(edit) = plan_word_replacement(&at, &fix) else {
@@ -547,6 +543,94 @@ fn fix_last_word(
         }
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
+}
+
+/// Pick a fix for the word at the caret. LLM path uses
+/// `sentence_at_caret` as context so the model can disambiguate
+/// homophones; Spellbook path is the plain offline lookup. On
+/// LLM failure (timeout, no key, etc.) we fall back to Spellbook
+/// so the chord never silently no-ops. Returns `None` after
+/// firing the "nothing to do" toast and logging — callers exit
+/// without emitting.
+#[cfg(target_os = "linux")]
+fn pick_word_fix(
+    buffer: &hyprcorrect_core::Buffer,
+    at: &hyprcorrect_core::WordAtCaret,
+    bracketed: &str,
+    default: hyprcorrect_core::ProviderId,
+    llm: Option<&hyprcorrect_core::LlmProvider>,
+    spell: &hyprcorrect_core::OfflineProvider,
+) -> Option<String> {
+    use hyprcorrect_core::ProviderId;
+    if default == ProviderId::Llm {
+        match llm {
+            Some(llm) => {
+                let sentence = buffer
+                    .sentence_at_caret()
+                    .map(|s| s.sentence)
+                    .unwrap_or_else(|| at.word.clone());
+                match llm.fix_word_in_context(&sentence, &at.word) {
+                    Ok(corrected) => {
+                        if corrected.is_empty() || corrected == at.word {
+                            eprintln!(
+                                "hyprcorrect: word-fix — LLM left {:?} unchanged",
+                                at.word
+                            );
+                            notify_info(
+                                "Nothing to correct",
+                                &format!("LLM thinks {bracketed} is fine in context."),
+                            );
+                            return None;
+                        }
+                        eprintln!(
+                            "hyprcorrect: word-fix — LLM picked {:?} for {:?}",
+                            corrected, at.word
+                        );
+                        return Some(corrected);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "hyprcorrect: word-fix LLM failed ({e}) — falling back to spellbook"
+                        );
+                        notify_warning(
+                            "LLM unavailable",
+                            &format!("Falling back to Spellbook for {bracketed}."),
+                        );
+                        // Fall through to spellbook.
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "hyprcorrect: word-fix — default provider is LLM but no key configured; falling back to spellbook"
+                );
+                notify_warning(
+                    "LLM key not set",
+                    "Open Preferences → Providers → LLM and paste your Anthropic key.",
+                );
+                // Fall through to spellbook.
+            }
+        }
+    }
+    let Some(correction) = spell.check_text(&at.word).into_iter().next() else {
+        eprintln!(
+            "hyprcorrect: word-fix — spellbook found no error in {:?}",
+            at.word
+        );
+        notify_warning(
+            "Nothing to correct",
+            &format!("Spellbook didn't find an error in {bracketed}."),
+        );
+        return None;
+    };
+    let Some(fix) = correction.suggestions.into_iter().next() else {
+        eprintln!(
+            "hyprcorrect: word-fix — spellbook flagged {:?} but offered no suggestions",
+            at.word
+        );
+        return None;
+    };
+    Some(fix)
 }
 
 /// Render a word with the daemon's caret position bracketed,
