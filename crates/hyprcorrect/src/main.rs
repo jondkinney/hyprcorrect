@@ -587,7 +587,10 @@ fn fix_last_word(
             // no longer warranted.
             hyprcorrect_platform::linux::capture::caret_suspect_flag()
                 .store(false, Ordering::Relaxed);
-            notify_info("Corrected", &format!("{} → \"{}\"", plan.label, plan.fix));
+            notify_info(
+                &format!("Corrected ({})", provider_label(plan.provider)),
+                &format!("{} → \"{}\"", plan.label, plan.fix),
+            );
         }
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
@@ -613,6 +616,11 @@ struct WordFixPlan {
     /// caret-bracketed original (e.g., `"spa[g]heti"`); for a
     /// nearby pick it's the plain word.
     label: String,
+    /// Which provider actually produced `fix`. Set at the call site
+    /// inside [`pick_word_fix`] so fallback paths (e.g. LLM error →
+    /// spellbook) report the provider that *succeeded*, not the
+    /// configured default. Surfaced in the success toast.
+    provider: hyprcorrect_core::ProviderId,
 }
 
 /// How far (in chars) from the caret to consider "nearby" when
@@ -681,7 +689,7 @@ fn pick_word_fix(
                         "hyprcorrect: word-fix — LLM picked {:?} for {:?}",
                         corrected, at.word
                     );
-                    return Some(plan_for(&primary, corrected, bracketed));
+                    return Some(plan_for(&primary, corrected, bracketed, ProviderId::Llm));
                 }
                 eprintln!(
                     "hyprcorrect: word-fix — LLM left {:?} unchanged, scanning nearby",
@@ -728,7 +736,7 @@ fn pick_word_fix(
                         "hyprcorrect: word-fix — LT picked {:?} for {:?}",
                         fix, at.word
                     );
-                    return Some(plan_for(&primary, fix, bracketed));
+                    return Some(plan_for(&primary, fix, bracketed, ProviderId::LanguageTool));
                 }
                 eprintln!(
                     "hyprcorrect: word-fix — LT left {:?} unchanged, scanning nearby",
@@ -763,7 +771,7 @@ fn pick_word_fix(
     }
 
     if let Some(fix) = spellbook_pick(spell, &at.word) {
-        return Some(plan_for(&primary, fix, bracketed));
+        return Some(plan_for(&primary, fix, bracketed, ProviderId::Spellbook));
     }
     eprintln!(
         "hyprcorrect: word-fix — spellbook found no error in {:?}, scanning nearby",
@@ -819,6 +827,7 @@ fn scan_nearby_spellbook(
                 byte_start: nw.byte_start,
                 byte_end: nw.byte_end,
                 label: nw.word,
+                provider: hyprcorrect_core::ProviderId::Spellbook,
             });
         }
     }
@@ -869,6 +878,7 @@ fn scan_nearby_llm(
                     byte_start: nw.byte_start,
                     byte_end: nw.byte_end,
                     label: nw.word,
+                    provider: hyprcorrect_core::ProviderId::Llm,
                 });
             }
             Err(e) => {
@@ -920,6 +930,7 @@ fn scan_nearby_lt(
                         byte_start: nw.byte_start,
                         byte_end: nw.byte_end,
                         label: nw.word,
+                        provider: hyprcorrect_core::ProviderId::LanguageTool,
                     });
                 }
             }
@@ -931,6 +942,7 @@ fn scan_nearby_lt(
     }
     None
 }
+
 
 
 /// The primary edit target derived from `word_at_caret`: the
@@ -970,15 +982,20 @@ fn primary_target(
     }
 }
 
-
 #[cfg(target_os = "linux")]
-fn plan_for(primary: &PrimaryTarget, fix: String, bracketed: &str) -> WordFixPlan {
+fn plan_for(
+    primary: &PrimaryTarget,
+    fix: String,
+    bracketed: &str,
+    provider: hyprcorrect_core::ProviderId,
+) -> WordFixPlan {
     WordFixPlan {
         original: primary.original.clone(),
         fix,
         byte_start: primary.byte_start,
         byte_end: primary.byte_end,
         label: bracketed.to_string(),
+        provider,
     }
 }
 
@@ -1077,7 +1094,8 @@ fn start_review(
     let Some(at) = buffer.sentence_at_caret() else {
         return;
     };
-    let corrected = correct_sentence(&at.sentence, smart, llm, languagetool, provider);
+    let (corrected, _used_provider) =
+        correct_sentence(&at.sentence, smart, llm, languagetool, provider);
     eprintln!(
         "hyprcorrect: review-build — original ({} chars): {:?}",
         at.sentence.chars().count(),
@@ -1310,7 +1328,8 @@ fn fix_last_sentence(
         llm.is_some(),
         languagetool.is_some(),
     );
-    let corrected = correct_sentence(&at.sentence, smart, llm, languagetool, provider);
+    let (corrected, used_provider) =
+        correct_sentence(&at.sentence, smart, llm, languagetool, provider);
     if corrected == at.sentence {
         eprintln!("hyprcorrect: sentence-fix — provider returned the same text, nothing to emit");
         return;
@@ -1328,7 +1347,13 @@ fn fix_last_sentence(
         &insert,
         pause_per_backspace_ms,
     ) {
-        Ok(()) => buffer.apply_around_caret(backspaces, deletes, &insert),
+        Ok(()) => {
+            buffer.apply_around_caret(backspaces, deletes, &insert);
+            notify_info(
+                &format!("Corrected ({})", provider_label(used_provider)),
+                &format!("{} → {}", truncate(&at.sentence, 40), truncate(&corrected, 40)),
+            );
+        }
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
 }
@@ -1347,6 +1372,11 @@ fn truncate(s: &str, n: usize) -> String {
 /// offline spellbook path so the chord never silently no-ops, and
 /// fire a desktop toast so the user knows what failed instead of
 /// having to tail the daemon's stdout.
+///
+/// Returns the corrected text together with the provider that
+/// actually produced it — fallback paths (e.g. LLM error → spellbook)
+/// report `Spellbook`, not the configured default, so the success
+/// toast can't claim a provider that didn't run.
 #[cfg(target_os = "linux")]
 fn correct_sentence(
     text: &str,
@@ -1354,17 +1384,17 @@ fn correct_sentence(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
-) -> String {
+) -> (String, hyprcorrect_core::ProviderId) {
     use hyprcorrect_core::ProviderId;
     match smart {
         ProviderId::Llm => match llm {
             Some(llm) => match llm.rewrite(text) {
-                Ok(corrected) => corrected,
+                Ok(corrected) => (corrected, ProviderId::Llm),
                 Err(e) => {
                     let msg = format!("LLM call failed: {e}");
                     eprintln!("hyprcorrect: {msg} — falling back to spellbook");
                     notify_warning("LLM unavailable", &msg);
-                    apply_corrections(text, spell)
+                    (apply_corrections(text, spell), ProviderId::Spellbook)
                 }
             },
             None => {
@@ -1372,17 +1402,20 @@ fn correct_sentence(
                            Open Preferences → Providers → LLM and paste your Anthropic key.";
                 eprintln!("hyprcorrect: {msg} — falling back to spellbook");
                 notify_warning("LLM key not set", msg);
-                apply_corrections(text, spell)
+                (apply_corrections(text, spell), ProviderId::Spellbook)
             }
         },
         ProviderId::LanguageTool => match languagetool {
             Some(lt) => match lt.check_text(text) {
-                Ok(corrections) => apply_correction_list(text, corrections),
+                Ok(corrections) => (
+                    apply_correction_list(text, corrections),
+                    ProviderId::LanguageTool,
+                ),
                 Err(e) => {
                     let msg = format!("LanguageTool call failed: {e}");
                     eprintln!("hyprcorrect: {msg} — falling back to spellbook");
                     notify_warning("LanguageTool unavailable", &msg);
-                    apply_corrections(text, spell)
+                    (apply_corrections(text, spell), ProviderId::Spellbook)
                 }
             },
             None => {
@@ -1390,10 +1423,10 @@ fn correct_sentence(
                            no URL configured. Open Preferences → Providers → LanguageTool.";
                 eprintln!("hyprcorrect: {msg} — falling back to spellbook");
                 notify_warning("LanguageTool not configured", msg);
-                apply_corrections(text, spell)
+                (apply_corrections(text, spell), ProviderId::Spellbook)
             }
         },
-        ProviderId::Spellbook => apply_corrections(text, spell),
+        ProviderId::Spellbook => (apply_corrections(text, spell), ProviderId::Spellbook),
     }
 }
 
@@ -1412,6 +1445,20 @@ fn notify_warning(title: &str, body: &str) {
 #[cfg(target_os = "linux")]
 fn notify_info(title: &str, body: &str) {
     notify_send("low", title, body);
+}
+
+/// User-facing name of the provider that produced a correction.
+/// Source-of-truth lookup so the toast can't disagree with the code
+/// path that ran — `WordFixPlan::provider` is set at the same return
+/// site as the fix itself.
+#[cfg(target_os = "linux")]
+fn provider_label(provider: hyprcorrect_core::ProviderId) -> &'static str {
+    use hyprcorrect_core::ProviderId;
+    match provider {
+        ProviderId::Spellbook => "Spellbook",
+        ProviderId::Llm => "LLM",
+        ProviderId::LanguageTool => "LanguageTool",
+    }
 }
 
 #[cfg(target_os = "linux")]
