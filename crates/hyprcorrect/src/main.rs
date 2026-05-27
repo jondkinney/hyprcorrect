@@ -85,6 +85,7 @@ fn run_daemon() {
     let mut default_provider_id = initial_config.providers.default;
     let mut smart_provider_id = initial_config.providers.smart;
     let mut pause_per_backspace_ms = initial_config.behavior.pause_per_backspace_ms;
+    capture::set_reset_keys(reset_key_config(&initial_config.behavior.reset_keys));
     let mut chord = match effective_chord(&initial_config) {
         Ok(c) => c,
         Err(e) => {
@@ -252,6 +253,14 @@ fn run_daemon() {
                 {
                     buffers.entry(addr.to_string()).or_default().push(key);
                 }
+                // Any keystroke that resets the buffer (Enter, Tab,
+                // Esc, …) also restores caret-buffer agreement, so
+                // the "buffer caret is suspect, scan the whole
+                // buffer" mode mouse clicks opted us into is no
+                // longer needed.
+                if matches!(key, hyprcorrect_core::Key::Reset) {
+                    capture::caret_suspect_flag().store(false, Ordering::Relaxed);
+                }
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Trigger) => {
                 let action = hyprcorrect_core::runtime::read_action();
@@ -287,6 +296,7 @@ fn run_daemon() {
                                     buffer,
                                     default_provider_id,
                                     llm.as_ref(),
+                                    languagetool.as_ref(),
                                     &provider,
                                     pause_per_backspace_ms,
                                 ),
@@ -342,6 +352,9 @@ fn run_daemon() {
                             default_provider_id = new_config.providers.default;
                             smart_provider_id = new_config.providers.smart;
                             pause_per_backspace_ms = new_config.behavior.pause_per_backspace_ms;
+                            capture::set_reset_keys(reset_key_config(
+                                &new_config.behavior.reset_keys,
+                            ));
                             eprintln!("hyprcorrect: config reloaded");
                         }
                         Err(e) => {
@@ -429,6 +442,29 @@ fn build_blocklist(config: &hyprcorrect_core::Config) -> std::collections::HashS
         .collect()
 }
 
+/// Convert the core's [`hyprcorrect_core::ResetKeys`] config struct
+/// into the platform's
+/// [`hyprcorrect_platform::linux::capture::ResetKeyConfig`]. They're
+/// intentionally separate types — the config one is serializable /
+/// versioned for TOML; the capture one is the runtime view the
+/// classifier reads on every keystroke.
+#[cfg(target_os = "linux")]
+fn reset_key_config(
+    rk: &hyprcorrect_core::ResetKeys,
+) -> hyprcorrect_platform::linux::capture::ResetKeyConfig {
+    hyprcorrect_platform::linux::capture::ResetKeyConfig {
+        enter: rk.enter,
+        tab: rk.tab,
+        escape: rk.escape,
+        up: rk.up,
+        down: rk.down,
+        page_up: rk.page_up,
+        page_down: rk.page_down,
+        delete: rk.delete,
+        insert: rk.insert,
+    }
+}
+
 /// Launch `hyprcorrect prefs` as a detached subprocess (no stdio).
 /// Fire-and-forget; if a prefs window is already running, the new
 /// process short-circuits and focuses the existing one (the prefs
@@ -506,9 +542,12 @@ fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
     default: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     provider: &hyprcorrect_core::OfflineProvider,
     pause_per_backspace_ms: u32,
 ) {
+    use std::sync::atomic::Ordering;
+
     use hyprcorrect_platform::linux::emit;
 
     let Some(at) = buffer.word_at_caret() else {
@@ -521,7 +560,8 @@ fn fix_last_word(
         at.word, at.chars_before_caret, at.chars_after_caret,
     );
     let bracketed = format_word_with_caret(&at.word, at.chars_before_caret, at.chars_after_caret);
-    let Some(plan) = pick_word_fix(buffer, &at, &bracketed, default, llm, provider) else {
+    let Some(plan) = pick_word_fix(buffer, &at, &bracketed, default, llm, languagetool, provider)
+    else {
         return;
     };
     let word_chars = plan.original.chars().count();
@@ -541,6 +581,12 @@ fn fix_last_word(
     ) {
         Ok(()) => {
             buffer.apply_at_word(plan.byte_start, plan.byte_end, &plan.fix);
+            // The fix landed; the buffer's caret now agrees with
+            // the on-screen cursor (both at end of `plan.fix`),
+            // so a click-driven "scan the whole buffer" flag is
+            // no longer warranted.
+            hyprcorrect_platform::linux::capture::caret_suspect_flag()
+                .store(false, Ordering::Relaxed);
             notify_info("Corrected", &format!("{} → \"{}\"", plan.label, plan.fix));
         }
         Err(e) => eprintln!("hyprcorrect: {e}"),
@@ -579,12 +625,14 @@ const NEARBY_WORD_MAX_CHARS: i32 = 30;
 /// Build a [`WordFixPlan`] for the word the user wants fixed.
 /// First tries the primary pick (`word_at_caret`) through the
 /// configured provider. If that comes back fine, widens to
-/// nearby words within [`NEARBY_WORD_MAX_CHARS`] of the caret —
-/// covers the common "held-arrow caret drift" and "mouse click
-/// somewhere we didn't see" cases. On any LLM failure falls
-/// back to Spellbook so the chord never silently no-ops.
-/// Returns `None` after firing the "nothing to do" toast and
-/// logging — callers exit without emitting.
+/// nearby words around the caret — within
+/// [`NEARBY_WORD_MAX_CHARS`] by default, or the entire buffer
+/// when [`capture::caret_suspect_flag`] is set (a recent mouse
+/// click means the buffer caret may be far from the visible
+/// cursor). On any LLM failure falls back to Spellbook so the
+/// chord never silently no-ops. Returns `None` after firing the
+/// "nothing to do" toast and logging — callers exit without
+/// emitting.
 #[cfg(target_os = "linux")]
 fn pick_word_fix(
     buffer: &hyprcorrect_core::Buffer,
@@ -592,9 +640,14 @@ fn pick_word_fix(
     bracketed: &str,
     default: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
 ) -> Option<WordFixPlan> {
+    use std::sync::atomic::Ordering;
+
     use hyprcorrect_core::ProviderId;
+    use hyprcorrect_platform::linux::capture;
+
     let sentence = buffer
         .sentence_at_caret()
         .map(|s| s.sentence)
@@ -602,6 +655,20 @@ fn pick_word_fix(
 
     let use_llm = default == ProviderId::Llm && llm.is_some();
     let primary = primary_target(buffer, at);
+    // A recent mouse click leaves the buffer caret stale; scan
+    // every word in the buffer rather than just the ±30-char
+    // window around the (probably wrong) caret position.
+    let caret_suspect = capture::caret_suspect_flag().load(Ordering::Relaxed);
+    let max_chars = if caret_suspect {
+        i32::MAX
+    } else {
+        NEARBY_WORD_MAX_CHARS
+    };
+    if caret_suspect {
+        eprintln!(
+            "hyprcorrect: word-fix — caret suspect (recent click); scan widened to whole buffer"
+        );
+    }
 
     // Primary pass: the picked word at the caret.
     if use_llm {
@@ -621,7 +688,7 @@ fn pick_word_fix(
                     at.word
                 );
                 // Fall through to nearby scan via LLM.
-                if let Some(plan) = scan_nearby_llm(buffer, &sentence, &at.word, llm) {
+                if let Some(plan) = scan_nearby_llm(buffer, &sentence, &at.word, llm, max_chars) {
                     return Some(plan);
                 }
                 notify_info(
@@ -647,6 +714,52 @@ fn pick_word_fix(
             "LLM key not set",
             "Open Preferences → Providers → LLM and paste your Anthropic key.",
         );
+    } else if default == ProviderId::LanguageTool
+        && let Some(lt) = languagetool
+    {
+        match lt.check_text(&at.word) {
+            Ok(corrections) => {
+                if let Some(fix) = corrections
+                    .into_iter()
+                    .find_map(|c| c.suggestions.into_iter().next())
+                    && fix != at.word
+                {
+                    eprintln!(
+                        "hyprcorrect: word-fix — LT picked {:?} for {:?}",
+                        fix, at.word
+                    );
+                    return Some(plan_for(&primary, fix, bracketed));
+                }
+                eprintln!(
+                    "hyprcorrect: word-fix — LT left {:?} unchanged, scanning nearby",
+                    at.word
+                );
+                if let Some(plan) = scan_nearby_lt(buffer, &at.word, lt, max_chars) {
+                    return Some(plan);
+                }
+                notify_info(
+                    "Nothing to correct",
+                    &format!("LanguageTool thinks {bracketed} (and nearby) are fine."),
+                );
+                return None;
+            }
+            Err(e) => {
+                eprintln!("hyprcorrect: word-fix LT failed ({e}) — falling back to spellbook");
+                notify_warning(
+                    "LanguageTool unavailable",
+                    &format!("Falling back to Spellbook for {bracketed}."),
+                );
+                // Fall through to spellbook.
+            }
+        }
+    } else if default == ProviderId::LanguageTool {
+        eprintln!(
+            "hyprcorrect: word-fix — default provider is LanguageTool but it isn't configured; falling back to spellbook"
+        );
+        notify_warning(
+            "LanguageTool not configured",
+            "Open Preferences → Providers → LanguageTool, enable it, and set the URL.",
+        );
     }
 
     if let Some(fix) = spellbook_pick(spell, &at.word) {
@@ -656,7 +769,7 @@ fn pick_word_fix(
         "hyprcorrect: word-fix — spellbook found no error in {:?}, scanning nearby",
         at.word
     );
-    if let Some(plan) = scan_nearby_spellbook(buffer, &at.word, spell) {
+    if let Some(plan) = scan_nearby_spellbook(buffer, &at.word, spell, max_chars) {
         return Some(plan);
     }
     notify_warning(
@@ -676,13 +789,15 @@ fn spellbook_pick(spell: &hyprcorrect_core::OfflineProvider, word: &str) -> Opti
 
 /// Walk words near the buffer caret and return a plan for the
 /// first one Spellbook flags. Skips the primary word (already
-/// tried) and any word beyond [`NEARBY_WORD_MAX_CHARS`] from
-/// the caret.
+/// tried) and any word beyond `max_chars` from the caret.
+/// Caller passes `i32::MAX` to scan the entire buffer (used
+/// when a recent mouse click made the caret position unreliable).
 #[cfg(target_os = "linux")]
 fn scan_nearby_spellbook(
     buffer: &hyprcorrect_core::Buffer,
     primary_word: &str,
     spell: &hyprcorrect_core::OfflineProvider,
+    max_chars: i32,
 ) -> Option<WordFixPlan> {
     for nw in buffer.words_near_caret() {
         if nw.word == primary_word && nw.caret_offset_chars.abs() <= 1 {
@@ -690,7 +805,7 @@ fn scan_nearby_spellbook(
             // always at distance 0 or 1 (caret at end / inside).
             continue;
         }
-        if nw.caret_offset_chars.abs() > NEARBY_WORD_MAX_CHARS {
+        if nw.caret_offset_chars.abs() > max_chars {
             break; // sorted by distance, nothing closer follows
         }
         if let Some(fix) = spellbook_pick(spell, &nw.word) {
@@ -714,13 +829,16 @@ fn scan_nearby_spellbook(
 /// to fix-in-context, and return a plan for the first one the
 /// LLM rewrites. Caps the per-chord LLM cost at a few extra
 /// round-trips — same rate-limit / latency profile as a manual
-/// re-trigger by the user.
+/// re-trigger by the user. `max_chars` is `i32::MAX` for the
+/// post-mouse-click "scan everything" mode, otherwise the normal
+/// ±30-char window around the caret.
 #[cfg(target_os = "linux")]
 fn scan_nearby_llm(
     buffer: &hyprcorrect_core::Buffer,
     sentence: &str,
     primary_word: &str,
     llm: &hyprcorrect_core::LlmProvider,
+    max_chars: i32,
 ) -> Option<WordFixPlan> {
     const MAX_NEARBY_LLM_CALLS: usize = 4;
     let mut calls = 0;
@@ -728,7 +846,7 @@ fn scan_nearby_llm(
         if nw.word == primary_word && nw.caret_offset_chars.abs() <= 1 {
             continue;
         }
-        if nw.caret_offset_chars.abs() > NEARBY_WORD_MAX_CHARS {
+        if nw.caret_offset_chars.abs() > max_chars {
             break;
         }
         if calls >= MAX_NEARBY_LLM_CALLS {
@@ -762,6 +880,59 @@ fn scan_nearby_llm(
     None
 }
 
+/// Walk words near the buffer caret and return a plan for the
+/// first one LanguageTool flags. Mirrors [`scan_nearby_llm`] —
+/// same per-word cap, same early-exit on provider error.
+#[cfg(target_os = "linux")]
+fn scan_nearby_lt(
+    buffer: &hyprcorrect_core::Buffer,
+    primary_word: &str,
+    lt: &hyprcorrect_core::LanguageToolProvider,
+    max_chars: i32,
+) -> Option<WordFixPlan> {
+    const MAX_NEARBY_LT_CALLS: usize = 4;
+    let mut calls = 0;
+    for nw in buffer.words_near_caret() {
+        if nw.word == primary_word && nw.caret_offset_chars.abs() <= 1 {
+            continue;
+        }
+        if nw.caret_offset_chars.abs() > max_chars {
+            break;
+        }
+        if calls >= MAX_NEARBY_LT_CALLS {
+            break;
+        }
+        calls += 1;
+        match lt.check_text(&nw.word) {
+            Ok(corrections) => {
+                if let Some(fix) = corrections
+                    .into_iter()
+                    .find_map(|c| c.suggestions.into_iter().next())
+                    && fix != nw.word
+                {
+                    eprintln!(
+                        "hyprcorrect: word-fix — nearby LT hit {:?} → {:?} (offset {})",
+                        nw.word, fix, nw.caret_offset_chars
+                    );
+                    return Some(WordFixPlan {
+                        original: nw.word.clone(),
+                        fix,
+                        byte_start: nw.byte_start,
+                        byte_end: nw.byte_end,
+                        label: nw.word,
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("hyprcorrect: word-fix nearby LT call failed ({e}) — stopping scan");
+                return None;
+            }
+        }
+    }
+    None
+}
+
+
 /// The primary edit target derived from `word_at_caret`: the
 /// word's byte range in the buffer. Used to build the plan for
 /// the caret's-actual-word case.
@@ -777,18 +948,28 @@ fn primary_target(
     buffer: &hyprcorrect_core::Buffer,
     at: &hyprcorrect_core::WordAtCaret,
 ) -> PrimaryTarget {
+    // `WordAtCaret::chars_before_caret` counts only word chars,
+    // never the `trailing` whitespace/punctuation between the
+    // word's end and the caret. We have to step past `trailing`
+    // explicitly when walking back from the caret to find the
+    // word's start — otherwise a chord fired after typing
+    // "disambiguat " (note the trailing space) lands byte_start
+    // one position into the word, leaves the first letter behind
+    // on emit, and the caret-end backspace burst strips the space
+    // instead of the leading letter. Same bug shape for any
+    // captured trailing punctuation.
     let caret = buffer.caret();
-    // Byte positions: word starts `chars_before_caret` chars
-    // before the caret, ends `chars_after_caret` chars after.
     let text = buffer.text();
-    let byte_start = char_step_left(text, caret, at.chars_before_caret);
-    let byte_end = char_step_right(text, caret, at.chars_after_caret);
+    let trailing_chars = at.trailing.chars().count();
+    let byte_start = char_step_left(text, caret, at.chars_before_caret + trailing_chars);
+    let byte_end = byte_start + at.word.len();
     PrimaryTarget {
         original: at.word.clone(),
         byte_start,
         byte_end,
     }
 }
+
 
 #[cfg(target_os = "linux")]
 fn plan_for(primary: &PrimaryTarget, fix: String, bracketed: &str) -> WordFixPlan {
@@ -813,20 +994,6 @@ fn char_step_left(text: &str, from: usize, steps: usize) -> usize {
     pos
 }
 
-#[cfg(target_os = "linux")]
-fn char_step_right(text: &str, from: usize, steps: usize) -> usize {
-    let mut pos = from;
-    for _ in 0..steps {
-        if pos >= text.len() {
-            break;
-        }
-        pos = text[pos..]
-            .chars()
-            .next()
-            .map_or(pos, |c| pos + c.len_utf8());
-    }
-    pos
-}
 
 /// Render a word with the daemon's caret position bracketed,
 /// e.g. `spagheti` + caret after the 3rd char → `"spa[g]heti"`.
@@ -1074,7 +1241,13 @@ fn apply_review(
 #[cfg(target_os = "linux")]
 fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmProvider> {
     use hyprcorrect_core::{LlmProvider, ProviderId};
-    if config.providers.smart != ProviderId::Llm {
+    // Build the provider if either path (default = word-fix, smart =
+    // sentence/review) routes through it. Gating on `smart` alone
+    // silently denies fix-word when the user picks LLM as default
+    // and something else as smart.
+    if config.providers.smart != ProviderId::Llm
+        && config.providers.default != ProviderId::Llm
+    {
         return None;
     }
     match LlmProvider::from_config(&config.providers.llm) {
@@ -1094,7 +1267,9 @@ fn build_languagetool(
     config: &hyprcorrect_core::Config,
 ) -> Option<hyprcorrect_core::LanguageToolProvider> {
     use hyprcorrect_core::{LanguageToolProvider, ProviderId};
-    if config.providers.smart != ProviderId::LanguageTool {
+    if config.providers.smart != ProviderId::LanguageTool
+        && config.providers.default != ProviderId::LanguageTool
+    {
         return None;
     }
     match LanguageToolProvider::from_config(&config.providers.languagetool) {
@@ -1310,3 +1485,4 @@ fn run_daemon() {
 fn not_yet(what: &str, milestone: &str) {
     eprintln!("hyprcorrect: {what} is not implemented yet ({milestone}) — see DESIGN.md");
 }
+

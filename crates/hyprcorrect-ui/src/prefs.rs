@@ -168,6 +168,7 @@ impl PrefsApp {
         }
     }
 
+
     fn refresh_running_apps(&mut self) {
         if self.last_apps_refresh.elapsed() < Duration::from_secs(3) {
             return;
@@ -575,13 +576,17 @@ impl PrefsApp {
         field_label(ui, "Default provider");
         caption(ui, "Used for fix-last-word — instant, ideally local.");
         ui.add_space(4.0);
-        touched |= provider_radio(ui, &mut self.config.providers.default);
+        touched |= provider_radio(
+            ui,
+            &mut self.config.providers.default,
+            Some(LLM_DEFAULT_TOOLTIP),
+        );
 
         ui.add_space(SETTING_BLOCK_SPACING);
         field_label(ui, "Smart provider");
-        caption(ui, "Used for fix-last-sentence and the review popup (M4).");
+        caption(ui, "Used for fix-last-sentence and the review popup.");
         ui.add_space(4.0);
-        touched |= provider_radio(ui, &mut self.config.providers.smart);
+        touched |= provider_radio(ui, &mut self.config.providers.smart, None);
 
         ui.add_space(SETTING_BLOCK_SPACING);
         ui.separator();
@@ -611,6 +616,7 @@ impl PrefsApp {
             self.clear_status();
         }
     }
+
 
     fn behavior_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Behavior");
@@ -665,6 +671,41 @@ impl PrefsApp {
              4 ms if your apps keep up cleanly — corrections will \
              feel snappier.",
         );
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        field_label(ui, "Buffer reset keys");
+        caption(
+            ui,
+            "When you press one of these keys, hyprcorrect clears the \
+             per-window typing buffer — necessary for keys that \
+             change the typing context (Enter submits, arrows \
+             scroll history, Delete edits text the daemon can't \
+             see). Disable a key to let the buffer survive across \
+             it, so a follow-up fix-word can still operate on \
+             already-typed text. Tab and Esc are off by default \
+             because they rarely change content.",
+        );
+        ui.add_space(8.0);
+        let mut any_changed = false;
+        let rk = &mut self.config.behavior.reset_keys;
+        for (label, slot) in [
+            ("Enter / Return", &mut rk.enter),
+            ("Tab", &mut rk.tab),
+            ("Escape", &mut rk.escape),
+            ("Up arrow", &mut rk.up),
+            ("Down arrow", &mut rk.down),
+            ("Page Up", &mut rk.page_up),
+            ("Page Down", &mut rk.page_down),
+            ("Delete (forward)", &mut rk.delete),
+            ("Insert", &mut rk.insert),
+        ] {
+            if ui.checkbox(slot, label).changed() {
+                any_changed = true;
+            }
+        }
+        if any_changed {
+            self.clear_status();
+        }
     }
 
     fn privacy_panel(&mut self, ui: &mut egui::Ui) {
@@ -871,16 +912,85 @@ impl PrefsApp {
     }
 }
 
+/// Tooltip shown next to the LLM radio in the *Default provider*
+/// section. The smart provider sends the whole sentence anyway,
+/// so the surprises this tooltip warns about (every chord =
+/// outbound API call, sentence context attached) aren't news
+/// there — only the default-provider users need this.
+const LLM_DEFAULT_TOOLTIP: &str = "\
+Each fix-word chord sends the sentence around the caret plus the \
+word at the caret to your configured LLM (default: Anthropic \
+Claude). The LLM returns only the corrected word; sentence \
+context lets it disambiguate homophones like their/there.
+
+If the picked word looks fine, hyprcorrect tries up to 4 nearby \
+words in the same buffer — covers held-arrow caret drift and \
+the click-then-trigger case. On any LLM failure (no key, \
+timeout, network) we fall back to the offline Spellbook so the \
+chord never silently no-ops.
+
+Privacy: your typed text leaves your machine on every chord. \
+Pick Spellbook if that's a concern.";
+
 /// Render a provider-id radio group; returns `true` if the user
-/// changed the selection in this frame.
-fn provider_radio(ui: &mut egui::Ui, selection: &mut ProviderId) -> bool {
+/// changed the selection in this frame. When `llm_tooltip` is
+/// `Some`, an info icon next to the LLM radio surfaces that
+/// text on hover — only the Default-provider variant uses this.
+fn provider_radio(
+    ui: &mut egui::Ui,
+    selection: &mut ProviderId,
+    llm_tooltip: Option<&str>,
+) -> bool {
     let before = *selection;
     ui.horizontal(|ui| {
         ui.radio_value(selection, ProviderId::Spellbook, "Spellbook (offline)");
         ui.radio_value(selection, ProviderId::Llm, "LLM");
+        if let Some(tip) = llm_tooltip {
+            info_icon(ui).on_hover_text(tip);
+        }
         ui.radio_value(selection, ProviderId::LanguageTool, "LanguageTool");
     });
     *selection != before
+}
+
+/// Paint a small circle-with-`i` info icon at the current cursor
+/// in `ui`, sized to the row height. Drawn with the egui painter
+/// directly so we don't have to bundle an icon font or SVG just
+/// for one glyph — the bundled Adwaita Sans doesn't include the
+/// Unicode ⓘ codepoint and falls back to a tofu box otherwise.
+/// Caller chains `.on_hover_text(...)` on the returned response
+/// to attach a tooltip.
+fn info_icon(ui: &mut egui::Ui) -> egui::Response {
+    // Size the icon to the body text height so it sits flush
+    // with the "LLM" label next to it, not the larger radio
+    // hit-box.
+    let font_size = egui::TextStyle::Body.resolve(ui.style()).size;
+    let size = font_size;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let visuals = ui.visuals();
+    let stroke_color = if response.hovered() {
+        visuals.strong_text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = (size * 0.5) - 1.0;
+    painter.circle_stroke(center, radius, egui::Stroke::new(1.0, stroke_color));
+    // The "i" — drawn slightly above center because the glyph
+    // baseline sits low in most fonts.
+    painter.text(
+        center + egui::vec2(0.0, -0.5),
+        egui::Align2::CENTER_CENTER,
+        "i",
+        egui::FontId::proportional(size * 0.75),
+        stroke_color,
+    );
+    response
 }
 
 /// Render LLM-specific fields. Returns `true` if anything changed.

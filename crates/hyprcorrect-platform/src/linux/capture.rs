@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -109,6 +110,11 @@ pub fn start(
     let mods = MODS_WATCH
         .get_or_init(|| Arc::new(ModsWatch::new()))
         .clone();
+    let suspect = caret_suspect_flag();
+    for device in mouse_devices() {
+        let suspect = suspect.clone();
+        thread::spawn(move || read_mouse(device, suspect));
+    }
     let (tx, rx) = mpsc::channel();
     for (idx, device) in keyboards.into_iter().enumerate() {
         let tx = tx.clone();
@@ -156,7 +162,76 @@ pub fn wait_mods_clear(timeout: Duration) -> bool {
     watch.wait_clear(timeout)
 }
 
+/// Shared flag set by the mouse-listener threads whenever the user
+/// clicks a mouse button, and cleared by the daemon after the next
+/// fix-word emit or buffer reset. When `true`, the daemon's
+/// word-fix path widens its nearby-word scan to the entire buffer
+/// — the buffer's caret tracking can't follow a mouse click, but
+/// the buffer's *text* is still accurate, so scanning all of it
+/// for a typo is the best we can do without OS-level cursor
+/// snooping. Returned as an `Arc` so the daemon can both read and
+/// reset it.
+pub fn caret_suspect_flag() -> Arc<AtomicBool> {
+    CARET_SUSPECT
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+/// User-configurable view of which "control" keys reset the
+/// per-window buffer. The daemon passes the current settings via
+/// [`set_reset_keys`] at startup and on every config reload;
+/// `classify` reads it under a `RwLock::read` (essentially free)
+/// to decide whether a given key is a [`Key::Reset`] or just
+/// ignored. Defaults match the safest behavior — every
+/// context-changing key resets except for Tab and Escape, which
+/// rarely change typed text and would otherwise drop the buffer
+/// for no gain.
+#[derive(Debug, Clone, Copy)]
+pub struct ResetKeyConfig {
+    pub enter: bool,
+    pub tab: bool,
+    pub escape: bool,
+    pub up: bool,
+    pub down: bool,
+    pub page_up: bool,
+    pub page_down: bool,
+    pub delete: bool,
+    pub insert: bool,
+}
+
+impl Default for ResetKeyConfig {
+    fn default() -> Self {
+        Self {
+            enter: true,
+            tab: false,
+            escape: false,
+            up: true,
+            down: true,
+            page_up: true,
+            page_down: true,
+            delete: true,
+            insert: true,
+        }
+    }
+}
+
+/// Replace the daemon-wide reset-key config. Cheap (one `RwLock`
+/// write); call at startup and on every config reload.
+pub fn set_reset_keys(cfg: ResetKeyConfig) {
+    *reset_keys_lock().write().expect("reset-keys poisoned") = cfg;
+}
+
+fn reset_keys_lock() -> &'static std::sync::RwLock<ResetKeyConfig> {
+    RESET_KEY_CONFIG.get_or_init(|| std::sync::RwLock::new(ResetKeyConfig::default()))
+}
+
+fn reset_keys() -> ResetKeyConfig {
+    *reset_keys_lock().read().expect("reset-keys poisoned")
+}
+
 static MODS_WATCH: OnceLock<Arc<ModsWatch>> = OnceLock::new();
+static CARET_SUSPECT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+static RESET_KEY_CONFIG: OnceLock<std::sync::RwLock<ResetKeyConfig>> = OnceLock::new();
 
 /// Shared tracker of which chord modifiers are currently held, keyed
 /// by input-device index. The capture thread per device writes its
@@ -484,6 +559,63 @@ fn is_keyboard(device: &Device) -> bool {
         .is_some_and(|keys| keys.contains(KeyCode::KEY_A))
 }
 
+/// Enumerate `/dev/input` and return the devices that look like
+/// mice — those that can emit `BTN_LEFT`. Best-effort: any error
+/// (permission denied, missing /dev/input, …) yields an empty
+/// list rather than failing the whole daemon, since mouse
+/// listening is a UX-improvement add-on, not a hard requirement.
+fn mouse_devices() -> Vec<Device> {
+    let Ok(entries) = std::fs::read_dir("/dev/input") else {
+        return Vec::new();
+    };
+    let mut mice = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_event_node = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("event"));
+        if !is_event_node {
+            continue;
+        }
+        if let Ok(device) = Device::open(&path)
+            && is_mouse(&device)
+        {
+            mice.push(device);
+        }
+    }
+    mice
+}
+
+/// A device is treated as a mouse if it advertises `BTN_LEFT`.
+fn is_mouse(device: &Device) -> bool {
+    device
+        .supported_keys()
+        .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT))
+}
+
+/// Read one mouse forever; set [`caret_suspect_flag`] on every
+/// `BTN_LEFT` press. The daemon reads the flag in its word-fix
+/// path to widen the nearby-word scan when the buffer caret may
+/// have drifted from the visible cursor (the buffer doesn't see
+/// mouse clicks, so without this signal it has no idea the
+/// cursor moved).
+fn read_mouse(mut device: Device, suspect: Arc<AtomicBool>) {
+    loop {
+        let Ok(events) = device.fetch_events() else {
+            return;
+        };
+        for input in events {
+            if let EventSummary::Key(_, code, value) = input.destructure()
+                && code == KeyCode::BTN_LEFT
+                && value == 1
+            {
+                suspect.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Read one device forever, translating key events into [`Key`]s and
 /// sending them to `tx`. Returns — ending the thread — when the device
 /// disappears or the receiver is dropped.
@@ -749,37 +881,42 @@ fn is_modifier_keysym(sym: u32) -> bool {
     (0xffe1..=0xffee).contains(&sym)
 }
 
+/// Resolve "does this keysym reset the buffer right now" against
+/// the user's prefs-driven [`ResetKeyConfig`]. Cheap (one RwLock
+/// read) so `classify` can call it on every keystroke.
+fn reset_for_keysym(sym: u32) -> bool {
+    use xkb::keysyms::{
+        KEY_Delete, KEY_Down, KEY_Escape, KEY_ISO_Left_Tab, KEY_Insert, KEY_KP_Enter, KEY_Linefeed,
+        KEY_Next, KEY_Prior, KEY_Return, KEY_Tab, KEY_Up,
+    };
+    let cfg = reset_keys();
+    matches!(
+        sym,
+        s if (s == KEY_Return || s == KEY_KP_Enter || s == KEY_Linefeed) && cfg.enter
+    ) || matches!(sym, s if (s == KEY_Tab || s == KEY_ISO_Left_Tab) && cfg.tab)
+        || matches!(sym, s if s == KEY_Escape && cfg.escape)
+        || matches!(sym, s if s == KEY_Up && cfg.up)
+        || matches!(sym, s if s == KEY_Down && cfg.down)
+        || matches!(sym, s if s == KEY_Prior && cfg.page_up)
+        || matches!(sym, s if s == KEY_Next && cfg.page_down)
+        || matches!(sym, s if s == KEY_Delete && cfg.delete)
+        || matches!(sym, s if s == KEY_Insert && cfg.insert)
+}
+
 /// Classify an xkb keysym and the UTF-8 it produces into a buffer
 /// [`Key`]: Backspace and caret-moving keys are matched by keysym; a
 /// single printable character becomes a `Char`; everything else (bare
 /// modifiers, function keys) is ignored.
 fn classify(sym: u32, utf8: &str) -> Option<Key> {
-    use xkb::keysyms::{
-        KEY_BackSpace, KEY_Delete, KEY_Down, KEY_End, KEY_Escape, KEY_Home, KEY_ISO_Left_Tab,
-        KEY_Insert, KEY_KP_Enter, KEY_Left, KEY_Linefeed, KEY_Next, KEY_Prior, KEY_Return,
-        KEY_Right, KEY_Tab, KEY_Up,
-    };
+    use xkb::keysyms::{KEY_BackSpace, KEY_End, KEY_Home, KEY_Left, KEY_Right};
     // Left/Right arrow press translates to a buffer caret move,
     // and Home/End jump to the line edges (single-line context: a
     // safe approximation for the buffer, since we reset on
     // Return/Enter anyway). Ctrl+arrow word-jumps are detected
-    // upstream in `translate`. The remaining cursor-modifying keys
-    // (Return/Tab/Esc/Delete/Insert/Up/Down/Prior/Next) still
-    // reset: we can't track them precisely from raw evdev.
-    const RESET_KEYS: [u32; 12] = [
-        KEY_Return,
-        KEY_KP_Enter,
-        KEY_Linefeed,
-        KEY_Tab,
-        KEY_ISO_Left_Tab,
-        KEY_Escape,
-        KEY_Up,
-        KEY_Down,
-        KEY_Prior,
-        KEY_Next,
-        KEY_Delete,
-        KEY_Insert,
-    ];
+    // upstream in `translate`. The remaining context-changing
+    // keys (Enter/Tab/Esc/Up/Down/PageUp/PageDown/Delete/Insert)
+    // reset the buffer when the user has them toggled on in
+    // prefs — see `ResetKeyConfig`.
 
     if sym == KEY_BackSpace {
         Some(Key::Backspace)
@@ -791,7 +928,7 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         Some(Key::LineStart)
     } else if sym == KEY_End {
         Some(Key::LineEnd)
-    } else if RESET_KEYS.contains(&sym) {
+    } else if reset_for_keysym(sym) {
         Some(Key::Reset)
     } else {
         let mut chars = utf8.chars();
@@ -827,11 +964,36 @@ mod tests {
         assert_eq!(classify(KEY_End, ""), Some(Key::LineEnd));
     }
 
+    // The reset-key classifier reads a process-global `RwLock`
+    // (see `set_reset_keys`), so default + toggled assertions
+    // share state across tests. Cargo runs tests in parallel
+    // within a binary, which would race if we used three
+    // separate `#[test]` fns — combine them into one and
+    // explicitly set the config at every checkpoint.
     #[test]
-    fn other_navigation_keys_reset_the_buffer() {
-        for sym in [KEY_Return, KEY_Tab, KEY_Escape, KEY_Up] {
-            assert_eq!(classify(sym, ""), Some(Key::Reset), "keysym {sym:#x}");
-        }
+    fn reset_key_classifier_honors_config() {
+        // Defaults: Enter/Up reset, Tab/Esc ignored.
+        set_reset_keys(ResetKeyConfig::default());
+        assert_eq!(classify(KEY_Return, ""), Some(Key::Reset));
+        assert_eq!(classify(KEY_Up, ""), Some(Key::Reset));
+        assert_eq!(classify(KEY_Tab, "\t"), None);
+        assert_eq!(classify(KEY_Escape, "\u{1b}"), None);
+
+        // Flip Tab/Esc on, Enter off — classify mirrors the
+        // new config.
+        set_reset_keys(ResetKeyConfig {
+            enter: false,
+            tab: true,
+            escape: true,
+            ..Default::default()
+        });
+        assert_eq!(classify(KEY_Tab, "\t"), Some(Key::Reset));
+        assert_eq!(classify(KEY_Escape, "\u{1b}"), Some(Key::Reset));
+        assert_eq!(classify(KEY_Return, ""), None);
+
+        // Restore defaults so other tests in this module that
+        // don't touch the global still observe expected behavior.
+        set_reset_keys(ResetKeyConfig::default());
     }
 
     #[test]

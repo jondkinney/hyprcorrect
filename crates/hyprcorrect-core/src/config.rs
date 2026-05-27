@@ -101,7 +101,13 @@ pub enum ProviderId {
     Spellbook,
     /// Network LLM (model and backend per [`LlmConfig`]).
     Llm,
-    /// Self-hosted LanguageTool over HTTP.
+    /// Self-hosted LanguageTool over HTTP. Serialized as
+    /// `"languagetool"` (one word) so the TOML enum value matches
+    /// the `[providers.languagetool]` section header and the
+    /// product's own one-word branding — overriding the
+    /// container-level snake_case default that would otherwise
+    /// produce `"language_tool"`.
+    #[serde(rename = "languagetool")]
     LanguageTool,
 }
 
@@ -159,11 +165,57 @@ pub struct Behavior {
     /// original on screen. This pause covers that drain time.
     /// Raise it if you still see leftover prefix characters.
     pub pause_per_backspace_ms: u32,
+
+    /// Which keys clear the per-window typing buffer when pressed.
+    /// Useful trade-off: a reset is the safest response to a key
+    /// we can't precisely track (so fix-word never lands at the
+    /// wrong spot), but disabling some resets lets the buffer
+    /// survive an autocomplete (Tab), a mode switch (Esc), and so
+    /// on so a subsequent fix-word can still operate on the
+    /// already-typed text.
+    pub reset_keys: ResetKeys,
 }
 impl Default for Behavior {
     fn default() -> Self {
         Self {
             pause_per_backspace_ms: 8,
+            reset_keys: ResetKeys::default(),
+        }
+    }
+}
+
+/// Per-key toggles for "this key clears the typing buffer." See
+/// [`Behavior::reset_keys`]. Defaults match what the daemon needs
+/// to stay safe — Enter, the arrow keys above/below, Page Up/Down,
+/// forward Delete, and Insert all reset; Tab and Escape do not
+/// because they typically don't change typed text and resetting
+/// drops the buffer for no gain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ResetKeys {
+    pub enter: bool,
+    pub tab: bool,
+    pub escape: bool,
+    pub up: bool,
+    pub down: bool,
+    pub page_up: bool,
+    pub page_down: bool,
+    pub delete: bool,
+    pub insert: bool,
+}
+
+impl Default for ResetKeys {
+    fn default() -> Self {
+        Self {
+            enter: true,
+            tab: false,
+            escape: false,
+            up: true,
+            down: true,
+            page_up: true,
+            page_down: true,
+            delete: true,
+            insert: true,
         }
     }
 }

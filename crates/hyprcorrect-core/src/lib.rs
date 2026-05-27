@@ -18,7 +18,7 @@ pub use buffer::{Buffer, Key, NearbyWord, SentenceAtCaret, WordAtCaret};
 pub use chord::{Chord, ChordError};
 pub use config::{
     Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,
-    Providers,
+    Providers, ResetKeys,
 };
 pub use languagetool::{LanguageToolError, LanguageToolProvider};
 pub use llm::{LlmError, LlmProvider};
