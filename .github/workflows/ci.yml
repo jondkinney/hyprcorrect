@@ -1,8 +1,8 @@
 name: CI
 
 # Per-PR safety net: fmt + clippy + test on every OS we ship to.
-# Release-time builds will live in release.yml (added with packaging at
-# milestone M6); this is the pre-merge gate that keeps main green.
+# Release-time builds live in release.yml; this is the pre-merge gate
+# that keeps main green.
 
 on:
   push:
@@ -25,9 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          # Run fmt on both OSes: rustfmt only sees the cfg-gated source
-          # for the platform it runs on, so a macOS-only block stays
-          # unchecked until fmt runs on macOS too.
+          # Run fmt on both OSes: rustfmt only sees the cfg-gated
+          # source for the platform it runs on, so a macOS-only block
+          # stays unchecked until fmt runs on macOS too.
           - ubuntu-latest
           - macos-latest
     steps:
@@ -44,6 +44,8 @@ jobs:
       fail-fast: false
       matrix:
         os:
+          # OS matrix mirrors release.yml's platform set: every OS we
+          # ship binaries for gets a per-PR gate too.
           - ubuntu-24.04
           - macos-latest
     steps:
@@ -51,14 +53,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Scope rust-cache to the runner image
+        # ImageVersion changes whenever GitHub refreshes the runner
+        # image — which is also when preinstalled / Homebrew libs
+        # move. Folding it into the cache key stops a cached build
+        # script's baked-in `-L .../Cellar/<pkg>/<ver>/lib` from
+        # outliving the Cellar dir it points at (`ld: library '...'
+        # not found`).
+        shell: bash
+        run: echo "CACHE_IMAGE=${ImageOS:-}-${ImageVersion:-}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
-      - name: Install Linux build dependencies
+        with:
+          key: ${{ env.CACHE_IMAGE }}
+
+      - name: Install Linux deps
         if: runner.os == 'Linux'
-        # The xkbcommon crate links the system libxkbcommon.
+        # Same set release.yml installs for the Linux tarball builds.
+        # libsecret + libdbus are linked transitively by the keyring +
+        # ksni crates the prefs window and tray pull in.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libgl-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libdbus-1-dev \
+            libsecret-1-dev
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       - name: cargo test
         run: cargo test --workspace --all-features

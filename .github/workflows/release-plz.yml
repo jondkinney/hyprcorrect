@@ -1,12 +1,5 @@
 name: release-plz
 
-# Automated crates.io releases. On every push to main, release-plz keeps
-# a "release PR" (version bump + CHANGELOG) up to date; merging it
-# publishes the crates and cuts the tag + GitHub Release.
-#
-# Requires the RELEASE_PLZ_TOKEN and CARGO_REGISTRY_TOKEN repository
-# secrets — until those are set this workflow is inert.
-
 on:
   push:
     branches: [main]
@@ -16,6 +9,9 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Publish the crates and cut the tag + GitHub Release once the
+  # release PR is merged. The Release fires `release: published`,
+  # which the packaging workflows (binaries, AUR, site) build on.
   release:
     name: release-plz release
     runs-on: ubuntu-24.04
@@ -25,6 +21,22 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install native deps
+        # cargo publish runs a verify-build per crate, which links the
+        # full set (egui's GL surface, keyring's libsecret, ksni's
+        # dbus, etc.). Missing any of these turns the publish step
+        # into a confusing linker error.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libgl-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libdbus-1-dev \
+            libsecret-1-dev
       - uses: release-plz/action@v0.5
         with:
           command: release
@@ -32,6 +44,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+  # Keep the release PR (version bump + CHANGELOG) up to date on
+  # every push to main.
   release-pr:
     name: release-plz PR
     runs-on: ubuntu-24.04
@@ -44,6 +58,18 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libgl-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libdbus-1-dev \
+            libsecret-1-dev
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
