@@ -270,6 +270,27 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, triggers: &[TriggerSpec]
         return None;
     }
 
+    // Ctrl+Left / Ctrl+Right (with no Alt/Super) is the universal
+    // "jump by word" shortcut. Track those as word-boundary caret
+    // moves rather than treating them as a reset — otherwise the
+    // buffer goes blind every time the user word-jumps to fix a
+    // typo. Shift may also be held (selection extension), but that
+    // doesn't change where the caret ends up.
+    {
+        use xkb::keysyms::{KEY_Left, KEY_Right};
+        let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
+        let ctrl_only =
+            active(xkb::MOD_NAME_CTRL) && !active(xkb::MOD_NAME_ALT) && !active(xkb::MOD_NAME_LOGO);
+        if ctrl_only {
+            if sym == KEY_Left {
+                return Some(Key::WordLeft);
+            }
+            if sym == KEY_Right {
+                return Some(Key::WordRight);
+            }
+        }
+    }
+
     // A non-modifier key pressed while Ctrl/Alt/Super is held is a
     // shortcut, not typed text — and it may have moved the caret or
     // edited. Reset.
@@ -396,13 +417,14 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         KEY_Insert, KEY_KP_Enter, KEY_Left, KEY_Linefeed, KEY_Next, KEY_Prior, KEY_Return,
         KEY_Right, KEY_Tab, KEY_Up,
     };
-    // Left/Right arrow press translates to a buffer caret move so
-    // editing in-place during typing (jumping into earlier text to
-    // fix a typo, then continuing) keeps the buffer intact. Other
-    // caret movers (Up/Down/Home/End) and the cursor-modifying
-    // keys (Return/Tab/Esc/Delete/Insert/Prior/Next) still reset:
-    // we can't track them from raw evdev.
-    const RESET_KEYS: [u32; 14] = [
+    // Left/Right arrow press translates to a buffer caret move,
+    // and Home/End jump to the line edges (single-line context: a
+    // safe approximation for the buffer, since we reset on
+    // Return/Enter anyway). Ctrl+arrow word-jumps are detected
+    // upstream in `translate`. The remaining cursor-modifying keys
+    // (Return/Tab/Esc/Delete/Insert/Up/Down/Prior/Next) still
+    // reset: we can't track them precisely from raw evdev.
+    const RESET_KEYS: [u32; 12] = [
         KEY_Return,
         KEY_KP_Enter,
         KEY_Linefeed,
@@ -411,8 +433,6 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         KEY_Escape,
         KEY_Up,
         KEY_Down,
-        KEY_Home,
-        KEY_End,
         KEY_Prior,
         KEY_Next,
         KEY_Delete,
@@ -425,6 +445,10 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         Some(Key::MoveLeft)
     } else if sym == KEY_Right {
         Some(Key::MoveRight)
+    } else if sym == KEY_Home {
+        Some(Key::LineStart)
+    } else if sym == KEY_End {
+        Some(Key::LineEnd)
     } else if RESET_KEYS.contains(&sym) {
         Some(Key::Reset)
     } else {
@@ -440,7 +464,8 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
 mod tests {
     use super::*;
     use xkb::keysyms::{
-        KEY_BackSpace, KEY_End, KEY_Escape, KEY_Left, KEY_Return, KEY_Right, KEY_Tab, KEY_Up,
+        KEY_BackSpace, KEY_End, KEY_Escape, KEY_Home, KEY_Left, KEY_Return, KEY_Right, KEY_Tab,
+        KEY_Up,
     };
 
     #[test]
@@ -455,8 +480,14 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_jump_to_line_edges() {
+        assert_eq!(classify(KEY_Home, ""), Some(Key::LineStart));
+        assert_eq!(classify(KEY_End, ""), Some(Key::LineEnd));
+    }
+
+    #[test]
     fn other_navigation_keys_reset_the_buffer() {
-        for sym in [KEY_Return, KEY_Tab, KEY_Escape, KEY_Up, KEY_End] {
+        for sym in [KEY_Return, KEY_Tab, KEY_Escape, KEY_Up] {
             assert_eq!(classify(sym, ""), Some(Key::Reset), "keysym {sym:#x}");
         }
     }

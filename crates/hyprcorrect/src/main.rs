@@ -495,22 +495,83 @@ fn fix_last_word(
     use hyprcorrect_core::plan_word_replacement;
     use hyprcorrect_platform::linux::emit;
 
-    if let Some(last) = buffer.last_word() {
-        let Some(correction) = provider.check_text(&last.word).into_iter().next() else {
-            return;
-        };
-        let Some(fix) = correction.suggestions.into_iter().next() else {
-            return;
-        };
-        let Some(edit) = plan_word_replacement(&last, &fix) else {
-            return;
-        };
-        match emit::replace_with_delay(edit.backspaces, &edit.insert, pause_per_backspace_ms) {
-            Ok(()) => buffer.apply(edit.backspaces, &edit.insert),
-            Err(e) => eprintln!("hyprcorrect: {e}"),
-        }
-    } else {
+    let Some(at) = buffer.word_at_caret() else {
+        eprintln!("hyprcorrect: word-fix — buffer has no word at caret, trying clipboard fallback");
         fix_via_clipboard(provider);
+        return;
+    };
+    eprintln!(
+        "hyprcorrect: word-fix on {:?} (before={}, after={})",
+        at.word, at.chars_before_caret, at.chars_after_caret,
+    );
+    let bracketed = format_word_with_caret(&at.word, at.chars_before_caret, at.chars_after_caret);
+    let Some(correction) = provider.check_text(&at.word).into_iter().next() else {
+        eprintln!(
+            "hyprcorrect: word-fix — spellbook found no error in {:?}",
+            at.word
+        );
+        notify_warning(
+            "Nothing to correct",
+            &format!("Spellbook didn't find an error in {bracketed}."),
+        );
+        return;
+    };
+    let Some(fix) = correction.suggestions.into_iter().next() else {
+        eprintln!(
+            "hyprcorrect: word-fix — spellbook flagged {:?} but offered no suggestions",
+            at.word
+        );
+        return;
+    };
+    let Some(edit) = plan_word_replacement(&at, &fix) else {
+        eprintln!("hyprcorrect: word-fix — suggestion equals the original word, nothing to emit");
+        return;
+    };
+    eprintln!(
+        "hyprcorrect: word-fix emit — {} backspaces + {} deletes + {:?}",
+        edit.backspaces, edit.deletes, edit.insert
+    );
+    match emit::replace_around_caret_with_delay(
+        edit.backspaces,
+        edit.deletes,
+        &edit.insert,
+        pause_per_backspace_ms,
+    ) {
+        Ok(()) => {
+            buffer.apply_around_caret(edit.backspaces, edit.deletes, &edit.insert);
+            // Surface the picked-word → suggestion mapping in a
+            // toast. Bracket the char the daemon believes the
+            // caret is on so any mismatch with the TUI's visible
+            // cursor block is obvious at a glance.
+            notify_info("Corrected", &format!("{bracketed} → \"{fix}\""));
+        }
+        Err(e) => eprintln!("hyprcorrect: {e}"),
+    }
+}
+
+/// Render a word with the daemon's caret position bracketed,
+/// e.g. `spagheti` + caret after the 3rd char → `"spa[g]heti"`.
+/// Caret at the very end falls back to `"word|"`; at the very
+/// start to `"|word"`. Used in the fix-word success toast so the
+/// user can confirm exactly which character the daemon thinks
+/// the caret is on, since the TUI's visible cursor block can sit
+/// a position over.
+#[cfg(target_os = "linux")]
+fn format_word_with_caret(word: &str, chars_before: usize, chars_after: usize) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    if chars_after == 0 {
+        return format!("{word}|");
+    }
+    if chars_before >= chars.len() {
+        return format!("{word}|");
+    }
+    let before: String = chars[..chars_before].iter().collect();
+    let on: char = chars[chars_before];
+    let after: String = chars[chars_before + 1..].iter().collect();
+    if chars_before == 0 {
+        format!("|[{on}]{after}")
+    } else {
+        format!("{before}[{on}]{after}")
     }
 }
 
@@ -567,16 +628,16 @@ fn start_review(
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
 ) {
     use hyprcorrect_core::runtime::{ReviewRequest, write_review_request};
-    let Some(last) = buffer.last_sentence() else {
+    let Some(at) = buffer.sentence_at_caret() else {
         return;
     };
-    let corrected = correct_sentence(&last.sentence, smart, llm, languagetool, provider);
+    let corrected = correct_sentence(&at.sentence, smart, llm, languagetool, provider);
     eprintln!(
         "hyprcorrect: review-build — original ({} chars): {:?}",
-        last.sentence.chars().count(),
-        last.sentence
+        at.sentence.chars().count(),
+        at.sentence
     );
-    if corrected == last.sentence {
+    if corrected == at.sentence {
         eprintln!("hyprcorrect: review-build — provider returned the same text, nothing to review");
         return;
     }
@@ -586,9 +647,11 @@ fn start_review(
         corrected
     );
     let request = ReviewRequest {
-        original: last.sentence,
+        original: at.sentence,
         corrected,
-        trailing: last.trailing,
+        trailing: at.trailing,
+        chars_before_caret: at.chars_before_caret,
+        chars_after_caret: at.chars_after_caret,
         window_address: address.to_string(),
     };
     if let Err(e) = write_review_request(&request) {
@@ -696,16 +759,28 @@ fn apply_review(
     // The popup-side `REFOCUS_DELAY_MS` covers the focus-handoff
     // proper; this covers the app's post-focus settling.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let backspaces = req.original.chars().count() + req.trailing.chars().count();
+    // Backspaces (left of caret) = original's left half + trailing
+    //   whitespace that sits between sentence and caret.
+    // Deletes (right of caret) = original's right half.
+    // Insert at caret = corrected text + the same trailing whitespace.
+    // For end-of-text reviews (the common case) `chars_after_caret`
+    // is 0 and this collapses to "backspace everything, retype".
+    let backspaces = req.chars_before_caret + req.trailing.chars().count();
+    let deletes = req.chars_after_caret;
     let insert = format!("{}{}", req.corrected, req.trailing);
     eprintln!(
-        "hyprcorrect: review-apply — {backspaces} backspaces + {:?}",
+        "hyprcorrect: review-apply — {backspaces} backspaces + {deletes} deletes + {:?}",
         insert
     );
-    match emit::replace_with_delay(backspaces, &insert, pause_per_backspace_ms) {
+    match emit::replace_around_caret_with_delay(
+        backspaces,
+        deletes,
+        &insert,
+        pause_per_backspace_ms,
+    ) {
         Ok(()) => {
             if let Some(buf) = buffers.get_mut(&req.window_address) {
-                buf.apply(backspaces, &insert);
+                buf.apply_around_caret(backspaces, deletes, &insert);
             }
         }
         Err(e) => eprintln!("hyprcorrect: review emit failed: {e}"),
@@ -768,7 +843,7 @@ fn fix_last_sentence(
 ) {
     use hyprcorrect_platform::linux::emit;
 
-    let Some(last) = buffer.last_sentence() else {
+    let Some(at) = buffer.sentence_at_caret() else {
         eprintln!(
             "hyprcorrect: sentence-fix skipped — focused window's keystroke buffer holds no sentence (try typing the sentence inside this window first)"
         );
@@ -776,13 +851,13 @@ fn fix_last_sentence(
     };
     eprintln!(
         "hyprcorrect: sentence-fix on {:?} ({} chars; smart={smart:?}; llm={}; lt={})",
-        truncate(&last.sentence, 60),
-        last.sentence.chars().count(),
+        truncate(&at.sentence, 60),
+        at.sentence.chars().count(),
         llm.is_some(),
         languagetool.is_some(),
     );
-    let corrected = correct_sentence(&last.sentence, smart, llm, languagetool, provider);
-    if corrected == last.sentence {
+    let corrected = correct_sentence(&at.sentence, smart, llm, languagetool, provider);
+    if corrected == at.sentence {
         eprintln!("hyprcorrect: sentence-fix — provider returned the same text, nothing to emit");
         return;
     }
@@ -790,10 +865,16 @@ fn fix_last_sentence(
         "hyprcorrect: sentence-fix emitting → {:?}",
         truncate(&corrected, 60)
     );
-    let backspaces = last.sentence.chars().count() + last.trailing.chars().count();
-    let insert = format!("{corrected}{}", last.trailing);
-    match emit::replace_with_delay(backspaces, &insert, pause_per_backspace_ms) {
-        Ok(()) => buffer.apply(backspaces, &insert),
+    let backspaces = at.chars_before_caret + at.trailing.chars().count();
+    let deletes = at.chars_after_caret;
+    let insert = format!("{corrected}{}", at.trailing);
+    match emit::replace_around_caret_with_delay(
+        backspaces,
+        deletes,
+        &insert,
+        pause_per_backspace_ms,
+    ) {
+        Ok(()) => buffer.apply_around_caret(backspaces, deletes, &insert),
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
 }
@@ -867,6 +948,20 @@ fn correct_sentence(
 /// when `notify-send` (libnotify) isn't installed.
 #[cfg(target_os = "linux")]
 fn notify_warning(title: &str, body: &str) {
+    notify_send("normal", title, body);
+}
+
+/// Low-urgency informational notification. Used to confirm which
+/// word the daemon picked for fix-word, since the TUI's rendered
+/// cursor block can read as sitting on a different character than
+/// the buffer caret.
+#[cfg(target_os = "linux")]
+fn notify_info(title: &str, body: &str) {
+    notify_send("low", title, body);
+}
+
+#[cfg(target_os = "linux")]
+fn notify_send(urgency: &str, title: &str, body: &str) {
     use std::process::{Command, Stdio};
     let _ = Command::new("notify-send")
         .args([
@@ -875,7 +970,7 @@ fn notify_warning(title: &str, body: &str) {
             "-c",
             "im",
             "-u",
-            "normal",
+            urgency,
             "-i",
             "tools-check-spelling",
             &format!("hyprcorrect — {title}"),

@@ -22,32 +22,61 @@ pub enum Key {
     /// Right arrow — move the caret right by one character within the
     /// buffer.
     MoveRight,
-    /// Anything we can't track precisely: Up/Down/Home/End/Tab/Enter/
-    /// Esc, focus change, mouse click, or a Ctrl/Alt/Super shortcut.
-    /// After one of these the buffer's contents and caret are no
-    /// longer trustworthy, so the buffer clears itself.
+    /// `Ctrl+Left` (word-jump) — move the caret to the start of the
+    /// previous word (or the start of the current word if the caret
+    /// sits inside one).
+    WordLeft,
+    /// `Ctrl+Right` — move the caret past the end of the next word
+    /// (or the end of the current word if the caret sits inside one).
+    WordRight,
+    /// `Home` — move the caret to the start of the buffer. (The
+    /// daemon's buffer holds at most one line — `Enter` still
+    /// resets — so "line start" and "buffer start" coincide.)
+    LineStart,
+    /// `End` — move the caret to the end of the buffer.
+    LineEnd,
+    /// Anything we can't track precisely: Up/Down/Tab/Enter/Esc,
+    /// Page Up/Down, focus change, mouse click, or any Ctrl/Alt/
+    /// Super shortcut we haven't taught the buffer about. After one
+    /// of these the buffer's contents and caret are no longer
+    /// trustworthy, so the buffer clears itself.
     Reset,
 }
 
-/// The last word in the buffer, with any whitespace that follows it.
+/// The word at (or immediately to the left of) the caret, with the
+/// metadata an emit-side replace needs to delete the right characters
+/// before retyping. Returned by [`Buffer::word_at_caret`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastWord {
-    /// The word itself, with no surrounding whitespace.
+pub struct WordAtCaret {
+    /// The full word — both halves around the caret if the caret
+    /// sits inside the word.
     pub word: String,
-    /// Whitespace between the word and the caret (the buffer's end) —
-    /// usually the space the user typed after the word.
+    /// Whitespace between the right edge of the word and the caret
+    /// when the caret is in trailing whitespace, otherwise empty.
     pub trailing: String,
+    /// How many characters of `word` sit BEFORE the caret. Emit
+    /// uses this as the BackSpace count.
+    pub chars_before_caret: usize,
+    /// How many characters of `word` sit AFTER the caret. Emit
+    /// uses this as the Delete-key count.
+    pub chars_after_caret: usize,
 }
 
-/// The last sentence in the buffer, with any whitespace that follows it.
-/// "Sentence" here is "text after the previous `.`/`!`/`?`" (or, if
-/// there isn't one, the whole buffer's trimmed content).
+/// The sentence containing (or immediately to the left of) the caret,
+/// with metadata for the emit-side replace. Returned by
+/// [`Buffer::sentence_at_caret`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastSentence {
-    /// The sentence itself, with no surrounding whitespace.
+pub struct SentenceAtCaret {
+    /// The full sentence — both halves around the caret if the
+    /// caret sits inside the sentence.
     pub sentence: String,
-    /// Whitespace between the sentence and the caret.
+    /// Whitespace between the right edge of the sentence and the
+    /// caret when the caret is in trailing whitespace.
     pub trailing: String,
+    /// How many characters of `sentence` sit BEFORE the caret.
+    pub chars_before_caret: usize,
+    /// How many characters of `sentence` sit AFTER the caret.
+    pub chars_after_caret: usize,
 }
 
 /// A bounded record of recently typed text in the focused element.
@@ -110,6 +139,18 @@ impl Buffer {
                 }
                 self.caret = next_char_boundary(&self.text, self.caret);
             }
+            Key::WordLeft => {
+                self.caret = prev_word_boundary(&self.text, self.caret);
+            }
+            Key::WordRight => {
+                self.caret = next_word_boundary(&self.text, self.caret);
+            }
+            Key::LineStart => {
+                self.caret = 0;
+            }
+            Key::LineEnd => {
+                self.caret = self.text.len();
+            }
             Key::Reset => {
                 self.text.clear();
                 self.caret = 0;
@@ -150,84 +191,141 @@ impl Buffer {
     /// rather than no-opping. If the buffer doesn't end with an
     /// ender the sentence is the in-progress text after the previous
     /// one.
-    pub fn last_sentence(&self) -> Option<LastSentence> {
-        let before = self.text_before_caret();
-        let trimmed = before.trim_end();
-        if trimmed.is_empty() {
+    pub fn sentence_at_caret(&self) -> Option<SentenceAtCaret> {
+        let text = &self.text;
+        let caret = self.caret;
+        if text.is_empty() {
             return None;
         }
-        // Look for the previous sentence boundary — the ender BEFORE
-        // the current sentence. If trimmed ends in an ender, that one
-        // closes the current sentence, so we search the slice before
-        // it; otherwise we search the whole trimmed text.
-        let last_char = trimmed.chars().next_back().expect("non-empty");
-        let ends_with_ender = matches!(last_char, '.' | '!' | '?');
-        let search_end = if ends_with_ender {
-            trimmed.len() - last_char.len_utf8()
+        // Build the buffer's sentence ranges as `[start, end)` byte
+        // offsets, where `end` is the position AFTER the closing
+        // ender (or text.len() for an in-progress trailing sentence).
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0;
+        for (i, c) in text.char_indices() {
+            if matches!(c, '.' | '!' | '?') {
+                ranges.push((start, i + c.len_utf8()));
+                start = i + c.len_utf8();
+            }
+        }
+        if start < text.len() {
+            ranges.push((start, text.len()));
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        // Pick the latest range that contains the caret. When the
+        // caret sits exactly on a boundary (`caret == end`) the
+        // later range wins; if that later range is whitespace-only
+        // the caret is really in the previous sentence's trailing
+        // whitespace, so step back one.
+        let mut idx = ranges
+            .iter()
+            .rposition(|&(s, e)| s <= caret && caret <= e)?;
+        if text[ranges[idx].0..ranges[idx].1].trim().is_empty() && idx > 0 {
+            idx -= 1;
+        }
+        let (range_start, range_end) = ranges[idx];
+        let raw = &text[range_start..range_end];
+        let leading_ws = raw.len() - raw.trim_start().len();
+        let sentence_start = range_start + leading_ws;
+        let sentence_end = range_start + raw.trim_end().len();
+        if sentence_start >= sentence_end {
+            return None;
+        }
+        let sentence = text[sentence_start..sentence_end].to_string();
+        let caret_in_range = caret.clamp(sentence_start, sentence_end);
+        let chars_before = text[sentence_start..caret_in_range].chars().count();
+        let chars_after = text[caret_in_range..sentence_end].chars().count();
+        // Trailing whitespace between the sentence's right edge and
+        // the caret. Present only when the caret has walked past the
+        // sentence into trailing space.
+        let trailing = if caret > sentence_end {
+            text[sentence_end..caret].to_string()
         } else {
-            trimmed.len()
+            String::new()
         };
-        let after_prev_ender = trimmed[..search_end]
-            .char_indices()
-            .rev()
-            .find_map(|(i, c)| {
-                if matches!(c, '.' | '!' | '?') {
-                    Some(i + c.len_utf8())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-        // Skip whitespace after the boundary to find the sentence's
-        // first character.
-        let sentence_start = trimmed[after_prev_ender..]
-            .char_indices()
-            .find_map(|(i, c)| {
-                if !c.is_whitespace() {
-                    Some(after_prev_ender + i)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(trimmed.len());
-        if sentence_start >= trimmed.len() {
-            return None;
-        }
-        let before = self.text_before_caret();
-        Some(LastSentence {
-            sentence: trimmed[sentence_start..].to_string(),
-            trailing: before[trimmed.len()..].to_string(),
+        Some(SentenceAtCaret {
+            sentence,
+            trailing,
+            chars_before_caret: chars_before,
+            chars_after_caret: chars_after,
         })
     }
 
-    /// The last word in the buffer with the whitespace that follows it,
-    /// or `None` when the buffer holds no word (it is empty or holds
-    /// only whitespace).
-    pub fn last_word(&self) -> Option<LastWord> {
-        let before = self.text_before_caret();
-        let trimmed = before.trim_end();
-        if trimmed.is_empty() {
+    /// The word at (or immediately left of) the caret. Decides by
+    /// looking at the char immediately BEFORE the caret:
+    /// - If it's a word char, the caret is in / at the end of a
+    ///   word; expand both directions.
+    /// - If it's whitespace (or the caret is at position 0), pick
+    ///   the previous word — matches the "fix the word your cursor
+    ///   just passed" mental model.
+    ///
+    /// Returns `None` when there's no word to operate on.
+    pub fn word_at_caret(&self) -> Option<WordAtCaret> {
+        let caret = self.caret;
+        let text = &self.text;
+        let is_word_char = |c: char| !c.is_whitespace() && !matches!(c, '.' | '!' | '?');
+
+        let prev_is_word = text[..caret].chars().next_back().is_some_and(is_word_char);
+        if prev_is_word {
+            // Caret sits in or at the end of a word — expand both ways.
+            let right_span: usize = text[caret..]
+                .chars()
+                .take_while(|&c| is_word_char(c))
+                .map(char::len_utf8)
+                .sum();
+            let left_span: usize = text[..caret]
+                .chars()
+                .rev()
+                .take_while(|&c| is_word_char(c))
+                .map(char::len_utf8)
+                .sum();
+            let word_start = caret - left_span;
+            let word_end = caret + right_span;
+            if word_start == word_end {
+                return None;
+            }
+            return Some(WordAtCaret {
+                word: text[word_start..word_end].to_string(),
+                trailing: String::new(),
+                chars_before_caret: text[word_start..caret].chars().count(),
+                chars_after_caret: text[caret..word_end].chars().count(),
+            });
+        }
+        // Caret follows whitespace / sits at position 0. Look LEFT
+        // for the previous word, skipping any whitespace between
+        // the caret and that word's right edge.
+        let before = &text[..caret];
+        let trimmed_right = before.trim_end_matches(|c: char| c.is_whitespace());
+        if trimmed_right.is_empty() {
             return None;
         }
-        // Byte length of the run of non-whitespace at the end of `trimmed`.
-        let word_bytes: usize = trimmed
+        let word_chars: usize = trimmed_right
             .chars()
             .rev()
-            .take_while(|c| !c.is_whitespace())
+            .take_while(|&c| is_word_char(c))
             .map(char::len_utf8)
             .sum();
-        Some(LastWord {
-            word: trimmed[trimmed.len() - word_bytes..].to_string(),
-            trailing: before[trimmed.len()..].to_string(),
+        if word_chars == 0 {
+            return None;
+        }
+        let word_end = trimmed_right.len();
+        let word_start = word_end - word_chars;
+        Some(WordAtCaret {
+            word: text[word_start..word_end].to_string(),
+            trailing: text[word_end..caret].to_string(),
+            chars_before_caret: text[word_start..word_end].chars().count(),
+            chars_after_caret: 0,
         })
     }
 
-    /// Mirror an external edit in the buffer: delete `backspaces`
-    /// characters going LEFT from the caret, then insert `insert`
-    /// at the caret. Called after the emulation layer applies a
-    /// correction, so that a follow-up correction sees the
-    /// corrected text.
-    pub fn apply(&mut self, backspaces: usize, insert: &str) {
+    /// Mirror an external edit that happens AROUND the caret: delete
+    /// `backspaces` characters going LEFT and `deletes` characters
+    /// going RIGHT, then insert at the caret. Called after the
+    /// emulation layer fires `BackSpace × N` + `Delete × M` + the
+    /// replacement text.
+    pub fn apply_around_caret(&mut self, backspaces: usize, deletes: usize, insert: &str) {
         for _ in 0..backspaces {
             if self.caret == 0 {
                 break;
@@ -236,9 +334,23 @@ impl Buffer {
             self.text.drain(prev..self.caret);
             self.caret = prev;
         }
+        for _ in 0..deletes {
+            if self.caret >= self.text.len() {
+                break;
+            }
+            let next = next_char_boundary(&self.text, self.caret);
+            self.text.drain(self.caret..next);
+        }
         self.text.insert_str(self.caret, insert);
         self.caret += insert.len();
         self.trim_to_capacity();
+    }
+
+    /// Mirror an end-of-caret edit (no right-side deletes). Shim
+    /// over [`apply_around_caret`] so end-of-text call-sites stay
+    /// readable.
+    pub fn apply(&mut self, backspaces: usize, insert: &str) {
+        self.apply_around_caret(backspaces, 0, insert);
     }
 
     /// Drop characters from the front until the buffer fits `capacity`.
@@ -265,6 +377,50 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     s[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
 }
 
+/// Same "word char" rule `word_at_caret` uses: not whitespace and
+/// not a sentence-ender.
+fn is_word_char(c: char) -> bool {
+    !c.is_whitespace() && !matches!(c, '.' | '!' | '?')
+}
+
+/// Where the caret lands on `Ctrl+Left`. Walk past any non-word
+/// chars immediately to the caret's left, then to the start of
+/// the next word over.
+fn prev_word_boundary(s: &str, from: usize) -> usize {
+    let left = &s[..from];
+    let trim: usize = left
+        .chars()
+        .rev()
+        .take_while(|&c| !is_word_char(c))
+        .map(char::len_utf8)
+        .sum();
+    let trimmed_end = left.len() - trim;
+    let word_chars: usize = left[..trimmed_end]
+        .chars()
+        .rev()
+        .take_while(|&c| is_word_char(c))
+        .map(char::len_utf8)
+        .sum();
+    trimmed_end - word_chars
+}
+
+/// Where the caret lands on `Ctrl+Right`. Walk past any non-word
+/// chars to the caret's right, then past the end of that word.
+fn next_word_boundary(s: &str, from: usize) -> usize {
+    let right = &s[from..];
+    let skip: usize = right
+        .chars()
+        .take_while(|&c| !is_word_char(c))
+        .map(char::len_utf8)
+        .sum();
+    let word_chars: usize = right[skip..]
+        .chars()
+        .take_while(|&c| is_word_char(c))
+        .map(char::len_utf8)
+        .sum();
+    from + skip + word_chars
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,48 +433,70 @@ mod tests {
     }
 
     #[test]
-    fn empty_buffer_has_no_last_word() {
+    fn empty_buffer_has_no_word() {
         let buf = Buffer::default();
         assert!(buf.is_empty());
-        assert_eq!(buf.last_word(), None);
+        assert_eq!(buf.word_at_caret(), None);
     }
 
     #[test]
-    fn last_word_without_trailing_whitespace() {
+    fn word_at_caret_at_end_of_word() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "vernuer");
-        assert_eq!(
-            buf.last_word(),
-            Some(LastWord {
-                word: "vernuer".to_string(),
-                trailing: String::new(),
-            })
-        );
+        let at = buf.word_at_caret().unwrap();
+        assert_eq!(at.word, "vernuer");
+        assert_eq!(at.trailing, "");
+        assert_eq!(at.chars_before_caret, 7);
+        assert_eq!(at.chars_after_caret, 0);
     }
 
     #[test]
-    fn last_word_keeps_trailing_whitespace() {
+    fn word_at_caret_in_trailing_whitespace_picks_the_left_word() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "vernuer ");
-        let last = buf.last_word().unwrap();
-        assert_eq!(last.word, "vernuer");
-        assert_eq!(last.trailing, " ");
+        let at = buf.word_at_caret().unwrap();
+        assert_eq!(at.word, "vernuer");
+        assert_eq!(at.trailing, " ");
+        assert_eq!(at.chars_before_caret, 7);
+        assert_eq!(at.chars_after_caret, 0);
     }
 
     #[test]
-    fn last_word_picks_the_final_word() {
+    fn word_at_caret_inside_word_expands_both_directions() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "vernuer");
+        // Land the caret between "ver" and "nuer".
+        for _ in 0..4 {
+            buf.push(Key::MoveLeft);
+        }
+        let at = buf.word_at_caret().unwrap();
+        assert_eq!(at.word, "vernuer");
+        assert_eq!(at.chars_before_caret, 3);
+        assert_eq!(at.chars_after_caret, 4);
+    }
+
+    #[test]
+    fn word_at_caret_picks_the_final_word() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "the quick vernuer ");
-        let last = buf.last_word().unwrap();
-        assert_eq!(last.word, "vernuer");
-        assert_eq!(last.trailing, " ");
+        let at = buf.word_at_caret().unwrap();
+        assert_eq!(at.word, "vernuer");
     }
 
     #[test]
-    fn all_whitespace_has_no_last_word() {
+    fn all_whitespace_has_no_word_at_caret() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "   ");
-        assert_eq!(buf.last_word(), None);
+        assert_eq!(buf.word_at_caret(), None);
+    }
+
+    #[test]
+    fn word_at_caret_handles_multibyte_chars() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "café ");
+        let at = buf.word_at_caret().unwrap();
+        assert_eq!(at.word, "café");
+        assert_eq!(at.chars_before_caret, 4);
     }
 
     #[test]
@@ -342,7 +520,7 @@ mod tests {
         type_str(&mut buf, "vernuer ");
         buf.push(Key::Reset);
         assert!(buf.is_empty());
-        assert_eq!(buf.last_word(), None);
+        assert_eq!(buf.word_at_caret(), None);
     }
 
     #[test]
@@ -353,82 +531,103 @@ mod tests {
     }
 
     #[test]
-    fn last_word_handles_multibyte_characters() {
-        let mut buf = Buffer::default();
-        type_str(&mut buf, "café ");
-        let last = buf.last_word().unwrap();
-        assert_eq!(last.word, "café");
-        assert_eq!(last.trailing, " ");
-    }
-
-    #[test]
-    fn last_sentence_after_an_ender() {
+    fn sentence_at_caret_after_an_ender() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "Hello there. how are you ");
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "how are you");
-        assert_eq!(last.trailing, " ");
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "how are you");
+        assert_eq!(at.trailing, " ");
+        assert_eq!(at.chars_after_caret, 0);
     }
 
     #[test]
-    fn last_sentence_when_no_ender_yet() {
+    fn sentence_at_caret_when_no_ender_yet() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "the quick brown fox");
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "the quick brown fox");
-        assert_eq!(last.trailing, "");
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "the quick brown fox");
+        assert_eq!(at.trailing, "");
     }
 
     #[test]
-    fn last_sentence_with_multiple_enders() {
+    fn sentence_at_caret_with_multiple_enders_picks_current() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "Hi! Hello there. How are yu");
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "How are yu");
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "How are yu");
     }
 
     #[test]
-    fn last_sentence_includes_the_trailing_ender() {
+    fn sentence_at_caret_includes_the_trailing_ender() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "Hello there.");
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "Hello there.");
-        assert_eq!(last.trailing, "");
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "Hello there.");
     }
 
     #[test]
-    fn last_sentence_picks_the_final_of_multiple_complete_sentences() {
+    fn sentence_at_caret_picks_the_final_of_multiple_complete_sentences() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "First sentence. Second sentence!");
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "Second sentence!");
-        assert_eq!(last.trailing, "");
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "Second sentence!");
     }
 
     #[test]
-    fn last_sentence_after_complete_one_then_trailing_ws() {
+    fn sentence_at_caret_after_complete_one_then_trailing_ws() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "Hello there.   ");
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "Hello there.");
-        assert_eq!(last.trailing, "   ");
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "Hello there.");
+        assert_eq!(at.trailing, "   ");
     }
 
     #[test]
-    fn last_sentence_returns_none_for_whitespace() {
+    fn sentence_at_caret_returns_none_for_whitespace_only() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "   ");
-        assert!(buf.last_sentence().is_none());
+        assert!(buf.sentence_at_caret().is_none());
     }
 
     #[test]
-    fn apply_mirrors_a_correction() {
+    fn sentence_at_caret_in_middle_spans_both_sides() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox jumps");
+        // Land caret after "brown".
+        for _ in 0..10 {
+            buf.push(Key::MoveLeft);
+        }
+        let at = buf.sentence_at_caret().unwrap();
+        assert_eq!(at.sentence, "the quick brown fox jumps");
+        assert_eq!(at.chars_before_caret, 15);
+        assert_eq!(at.chars_after_caret, 10);
+    }
+
+    #[test]
+    fn apply_mirrors_a_correction_at_end() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "vernuer ");
-        // Replace "vernuer " (8 characters) with "veneer ".
         buf.apply(8, "veneer ");
         assert_eq!(buf.text(), "veneer ");
-        assert_eq!(buf.last_word().unwrap().word, "veneer");
+        assert_eq!(buf.word_at_caret().unwrap().word, "veneer");
+    }
+
+    #[test]
+    fn apply_around_caret_mirrors_a_mid_word_fix() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "vernuer trailing");
+        // Park caret right after "vernuer".
+        for _ in 0..9 {
+            buf.push(Key::MoveLeft);
+        }
+        // Mid-word edit emitting BackSpace × 3 + Delete × 4 + "veneer":
+        // pretend caret was between "ver" and "nuer" instead of after
+        // "vernuer". Functionally checks the both-sides drain.
+        for _ in 0..4 {
+            buf.push(Key::MoveLeft);
+        }
+        buf.apply_around_caret(3, 4, "veneer");
+        assert_eq!(buf.text(), "veneer trailing");
     }
 
     #[test]
@@ -438,21 +637,8 @@ mod tests {
         for _ in 0..6 {
             buf.push(Key::MoveLeft);
         }
-        // Text unchanged, but the caret is now before "world".
         assert_eq!(buf.text(), "hello world");
         assert_eq!(buf.text_before_caret(), "hello");
-    }
-
-    #[test]
-    fn last_sentence_uses_text_before_caret() {
-        let mut buf = Buffer::default();
-        type_str(&mut buf, "Hi! how are you doing today");
-        // Move caret back 6 chars so it sits after "doing".
-        for _ in 0..6 {
-            buf.push(Key::MoveLeft);
-        }
-        let last = buf.last_sentence().unwrap();
-        assert_eq!(last.sentence, "how are you doing");
     }
 
     #[test]
@@ -497,15 +683,50 @@ mod tests {
     }
 
     #[test]
-    fn apply_acts_at_caret_not_end() {
+    fn line_start_and_line_end_jump_to_the_edges() {
         let mut buf = Buffer::default();
-        type_str(&mut buf, "vernuer trailing");
-        // Park the caret right after "vernuer".
-        for _ in 0..9 {
+        type_str(&mut buf, "hello world");
+        buf.push(Key::LineStart);
+        assert_eq!(buf.text_before_caret(), "");
+        buf.push(Key::LineEnd);
+        assert_eq!(buf.text_before_caret(), "hello world");
+    }
+
+    #[test]
+    fn word_left_jumps_to_previous_word_start() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox");
+        buf.push(Key::WordLeft);
+        assert_eq!(buf.text_before_caret(), "the quick brown ");
+        buf.push(Key::WordLeft);
+        assert_eq!(buf.text_before_caret(), "the quick ");
+        buf.push(Key::WordLeft);
+        assert_eq!(buf.text_before_caret(), "the ");
+        buf.push(Key::WordLeft);
+        assert_eq!(buf.text_before_caret(), "");
+    }
+
+    #[test]
+    fn word_right_jumps_to_next_word_end() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox");
+        buf.push(Key::LineStart);
+        buf.push(Key::WordRight);
+        assert_eq!(buf.text_before_caret(), "the");
+        buf.push(Key::WordRight);
+        assert_eq!(buf.text_before_caret(), "the quick");
+    }
+
+    #[test]
+    fn word_left_from_mid_word_lands_at_word_start() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "hello world");
+        for _ in 0..3 {
             buf.push(Key::MoveLeft);
         }
-        // Replace the 7 chars before the caret ("vernuer") with "veneer".
-        buf.apply(7, "veneer");
-        assert_eq!(buf.text(), "veneer trailing");
+        // caret is between "wo" and "rld"
+        assert_eq!(buf.text_before_caret(), "hello wo");
+        buf.push(Key::WordLeft);
+        assert_eq!(buf.text_before_caret(), "hello ");
     }
 }

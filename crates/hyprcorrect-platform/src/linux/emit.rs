@@ -60,17 +60,62 @@ pub fn replace_with_delay(
     text: &str,
     pause_per_backspace_ms: u32,
 ) -> Result<(), EmitError> {
-    if backspaces > 0 {
+    replace_around_caret_with_delay(backspaces, 0, text, pause_per_backspace_ms)
+}
+
+/// Like [`replace_with_delay`] but also emits Delete keys (right of
+/// the caret) before typing the replacement. Used by fix-word /
+/// fix-sentence when the caret is INSIDE a word or sentence: we
+/// can't backspace away text on the right side of the caret, so we
+/// hand the focused app `BackSpace × N` then `Delete × M` then the
+/// new text.
+///
+/// `pause_per_backspace_ms` scales the drain pause by the total
+/// number of editing keystrokes (backspaces + deletes), since both
+/// kinds of edits queue in the focused app's event loop the same
+/// way.
+///
+/// # Errors
+///
+/// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
+pub fn replace_around_caret_with_delay(
+    backspaces: usize,
+    deletes: usize,
+    text: &str,
+    pause_per_backspace_ms: u32,
+) -> Result<(), EmitError> {
+    // Implementation strategy: "delete N chars to the right of the
+    // caret" is rewritten as "move caret right N, then backspace N
+    // more." Every deletion ends up going through `BackSpace`,
+    // which TUIs and editors handle uniformly. Sending Delete keys
+    // directly worked unreliably — under fast bursts terminals'
+    // input parsers were dropping the trailing keystrokes, leaving
+    // chars on screen.
+    //
+    // Three phases, each its own wtype call with a drain pause:
+    // 1. Right arrow × `deletes` — moves caret to the right edge of
+    //    the region we want gone.
+    // 2. BackSpace × (`backspaces` + `deletes`) — drains the whole
+    //    region left of the now-rightmost caret position.
+    // 3. Type the replacement text.
+    if deletes > 0 {
         let mut cmd = Command::new("wtype");
         cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
-        for _ in 0..backspaces {
+        for _ in 0..deletes {
+            cmd.args(["-P", "Right", "-p", "Right"]);
+        }
+        run(cmd)?;
+        sleep_ms(pause_per_backspace_ms, deletes);
+    }
+    let total_backspaces = backspaces + deletes;
+    if total_backspaces > 0 {
+        let mut cmd = Command::new("wtype");
+        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+        for _ in 0..total_backspaces {
             cmd.args(["-P", "BackSpace", "-p", "BackSpace"]);
         }
         run(cmd)?;
-        let total_pause = u64::from(pause_per_backspace_ms).saturating_mul(backspaces as u64);
-        if total_pause > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(total_pause));
-        }
+        sleep_ms(pause_per_backspace_ms, total_backspaces);
     }
     if !text.is_empty() {
         let mut cmd = Command::new("wtype");
@@ -79,6 +124,13 @@ pub fn replace_with_delay(
         run(cmd)?;
     }
     Ok(())
+}
+
+fn sleep_ms(pause_per_backspace_ms: u32, count: usize) {
+    let total = u64::from(pause_per_backspace_ms).saturating_mul(count as u64);
+    if total > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(total));
+    }
 }
 
 fn run(mut cmd: Command) -> Result<(), EmitError> {

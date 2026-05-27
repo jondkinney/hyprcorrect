@@ -62,9 +62,19 @@ pub struct ReviewRequest {
     pub original: String,
     /// The smart provider's proposed correction.
     pub corrected: String,
-    /// Whitespace between the sentence and the caret, preserved so
-    /// the emit lands with the user's spacing intact.
+    /// Whitespace between the sentence's right edge and the caret —
+    /// preserved so the emit lands with the user's spacing intact.
     pub trailing: String,
+    /// How many characters of `original` sit BEFORE the caret —
+    /// determines the BackSpace count when the apply path emits.
+    #[serde(default)]
+    pub chars_before_caret: usize,
+    /// How many characters of `original` sit AFTER the caret —
+    /// determines the Delete count when the apply path emits.
+    /// Zero for the common case where the caret is at the end of
+    /// (or in trailing whitespace after) the sentence.
+    #[serde(default)]
+    pub chars_after_caret: usize,
     /// Hyprland address of the window the request originated from —
     /// the daemon uses it to update that window's buffer when the
     /// user accepts.
