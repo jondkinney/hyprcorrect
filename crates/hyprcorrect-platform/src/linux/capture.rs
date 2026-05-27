@@ -20,8 +20,10 @@
 
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use evdev::{Device, EventSummary, KeyCode};
 use hyprcorrect_core::{Chord, Key};
@@ -99,15 +101,59 @@ pub fn start(
 
     let triggers: Vec<TriggerSpec> = chords.iter().map(resolve_trigger).collect();
     let keyboards = keyboard_devices()?;
+    let dedupe = Arc::new(Mutex::new(Dedupe::new()));
     let (tx, rx) = mpsc::channel();
     for device in keyboards {
         let tx = tx.clone();
         let keymap_text = keymap_text.clone();
         let triggers = triggers.clone();
         let chord_capture = chord_capture.clone();
-        thread::spawn(move || read_device(device, &keymap_text, &triggers, &chord_capture, &tx));
+        let dedupe = dedupe.clone();
+        thread::spawn(move || {
+            read_device(device, &keymap_text, &triggers, &chord_capture, &dedupe, &tx)
+        });
     }
     Ok(rx)
+}
+
+/// Cross-device duplicate suppressor. Users with `keyd` (or other
+/// input remappers) often have several evdev devices emitting the
+/// same key: the physical keyboard, the keyd-virtual-keyboard, and
+/// sometimes a third passthrough device. Each carries the same
+/// keycode in lockstep, so the daemon sees 2–3× the events the
+/// compositor delivers to the focused app — and the daemon's
+/// caret runs ahead of the TUI's by the same multiple.
+///
+/// `Dedupe` collapses runs of the same `(keycode, value)` event
+/// arriving within a short window across any device. The first
+/// event in the window is forwarded; the rest are dropped.
+struct Dedupe {
+    last: Option<(u16, i32, Instant)>,
+}
+
+impl Dedupe {
+    fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// Returns `true` if this event should be processed (not a
+    /// near-duplicate of the last one we saw). The window is short
+    /// enough that legitimate manual repeats (typing the same key
+    /// twice quickly) still come through.
+    fn allow(&mut self, code: u16, value: i32) -> bool {
+        const WINDOW: Duration = Duration::from_millis(8);
+        let now = Instant::now();
+        let is_dup = matches!(
+            self.last,
+            Some((last_code, last_value, last_time))
+                if last_code == code && last_value == value && now - last_time < WINDOW
+        );
+        let allow = !is_dup;
+        if allow {
+            self.last = Some((code, value, now));
+        }
+        allow
+    }
 }
 
 /// Resolve the trigger spec for the given chord. Bare modifiers (no
@@ -186,6 +232,7 @@ fn read_device(
     keymap_text: &str,
     triggers: &[TriggerSpec],
     chord_capture: &ChordCaptureSlot,
+    dedupe: &Mutex<Dedupe>,
     tx: &Sender<Key>,
 ) {
     // Each thread builds its own xkb state: Context/Keymap/State hold
@@ -211,6 +258,14 @@ fn read_device(
                 continue;
             };
             let keycode = xkb::Keycode::new(u32::from(code.0) + 8);
+
+            // Drop near-duplicate events from sibling devices (keyd
+            // virtual keyboard + physical, etc.) — see `Dedupe`.
+            // Applied to BOTH press and release so xkb state doesn't
+            // double-toggle modifiers either.
+            if !dedupe.lock().expect("dedupe poisoned").allow(code.0, value) {
+                continue;
+            }
 
             // value: 0 = release, 1 = press, 2 = auto-repeat. Read the
             // key from the *current* state, before this key updates it
