@@ -450,7 +450,23 @@ impl eframe::App for PrefsApp {
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
                     if let Some(handle) = &logo {
-                        ui.add(egui::Image::new(handle).fit_to_exact_size(egui::vec2(28.0, 28.0)));
+                        // The icon's SVG is cropped tight (so it
+                        // fills the tray slot), which makes its
+                        // content reach the very top of a flush
+                        // 28×28 widget — visually higher than the
+                        // heading's baseline. Allocate a slightly
+                        // taller rect and paint the image into the
+                        // lower 28 px so it lines up with the
+                        // "hyprcorrect" cap height.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(28.0, 34.0),
+                            egui::Sense::hover(),
+                        );
+                        let icon_rect = egui::Rect::from_min_size(
+                            rect.left_top() + egui::vec2(0.0, 6.0),
+                            egui::vec2(28.0, 28.0),
+                        );
+                        egui::Image::new(handle).paint_at(ui, icon_rect);
                         ui.add_space(8.0);
                     }
                     ui.heading("hyprcorrect");

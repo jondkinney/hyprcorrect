@@ -45,20 +45,41 @@ impl TrayHandle {
     }
 }
 
+/// A pre-rasterized icon pixmap to publish via SNI. The data is
+/// ARGB32 in network (big-endian) byte order — that's the format
+/// the StatusNotifierItem spec requires.
+pub struct IconPixmap {
+    pub width: i32,
+    pub height: i32,
+    pub argb: Vec<u8>,
+}
+
 /// Start the tray. Returns a [`TrayHandle`] (the caller must hold
 /// it for the life of the daemon) and a receiver of menu activations.
 ///
 /// `paused` is the shared pause flag; the tray reads it live and
-/// changes its icon / label / SNI status to reflect it.
+/// switches between `active_icon` and `paused_icon` to reflect it.
+/// Each icon is a list of pre-rasterized pixmaps the platform layer
+/// publishes as-is; the caller (the daemon) owns rasterization so
+/// this crate doesn't have to drag in resvg/tiny-skia.
 ///
 /// # Errors
 ///
 /// See [`TrayError`].
-pub fn start(paused: Arc<AtomicBool>) -> Result<(TrayHandle, Receiver<TrayEvent>), TrayError> {
+pub fn start(
+    paused: Arc<AtomicBool>,
+    active_icon: Vec<IconPixmap>,
+    paused_icon: Vec<IconPixmap>,
+) -> Result<(TrayHandle, Receiver<TrayEvent>), TrayError> {
     use ksni::blocking::TrayMethods;
 
     let (events_tx, events_rx) = mpsc::channel();
-    let tray = HyprcorrectTray { events_tx, paused };
+    let tray = HyprcorrectTray {
+        events_tx,
+        paused,
+        active_icon,
+        paused_icon,
+    };
     let inner = tray.spawn().map_err(|e| TrayError::Ksni(e.to_string()))?;
     Ok((TrayHandle { inner }, events_rx))
 }
@@ -66,6 +87,8 @@ pub fn start(paused: Arc<AtomicBool>) -> Result<(TrayHandle, Receiver<TrayEvent>
 struct HyprcorrectTray {
     events_tx: Sender<TrayEvent>,
     paused: Arc<AtomicBool>,
+    active_icon: Vec<IconPixmap>,
+    paused_icon: Vec<IconPixmap>,
 }
 
 impl HyprcorrectTray {
@@ -95,15 +118,32 @@ impl ksni::Tray for HyprcorrectTray {
     }
 
     fn icon_name(&self) -> String {
-        // Bundling a proper hyprcorrect icon (SVG → tiny-skia,
-        // vernier-style) is later polish. For now, use the theme's
-        // spelling-check icon, swapped for a muted symbolic variant
-        // while paused.
-        if self.is_paused() {
-            "tools-check-spelling-symbolic".to_string()
+        // Empty string forces SNI hosts to skip the icon-theme
+        // lookup and use [`icon_pixmap`] below — themed-name
+        // resolution is inconsistent across hosts (waybar can pick
+        // a small pre-rasterized PNG variant from the theme even
+        // when we publish a pixmap, and that variant is often a
+        // different drawing). Mirrors vernier's tray approach.
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        // Publish the daemon-rasterized bundled icon directly so we
+        // don't depend on the user's icon theme. SNI hosts downscale
+        // a single large pixmap (64×64) crisply to whatever bar
+        // slot they draw.
+        let src = if self.is_paused() {
+            &self.paused_icon
         } else {
-            "tools-check-spelling".to_string()
-        }
+            &self.active_icon
+        };
+        src.iter()
+            .map(|p| ksni::Icon {
+                width: p.width,
+                height: p.height,
+                data: p.argb.clone(),
+            })
+            .collect()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {

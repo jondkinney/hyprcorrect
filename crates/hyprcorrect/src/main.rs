@@ -168,7 +168,11 @@ fn run_daemon() {
             return;
         }
     };
-    let (tray_handle, tray_rx) = match tray::start(paused.clone()) {
+    let (tray_handle, tray_rx) = match tray::start(
+        paused.clone(),
+        build_tray_pixmaps(false),
+        build_tray_pixmaps(true),
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
@@ -1435,6 +1439,26 @@ fn build_languagetool(
             None
         }
     }
+}
+
+/// Pre-rasterized tray icons (1× + 2×). The SNI host picks the
+/// closest match for whatever bar height it draws. `paused=true`
+/// returns a half-alpha variant so the tray dims without needing a
+/// second SVG asset.
+#[cfg(target_os = "linux")]
+fn build_tray_pixmaps(paused: bool) -> Vec<hyprcorrect_platform::linux::tray::IconPixmap> {
+    use hyprcorrect_platform::linux::tray::IconPixmap;
+    // 22 px is the canonical SNI tray height on most bars; 44 px
+    // covers HiDPI / Waybar at 2×.
+    const SIZES: &[u32] = &[22, 44];
+    hyprcorrect_ui::icon::tray_pixmaps(SIZES, paused)
+        .into_iter()
+        .map(|p| IconPixmap {
+            width: p.size as i32,
+            height: p.size as i32,
+            argb: p.argb,
+        })
+        .collect()
 }
 
 /// Correct the buffer's last sentence in place. If the user routed
