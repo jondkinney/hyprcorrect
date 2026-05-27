@@ -1,4 +1,4 @@
-name: release
+name: Release
 run-name: "Release - ${{ github.event.release.tag_name || inputs.tag }}"
 
 # Fires when release-plz publishes a new GitHub Release. Builds every
