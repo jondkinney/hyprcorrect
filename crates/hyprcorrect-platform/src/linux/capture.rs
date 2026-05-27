@@ -18,6 +18,7 @@
 //! layout configured only in the compositor (e.g. `hyprland.conf`) is
 //! not yet read — that is M5 polish.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -102,6 +103,7 @@ pub fn start(
     let triggers: Vec<TriggerSpec> = chords.iter().map(resolve_trigger).collect();
     let keyboards = keyboard_devices()?;
     let dedupe = Arc::new(Mutex::new(Dedupe::new()));
+    let hold = Arc::new(HoldTracker::new(query_compositor_repeat()));
     let (tx, rx) = mpsc::channel();
     for device in keyboards {
         let tx = tx.clone();
@@ -109,11 +111,161 @@ pub fn start(
         let triggers = triggers.clone();
         let chord_capture = chord_capture.clone();
         let dedupe = dedupe.clone();
+        let hold = hold.clone();
         thread::spawn(move || {
-            read_device(device, &keymap_text, &triggers, &chord_capture, &dedupe, &tx)
+            read_device(
+                device,
+                &keymap_text,
+                &triggers,
+                &chord_capture,
+                &dedupe,
+                &hold,
+                &tx,
+            )
         });
     }
     Ok(rx)
+}
+
+/// Auto-repeat tuning the compositor uses to drive Wayland clients.
+/// We mimic these inside the daemon so the buffer's caret tracks
+/// what the TUI is doing, not the kernel's slower evdev repeats.
+#[derive(Debug, Clone, Copy)]
+struct RepeatConfig {
+    /// Initial delay before auto-repeat kicks in. Hyprland default
+    /// is ~600 ms; users often crank it down (the test rig has 225).
+    delay: Duration,
+    /// Repeat interval between synthetic emits.
+    interval: Duration,
+}
+
+impl Default for RepeatConfig {
+    fn default() -> Self {
+        // Common Wayland-compositor defaults — close enough for
+        // setups where `hyprctl getoption` isn't available or fails.
+        Self {
+            delay: Duration::from_millis(600),
+            interval: Duration::from_millis(40), // 25 Hz
+        }
+    }
+}
+
+/// Best-effort: pull `input:repeat_delay` and `input:repeat_rate`
+/// out of Hyprland via `hyprctl getoption -j`. Falls back to the
+/// common Wayland defaults when the call fails or we're not on
+/// Hyprland. Called once at daemon startup; the values are
+/// captured for the lifetime of the process.
+fn query_compositor_repeat() -> RepeatConfig {
+    let mut cfg = RepeatConfig::default();
+    let read = |key: &str| -> Option<i64> {
+        let out = std::process::Command::new("hyprctl")
+            .args(["getoption", "-j", key])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // The "int" field is what we want; cheap textual extract.
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.split("\"int\"")
+            .nth(1)?
+            .split(':')
+            .nth(1)?
+            .split(',')
+            .next()?
+            .trim()
+            .parse::<i64>()
+            .ok()
+    };
+    if let Some(d) = read("input:repeat_delay")
+        && d > 0
+    {
+        cfg.delay = Duration::from_millis(d as u64);
+    }
+    if let Some(r) = read("input:repeat_rate")
+        && r > 0
+    {
+        cfg.interval = Duration::from_millis(1000 / r as u64);
+    }
+    cfg
+}
+
+/// Synthesizes auto-repeats inside the daemon to match the
+/// compositor's repeat rate, since evdev's `value=2` events arrive
+/// at the kernel's slower rate (which the compositor often ignores
+/// in favor of its own timer-driven repeats). For each held key
+/// we spawn a thread that waits the initial delay, then emits
+/// `Key` at the configured interval until the release cancels it.
+///
+/// Cancellation is plumbed through an mpsc channel so the thread
+/// can `recv_timeout` on it — the wait returns the *instant* a
+/// cancel arrives, and the loop layout guarantees we never emit
+/// an extra event after cancellation. (The old `AtomicBool` poll
+/// had a "check-then-send" race that leaked one synthetic emit
+/// per hold, throwing post-release manual presses off by one.)
+struct HoldTracker {
+    repeat: RepeatConfig,
+    active: Mutex<HashMap<u16, Sender<()>>>,
+}
+
+impl HoldTracker {
+    fn new(repeat: RepeatConfig) -> Self {
+        Self {
+            repeat,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn start(&self, code: u16, emit: Key, tx: Sender<Key>) {
+        self.stop(code); // cancel any prior hold on the same key
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        self.active
+            .lock()
+            .expect("hold poisoned")
+            .insert(code, cancel_tx);
+        let repeat = self.repeat;
+        thread::spawn(move || {
+            use mpsc::RecvTimeoutError;
+            // Initial delay. Returning `Ok(())` means we got the
+            // cancel signal during the wait — return immediately,
+            // no emit. `Disconnected` means the sender was dropped
+            // (the HoldTracker forgot us) — same idea, return.
+            match cancel_rx.recv_timeout(repeat.delay) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            // First synthetic fires at t = delay — matching the
+            // compositor's first auto-repeat. Then each subsequent
+            // wait+emit pair keeps step with compositor at
+            // `interval`.
+            if tx.send(emit).is_err() {
+                return;
+            }
+            loop {
+                // Wait first, emit second: if cancellation arrives
+                // during the wait the recv returns instantly and
+                // we exit without firing the next event. There's
+                // still a tiny race for the FIRST synthetic above
+                // (cancel between delay-end and the send), but
+                // that window is sub-millisecond.
+                match cancel_rx.recv_timeout(repeat.interval) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+                if tx.send(emit).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn stop(&self, code: u16) {
+        if let Some(cancel_tx) = self.active.lock().expect("hold poisoned").remove(&code) {
+            // Best effort — if the thread has already exited the
+            // receiver is gone and this send just no-ops.
+            let _ = cancel_tx.send(());
+        }
+    }
 }
 
 /// Cross-device duplicate suppressor. Users with `keyd` (or other
@@ -227,12 +379,14 @@ fn is_keyboard(device: &Device) -> bool {
 /// Read one device forever, translating key events into [`Key`]s and
 /// sending them to `tx`. Returns — ending the thread — when the device
 /// disappears or the receiver is dropped.
+#[allow(clippy::too_many_arguments)]
 fn read_device(
     mut device: Device,
     keymap_text: &str,
     triggers: &[TriggerSpec],
     chord_capture: &ChordCaptureSlot,
     dedupe: &Mutex<Dedupe>,
+    hold: &HoldTracker,
     tx: &Sender<Key>,
 ) {
     // Each thread builds its own xkb state: Context/Keymap/State hold
@@ -267,10 +421,18 @@ fn read_device(
                 continue;
             }
 
-            // value: 0 = release, 1 = press, 2 = auto-repeat. Read the
-            // key from the *current* state, before this key updates it
+            // Drop kernel auto-repeats. We synthesize our own at the
+            // compositor's rate (see `HoldTracker`) so the buffer's
+            // caret tracks what the focused app actually sees,
+            // not what evdev's slower kernel-driven repeat fires.
+            if value == 2 {
+                continue;
+            }
+
+            // value: 0 = release, 1 = press. Read the key from the
+            // *current* state, before this key updates it
             // (the xkbcommon convention).
-            if value != 0 {
+            if value == 1 {
                 // Chord-record mode pre-empts normal Key handling so
                 // pressing the chord doesn't reset the buffer or fire
                 // any trigger while prefs is recording.
@@ -279,23 +441,28 @@ fn read_device(
                     && chord_capture.try_emit(chord)
                 {
                     // Modifier state still needs to update below.
-                } else if let Some(key) = translate(&state, keycode, triggers)
-                    && tx.send(key).is_err()
-                {
-                    return; // receiver dropped
+                } else if let Some(key) = translate(&state, keycode, triggers) {
+                    if tx.send(key).is_err() {
+                        return; // receiver dropped
+                    }
+                    // Start synthetic auto-repeats for this key so
+                    // holding it advances the buffer caret in sync
+                    // with the compositor's repeats.
+                    hold.start(code.0, key, tx.clone());
                 }
+            } else {
+                // value == 0 (release). Stop any hold thread for
+                // this key so the buffer stops auto-advancing.
+                hold.stop(code.0);
             }
 
-            // Track modifiers on press and release; an auto-repeat is
-            // not a distinct down/up and must not update the state.
-            if value != 2 {
-                let direction = if value == 0 {
-                    xkb::KeyDirection::Up
-                } else {
-                    xkb::KeyDirection::Down
-                };
-                state.update_key(keycode, direction);
-            }
+            // Track modifier state changes on press and release.
+            let direction = if value == 0 {
+                xkb::KeyDirection::Up
+            } else {
+                xkb::KeyDirection::Down
+            };
+            state.update_key(keycode, direction);
         }
     }
 }
