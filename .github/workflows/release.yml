@@ -177,13 +177,13 @@ jobs:
 
   macos-aarch64:
     name: Build aarch64 .app + DMG
-    # macOS support is M2-deferred per DESIGN.md. The job is guarded
-    # so it stays green until packaging/macos/package.sh lands —
-    # ported from vernier when the macOS platform layer is ready.
-    # Once that file exists, this job rasterizes the SVG, builds the
-    # .app, signs/notarizes via the same secrets vernier uses, and
-    # uploads the DMG.
-    if: hashFiles('packaging/macos/package.sh') != ''
+    # macOS support is M2-deferred per DESIGN.md. The job stays
+    # disabled until packaging/macos/package.sh lands — ported from
+    # vernier when the macOS platform layer is ready. Flip the `if:`
+    # to `true` (or delete it) once packaging is in place.
+    # NOTE: GitHub doesn't allow hashFiles() in job-level `if:`
+    # expressions, so a path-based auto-guard isn't an option here.
+    if: false
     runs-on: macos-latest
     permissions:
       contents: write
