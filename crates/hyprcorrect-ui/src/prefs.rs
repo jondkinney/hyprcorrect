@@ -203,9 +203,7 @@ impl PrefsApp {
         let autostart_changed = self.autostart_enabled != self.saved_autostart_enabled;
         #[cfg(not(target_os = "linux"))]
         let autostart_changed = false;
-        self.config != self.saved
-            || self.api_key_field != self.saved_api_key
-            || autostart_changed
+        self.config != self.saved || self.api_key_field != self.saved_api_key || autostart_changed
     }
 
     fn ok(&mut self, text: impl Into<String>) {
@@ -622,7 +620,10 @@ impl PrefsApp {
         {
             field_label(ui, "Start at login");
             ui.add_space(4.0);
-            let resp = ui.checkbox(&mut self.autostart_enabled, "Launch hyprcorrect when I log in");
+            let resp = ui.checkbox(
+                &mut self.autostart_enabled,
+                "Launch hyprcorrect when I log in",
+            );
             if resp.changed() {
                 self.clear_status();
             }

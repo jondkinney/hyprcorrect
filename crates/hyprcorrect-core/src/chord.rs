@@ -1,6 +1,6 @@
 //! A keyboard chord: a set of modifiers plus a single non-modifier
 //! key. Stored in `config.toml` as a `+`-separated uppercase string
-//! (`SUPER+CTRL+SHIFT+ALT+F`); parsed everywhere it's used.
+//! (`CTRL+SHIFT+ALT+SUPER+F`); parsed everywhere it's used.
 //!
 //! Storage uses an accelerator string (vernier-style) rather than a
 //! struct so the file stays human-readable.
@@ -75,15 +75,16 @@ impl Chord {
     }
 
     /// The Hyprland `bind = MODS, KEY, ...` modifier list. Empty when
-    /// no modifiers are set. Order matches the chip-display convention:
-    /// SHIFT, CTRL, ALT, SUPER (left-to-right on a typical keyboard).
+    /// no modifiers are set. Order matches the chip-display
+    /// convention: CTRL, SHIFT, ALT, SUPER — same as macOS native
+    /// menus (⌃⇧⌥⌘) and the Electron `CommandOrControl` token.
     pub fn hyprland_modifiers(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
-        if self.shift {
-            parts.push("SHIFT");
-        }
         if self.ctrl {
             parts.push("CTRL");
+        }
+        if self.shift {
+            parts.push("SHIFT");
         }
         if self.alt {
             parts.push("ALT");
@@ -120,11 +121,11 @@ impl Chord {
 impl std::fmt::Display for Chord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut parts: Vec<&str> = Vec::new();
-        if self.shift {
-            parts.push("SHIFT");
-        }
         if self.ctrl {
             parts.push("CTRL");
+        }
+        if self.shift {
+            parts.push("SHIFT");
         }
         if self.alt {
             parts.push("ALT");
@@ -167,11 +168,11 @@ mod tests {
 
     #[test]
     fn display_uses_canonical_order() {
-        // Parse any order, render in canonical (SHIFT, CTRL, ALT, SUPER).
+        // Parse any order, render in canonical (CTRL, SHIFT, ALT, SUPER).
         let c = Chord::parse("SUPER+CTRL+ALT+J").unwrap();
         assert_eq!(c.to_string(), "CTRL+ALT+SUPER+J");
         let c = Chord::parse("SUPER+CTRL+SHIFT+ALT+F").unwrap();
-        assert_eq!(c.to_string(), "SHIFT+CTRL+ALT+SUPER+F");
+        assert_eq!(c.to_string(), "CTRL+SHIFT+ALT+SUPER+F");
     }
 
     #[test]
@@ -187,7 +188,7 @@ mod tests {
     #[test]
     fn hyprland_modifiers_uses_spaces_not_pluses() {
         let c = Chord::parse("SUPER+CTRL+SHIFT+ALT+F").unwrap();
-        assert_eq!(c.hyprland_modifiers(), "SHIFT CTRL ALT SUPER");
+        assert_eq!(c.hyprland_modifiers(), "CTRL SHIFT ALT SUPER");
         assert_eq!(c.hyprland_key(), "F");
     }
 }

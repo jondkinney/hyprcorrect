@@ -51,7 +51,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Hotkeys {
-    /// Accelerator for `fix-last-word`. Example: `"SUPER+CTRL+SHIFT+ALT+F"`.
+    /// Accelerator for `fix-last-word`. Example: `"CTRL+SHIFT+ALT+SUPER+F"`.
     pub fix_word: String,
     /// Accelerator for `fix-last-sentence`. Empty = unbound.
     pub fix_sentence: String,
@@ -63,7 +63,7 @@ pub struct Hotkeys {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            fix_word: "SUPER+CTRL+SHIFT+ALT+F".into(),
+            fix_word: "CTRL+SHIFT+ALT+SUPER+F".into(),
             fix_sentence: String::new(),
             review: String::new(),
         }
