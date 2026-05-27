@@ -30,11 +30,15 @@ pub enum EmitError {
     WtypeFailed,
 }
 
-/// Per-key delay used inside each `wtype` burst. Small but nonzero so
-/// the protocol's flush points line up with each event — a couple of
-/// in-the-weeds bug reports against wtype have been fixed by ensuring
-/// `-d` is set rather than left at 0.
-const WTYPE_INTER_KEY_DELAY_MS: u32 = 2;
+/// Per-key delay used inside each `wtype` burst. Was 2 ms originally
+/// — large enough to give wtype's protocol a flush point per event,
+/// small enough to feel instant. But terminals (Ghostty, foot, …)
+/// drop the occasional BackSpace under that pressure when the burst
+/// is 5+ keys: the result is leftover characters that escape the
+/// deletion (e.g., `mothr → motherr` instead of `mother`). 8 ms
+/// per key is still imperceptible for normal-length words and is
+/// reliably swallowed by every terminal we've tested.
+const WTYPE_INTER_KEY_DELAY_MS: u32 = 8;
 
 /// Apply an edit at the caret: press Backspace `backspaces` times, then
 /// type `text`. Uses the default per-backspace pause.
