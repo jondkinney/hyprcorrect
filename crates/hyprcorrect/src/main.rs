@@ -495,6 +495,12 @@ fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
 /// nothing to work with (focus moved, caret-moving key, paste, …)
 /// we fall back to the clipboard path. Per `DESIGN.md`'s secondary
 /// mode.
+///
+/// If the picked word (`word_at_caret`) comes back fine from the
+/// provider, the search widens to nearby words within ~30 chars
+/// of the caret — this covers the common case where a held arrow
+/// or a mouse click has drifted the buffer caret a few chars from
+/// the visible cursor.
 #[cfg(target_os = "linux")]
 fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
@@ -503,7 +509,6 @@ fn fix_last_word(
     provider: &hyprcorrect_core::OfflineProvider,
     pause_per_backspace_ms: u32,
 ) {
-    use hyprcorrect_core::plan_word_replacement;
     use hyprcorrect_platform::linux::emit;
 
     let Some(at) = buffer.word_at_caret() else {
@@ -516,42 +521,70 @@ fn fix_last_word(
         at.word, at.chars_before_caret, at.chars_after_caret,
     );
     let bracketed = format_word_with_caret(&at.word, at.chars_before_caret, at.chars_after_caret);
-    let Some(fix) = pick_word_fix(buffer, &at, &bracketed, default, llm, provider) else {
+    let Some(plan) = pick_word_fix(buffer, &at, &bracketed, default, llm, provider) else {
         return;
     };
-    let Some(edit) = plan_word_replacement(&at, &fix) else {
-        eprintln!("hyprcorrect: word-fix — suggestion equals the original word, nothing to emit");
-        return;
-    };
+    let word_chars = plan.original.chars().count();
+    // Compute chars from end-of-line to end of target word. End-
+    // anchored emit dodges the held-arrow caret-drift trap the
+    // direct-offset path falls into.
+    let chars_from_end = buffer.text()[plan.byte_end..].chars().count();
     eprintln!(
-        "hyprcorrect: word-fix emit — {} backspaces + {} deletes + {:?}",
-        edit.backspaces, edit.deletes, edit.insert
+        "hyprcorrect: word-fix emit — chars_from_end={chars_from_end}, backspace {word_chars} chars, insert {:?}",
+        plan.fix
     );
-    match emit::replace_around_caret_with_delay(
-        edit.backspaces,
-        edit.deletes,
-        &edit.insert,
+    match emit::anchored_replace_with_delay(
+        chars_from_end,
+        word_chars,
+        &plan.fix,
         pause_per_backspace_ms,
     ) {
         Ok(()) => {
-            buffer.apply_around_caret(edit.backspaces, edit.deletes, &edit.insert);
-            // Surface the picked-word → suggestion mapping in a
-            // toast. Bracket the char the daemon believes the
-            // caret is on so any mismatch with the TUI's visible
-            // cursor block is obvious at a glance.
-            notify_info("Corrected", &format!("{bracketed} → \"{fix}\""));
+            buffer.apply_at_word(plan.byte_start, plan.byte_end, &plan.fix);
+            notify_info("Corrected", &format!("{} → \"{}\"", plan.label, plan.fix));
         }
         Err(e) => eprintln!("hyprcorrect: {e}"),
     }
 }
 
-/// Pick a fix for the word at the caret. LLM path uses
-/// `sentence_at_caret` as context so the model can disambiguate
-/// homophones; Spellbook path is the plain offline lookup. On
-/// LLM failure (timeout, no key, etc.) we fall back to Spellbook
-/// so the chord never silently no-ops. Returns `None` after
-/// firing the "nothing to do" toast and logging — callers exit
-/// without emitting.
+/// Where in the buffer to land an edit and what to type. Built by
+/// [`pick_word_fix`]; consumed by [`fix_last_word`] to drive the
+/// emit + buffer-apply pair.
+#[cfg(target_os = "linux")]
+struct WordFixPlan {
+    /// The original word being replaced (for the toast and so the
+    /// emit knows how many BackSpaces to fire).
+    original: String,
+    /// The corrected text to type.
+    fix: String,
+    /// Byte start of the original word in the buffer's text.
+    byte_start: usize,
+    /// Byte end (exclusive) of the original word in the buffer —
+    /// the emit converts this to "chars from end-of-line" and
+    /// uses `End`+`Left` to land the cursor reliably.
+    byte_end: usize,
+    /// Toast label — for the primary pick this is the
+    /// caret-bracketed original (e.g., `"spa[g]heti"`); for a
+    /// nearby pick it's the plain word.
+    label: String,
+}
+
+/// How far (in chars) from the caret to consider "nearby" when
+/// the primary word comes back fine. Tuned so a held arrow that
+/// over-or-undershoots by a word or two still lands a fix, but
+/// we don't go fishing for typos halfway across the buffer.
+#[cfg(target_os = "linux")]
+const NEARBY_WORD_MAX_CHARS: i32 = 30;
+
+/// Build a [`WordFixPlan`] for the word the user wants fixed.
+/// First tries the primary pick (`word_at_caret`) through the
+/// configured provider. If that comes back fine, widens to
+/// nearby words within [`NEARBY_WORD_MAX_CHARS`] of the caret —
+/// covers the common "held-arrow caret drift" and "mouse click
+/// somewhere we didn't see" cases. On any LLM failure falls
+/// back to Spellbook so the chord never silently no-ops.
+/// Returns `None` after firing the "nothing to do" toast and
+/// logging — callers exit without emitting.
 #[cfg(target_os = "linux")]
 fn pick_word_fix(
     buffer: &hyprcorrect_core::Buffer,
@@ -560,77 +593,239 @@ fn pick_word_fix(
     default: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
-) -> Option<String> {
+) -> Option<WordFixPlan> {
     use hyprcorrect_core::ProviderId;
-    if default == ProviderId::Llm {
-        match llm {
-            Some(llm) => {
-                let sentence = buffer
-                    .sentence_at_caret()
-                    .map(|s| s.sentence)
-                    .unwrap_or_else(|| at.word.clone());
-                match llm.fix_word_in_context(&sentence, &at.word) {
-                    Ok(corrected) => {
-                        if corrected.is_empty() || corrected == at.word {
-                            eprintln!(
-                                "hyprcorrect: word-fix — LLM left {:?} unchanged",
-                                at.word
-                            );
-                            notify_info(
-                                "Nothing to correct",
-                                &format!("LLM thinks {bracketed} is fine in context."),
-                            );
-                            return None;
-                        }
-                        eprintln!(
-                            "hyprcorrect: word-fix — LLM picked {:?} for {:?}",
-                            corrected, at.word
-                        );
-                        return Some(corrected);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "hyprcorrect: word-fix LLM failed ({e}) — falling back to spellbook"
-                        );
-                        notify_warning(
-                            "LLM unavailable",
-                            &format!("Falling back to Spellbook for {bracketed}."),
-                        );
-                        // Fall through to spellbook.
-                    }
+    let sentence = buffer
+        .sentence_at_caret()
+        .map(|s| s.sentence)
+        .unwrap_or_else(|| at.word.clone());
+
+    let use_llm = default == ProviderId::Llm && llm.is_some();
+    let primary = primary_target(buffer, at);
+
+    // Primary pass: the picked word at the caret.
+    if use_llm {
+        let llm = llm.expect("checked above");
+        match llm.fix_word_in_context(&sentence, &at.word) {
+            Ok(corrected) => {
+                let corrected = corrected.trim().to_string();
+                if !corrected.is_empty() && corrected != at.word {
+                    eprintln!(
+                        "hyprcorrect: word-fix — LLM picked {:?} for {:?}",
+                        corrected, at.word
+                    );
+                    return Some(plan_for(&primary, corrected, bracketed));
                 }
-            }
-            None => {
                 eprintln!(
-                    "hyprcorrect: word-fix — default provider is LLM but no key configured; falling back to spellbook"
+                    "hyprcorrect: word-fix — LLM left {:?} unchanged, scanning nearby",
+                    at.word
                 );
+                // Fall through to nearby scan via LLM.
+                if let Some(plan) = scan_nearby_llm(buffer, &sentence, &at.word, llm) {
+                    return Some(plan);
+                }
+                notify_info(
+                    "Nothing to correct",
+                    &format!("LLM thinks {bracketed} (and nearby) are fine in context."),
+                );
+                return None;
+            }
+            Err(e) => {
+                eprintln!("hyprcorrect: word-fix LLM failed ({e}) — falling back to spellbook");
                 notify_warning(
-                    "LLM key not set",
-                    "Open Preferences → Providers → LLM and paste your Anthropic key.",
+                    "LLM unavailable",
+                    &format!("Falling back to Spellbook for {bracketed}."),
                 );
-                // Fall through to spellbook.
+                // Fall through to spellbook for both primary and nearby.
+            }
+        }
+    } else if default == ProviderId::Llm {
+        eprintln!(
+            "hyprcorrect: word-fix — default provider is LLM but no key configured; falling back to spellbook"
+        );
+        notify_warning(
+            "LLM key not set",
+            "Open Preferences → Providers → LLM and paste your Anthropic key.",
+        );
+    }
+
+    if let Some(fix) = spellbook_pick(spell, &at.word) {
+        return Some(plan_for(&primary, fix, bracketed));
+    }
+    eprintln!(
+        "hyprcorrect: word-fix — spellbook found no error in {:?}, scanning nearby",
+        at.word
+    );
+    if let Some(plan) = scan_nearby_spellbook(buffer, &at.word, spell) {
+        return Some(plan);
+    }
+    notify_warning(
+        "Nothing to correct",
+        &format!("Spellbook didn't find an error in {bracketed} or nearby."),
+    );
+    None
+}
+
+/// First spellbook suggestion for `word`, or `None` if the word
+/// isn't flagged.
+#[cfg(target_os = "linux")]
+fn spellbook_pick(spell: &hyprcorrect_core::OfflineProvider, word: &str) -> Option<String> {
+    let correction = spell.check_text(word).into_iter().next()?;
+    correction.suggestions.into_iter().next()
+}
+
+/// Walk words near the buffer caret and return a plan for the
+/// first one Spellbook flags. Skips the primary word (already
+/// tried) and any word beyond [`NEARBY_WORD_MAX_CHARS`] from
+/// the caret.
+#[cfg(target_os = "linux")]
+fn scan_nearby_spellbook(
+    buffer: &hyprcorrect_core::Buffer,
+    primary_word: &str,
+    spell: &hyprcorrect_core::OfflineProvider,
+) -> Option<WordFixPlan> {
+    for nw in buffer.words_near_caret() {
+        if nw.word == primary_word && nw.caret_offset_chars.abs() <= 1 {
+            // Skip the primary pick — `word_at_caret`'s entry is
+            // always at distance 0 or 1 (caret at end / inside).
+            continue;
+        }
+        if nw.caret_offset_chars.abs() > NEARBY_WORD_MAX_CHARS {
+            break; // sorted by distance, nothing closer follows
+        }
+        if let Some(fix) = spellbook_pick(spell, &nw.word) {
+            eprintln!(
+                "hyprcorrect: word-fix — nearby spellbook hit {:?} → {:?} (offset {})",
+                nw.word, fix, nw.caret_offset_chars
+            );
+            return Some(WordFixPlan {
+                original: nw.word.clone(),
+                fix,
+                byte_start: nw.byte_start,
+                byte_end: nw.byte_end,
+                label: nw.word,
+            });
+        }
+    }
+    None
+}
+
+/// Walk words near the buffer caret, ask the LLM once per word
+/// to fix-in-context, and return a plan for the first one the
+/// LLM rewrites. Caps the per-chord LLM cost at a few extra
+/// round-trips — same rate-limit / latency profile as a manual
+/// re-trigger by the user.
+#[cfg(target_os = "linux")]
+fn scan_nearby_llm(
+    buffer: &hyprcorrect_core::Buffer,
+    sentence: &str,
+    primary_word: &str,
+    llm: &hyprcorrect_core::LlmProvider,
+) -> Option<WordFixPlan> {
+    const MAX_NEARBY_LLM_CALLS: usize = 4;
+    let mut calls = 0;
+    for nw in buffer.words_near_caret() {
+        if nw.word == primary_word && nw.caret_offset_chars.abs() <= 1 {
+            continue;
+        }
+        if nw.caret_offset_chars.abs() > NEARBY_WORD_MAX_CHARS {
+            break;
+        }
+        if calls >= MAX_NEARBY_LLM_CALLS {
+            break;
+        }
+        calls += 1;
+        match llm.fix_word_in_context(sentence, &nw.word) {
+            Ok(corrected) => {
+                let corrected = corrected.trim().to_string();
+                if corrected.is_empty() || corrected == nw.word {
+                    continue;
+                }
+                eprintln!(
+                    "hyprcorrect: word-fix — nearby LLM hit {:?} → {:?} (offset {})",
+                    nw.word, corrected, nw.caret_offset_chars
+                );
+                return Some(WordFixPlan {
+                    original: nw.word.clone(),
+                    fix: corrected,
+                    byte_start: nw.byte_start,
+                    byte_end: nw.byte_end,
+                    label: nw.word,
+                });
+            }
+            Err(e) => {
+                eprintln!("hyprcorrect: word-fix nearby LLM call failed ({e}) — stopping scan");
+                return None;
             }
         }
     }
-    let Some(correction) = spell.check_text(&at.word).into_iter().next() else {
-        eprintln!(
-            "hyprcorrect: word-fix — spellbook found no error in {:?}",
-            at.word
-        );
-        notify_warning(
-            "Nothing to correct",
-            &format!("Spellbook didn't find an error in {bracketed}."),
-        );
-        return None;
-    };
-    let Some(fix) = correction.suggestions.into_iter().next() else {
-        eprintln!(
-            "hyprcorrect: word-fix — spellbook flagged {:?} but offered no suggestions",
-            at.word
-        );
-        return None;
-    };
-    Some(fix)
+    None
+}
+
+/// The primary edit target derived from `word_at_caret`: the
+/// word's byte range in the buffer. Used to build the plan for
+/// the caret's-actual-word case.
+#[cfg(target_os = "linux")]
+struct PrimaryTarget {
+    original: String,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn primary_target(
+    buffer: &hyprcorrect_core::Buffer,
+    at: &hyprcorrect_core::WordAtCaret,
+) -> PrimaryTarget {
+    let caret = buffer.caret();
+    // Byte positions: word starts `chars_before_caret` chars
+    // before the caret, ends `chars_after_caret` chars after.
+    let text = buffer.text();
+    let byte_start = char_step_left(text, caret, at.chars_before_caret);
+    let byte_end = char_step_right(text, caret, at.chars_after_caret);
+    PrimaryTarget {
+        original: at.word.clone(),
+        byte_start,
+        byte_end,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn plan_for(primary: &PrimaryTarget, fix: String, bracketed: &str) -> WordFixPlan {
+    WordFixPlan {
+        original: primary.original.clone(),
+        fix,
+        byte_start: primary.byte_start,
+        byte_end: primary.byte_end,
+        label: bracketed.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn char_step_left(text: &str, from: usize, steps: usize) -> usize {
+    let mut pos = from;
+    for _ in 0..steps {
+        if pos == 0 {
+            break;
+        }
+        pos = text[..pos].char_indices().next_back().map_or(0, |(i, _)| i);
+    }
+    pos
+}
+
+#[cfg(target_os = "linux")]
+fn char_step_right(text: &str, from: usize, steps: usize) -> usize {
+    let mut pos = from;
+    for _ in 0..steps {
+        if pos >= text.len() {
+            break;
+        }
+        pos = text[pos..]
+            .chars()
+            .next()
+            .map_or(pos, |c| pos + c.len_utf8());
+    }
+    pos
 }
 
 /// Render a word with the daemon's caret position bracketed,

@@ -148,6 +148,70 @@ pub fn replace_around_caret_with_delay(
     Ok(())
 }
 
+/// Replace a word at a *known position relative to end-of-line*.
+/// `chars_from_end` is the number of Left arrows needed to walk
+/// from end-of-line back to the END of the word to replace;
+/// `word_chars` is the BackSpace count to remove the word once
+/// the cursor is on it.
+///
+/// Anchored at `End` (rather than relative to the user's current
+/// caret) so held-arrow undercount / mouse clicks / any other
+/// way the buffer's caret can drift from the visible cursor
+/// don't cause the emit to land at the wrong spot. The buffer's
+/// *text* tracks what's actually on screen reliably — only the
+/// caret offset is fragile — so counting chars back from
+/// end-of-line is rock solid as long as the focused app's `End`
+/// goes to end-of-line (shells, single-line text inputs, most
+/// terminals do; multi-line editors may not).
+///
+/// Same mod-clear gate runs first.
+///
+/// # Errors
+///
+/// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
+pub fn anchored_replace_with_delay(
+    chars_from_end: usize,
+    word_chars: usize,
+    insert: &str,
+    pause_per_backspace_ms: u32,
+) -> Result<(), EmitError> {
+    let _ = capture::wait_mods_clear(Duration::from_millis(MODS_CLEAR_TIMEOUT_MS));
+
+    // Anchor: jump the cursor to end-of-line.
+    {
+        let mut cmd = Command::new("wtype");
+        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+        cmd.args(["-P", "End", "-p", "End"]);
+        run(cmd)?;
+        sleep_ms(pause_per_backspace_ms, 1);
+    }
+    if chars_from_end > 0 {
+        let mut cmd = Command::new("wtype");
+        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+        for _ in 0..chars_from_end {
+            cmd.args(["-P", "Left", "-p", "Left"]);
+        }
+        run(cmd)?;
+        sleep_ms(pause_per_backspace_ms, chars_from_end);
+    }
+    if word_chars > 0 {
+        let mut cmd = Command::new("wtype");
+        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+        for _ in 0..word_chars {
+            cmd.args(["-P", "BackSpace", "-p", "BackSpace"]);
+        }
+        run(cmd)?;
+        sleep_ms(pause_per_backspace_ms, word_chars);
+    }
+    if !insert.is_empty() {
+        let mut cmd = Command::new("wtype");
+        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+        cmd.arg("--").arg(insert);
+        run(cmd)?;
+    }
+    Ok(())
+}
+
 fn sleep_ms(pause_per_backspace_ms: u32, count: usize) {
     let total = u64::from(pause_per_backspace_ms).saturating_mul(count as u64);
     if total > 0 {

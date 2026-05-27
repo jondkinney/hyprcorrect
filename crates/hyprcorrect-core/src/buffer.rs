@@ -79,6 +79,29 @@ pub struct SentenceAtCaret {
     pub chars_after_caret: usize,
 }
 
+/// A word the buffer holds *near* (but not necessarily at) the
+/// caret, with the offset metadata needed to navigate there and
+/// replace it. Returned by [`Buffer::words_near_caret`]; the
+/// corrector uses these to recover when the buffer caret has
+/// drifted a few chars from the visible cursor (held auto-repeat,
+/// mouse click, etc.) and the picked word_at_caret turns out to
+/// be fine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearbyWord {
+    /// The word itself.
+    pub word: String,
+    /// Byte position of the word's START in the buffer's text.
+    pub byte_start: usize,
+    /// Byte position one past the word's END in the buffer's text.
+    pub byte_end: usize,
+    /// Signed chars from the buffer caret to the END of this word
+    /// (`byte_end`). Positive when the word ends to the RIGHT of
+    /// the caret, negative to the LEFT, zero when the caret sits
+    /// exactly at the word's end. Emit uses this to compute
+    /// Right/Left arrows before deleting the word.
+    pub caret_offset_chars: i32,
+}
+
 /// A bounded record of recently typed text in the focused element.
 ///
 /// Carries a `caret` byte offset into `text`. Char/Backspace operate
@@ -354,6 +377,54 @@ impl Buffer {
         self.apply_around_caret(backspaces, 0, insert);
     }
 
+    /// Current caret position as a byte offset into [`Self::text`].
+    /// Used by the nearby-word fallback to compute the signed
+    /// distance from the caret to a candidate replacement target.
+    pub fn caret(&self) -> usize {
+        self.caret
+    }
+
+    /// Mirror an edit that happens at an arbitrary byte range —
+    /// `byte_start..byte_end` is replaced with `insert`, and the
+    /// caret lands at `byte_start + insert.len()`. Used by the
+    /// nearby-word fallback when the picked word_at_caret turns
+    /// out to be fine but a typo a few words away is what the
+    /// user actually wanted to fix.
+    pub fn apply_at_word(&mut self, byte_start: usize, byte_end: usize, insert: &str) {
+        debug_assert!(byte_start <= byte_end && byte_end <= self.text.len());
+        self.text.replace_range(byte_start..byte_end, insert);
+        self.caret = byte_start + insert.len();
+        self.trim_to_capacity();
+    }
+
+    /// Enumerate every word in the buffer, ordered by char distance
+    /// from the caret (nearest first). The corrector uses this as
+    /// a fallback when `word_at_caret`'s primary pick comes back
+    /// "fine" — buffer caret can drift a few chars from the
+    /// visible cursor on long auto-repeats or mouse clicks, so
+    /// scanning a small window around the caret recovers the
+    /// real typo the user meant to fix.
+    pub fn words_near_caret(&self) -> Vec<NearbyWord> {
+        let text = &self.text;
+        let caret = self.caret;
+        let mut out: Vec<NearbyWord> = Vec::new();
+        let mut current_start: Option<usize> = None;
+        for (i, c) in text.char_indices() {
+            if is_word_char(c) {
+                if current_start.is_none() {
+                    current_start = Some(i);
+                }
+            } else if let Some(start) = current_start.take() {
+                out.push(make_nearby_word(text, caret, start, i));
+            }
+        }
+        if let Some(start) = current_start {
+            out.push(make_nearby_word(text, caret, start, text.len()));
+        }
+        out.sort_by_key(|nw| nw.caret_offset_chars.abs());
+        out
+    }
+
     /// Drop characters from the front until the buffer fits `capacity`.
     /// Shifts the caret back by the same number of bytes so the
     /// before/after caret split stays consistent.
@@ -376,6 +447,22 @@ fn prev_char_boundary(s: &str, pos: usize) -> usize {
 /// `pos` must be < `s.len()` and a char boundary.
 fn next_char_boundary(s: &str, pos: usize) -> usize {
     s[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
+}
+
+/// Build a `NearbyWord` for the word at `[start, end)` in `text`,
+/// computing the signed char distance from `caret` to `end`.
+fn make_nearby_word(text: &str, caret: usize, start: usize, end: usize) -> NearbyWord {
+    let caret_offset_chars = if end >= caret {
+        text[caret..end].chars().count() as i32
+    } else {
+        -(text[end..caret].chars().count() as i32)
+    };
+    NearbyWord {
+        word: text[start..end].to_string(),
+        byte_start: start,
+        byte_end: end,
+        caret_offset_chars,
+    }
 }
 
 /// The "word char" rule for `word_at_caret`. Alphanumerics plus
@@ -803,5 +890,46 @@ mod tests {
         type_str(&mut buf, "deal...do");
         let at = buf.word_at_caret().expect("word at caret");
         assert_eq!(at.word, "do");
+    }
+
+    #[test]
+    fn words_near_caret_orders_by_char_distance() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox");
+        // caret is at end. Nearest word is "fox" (distance 0).
+        let nearby = buf.words_near_caret();
+        let just_words: Vec<&str> = nearby.iter().map(|nw| nw.word.as_str()).collect();
+        assert_eq!(just_words, vec!["fox", "brown", "quick", "the"]);
+        assert_eq!(nearby[0].caret_offset_chars, 0);
+        // "brown" ends 4 chars left of "fox"'s end (one space + "fox").
+        assert_eq!(nearby[1].caret_offset_chars, -4);
+    }
+
+    #[test]
+    fn words_near_caret_walks_outward_from_mid_buffer_caret() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox");
+        // Move caret back to between "quick" and "brown".
+        for _ in 0..("brown fox".len()) {
+            buf.push(Key::MoveLeft);
+        }
+        assert_eq!(buf.text_before_caret(), "the quick ");
+        let nearby = buf.words_near_caret();
+        // "quick" ends 1 char left, "brown" ends 5 chars right.
+        assert_eq!(nearby[0].word, "quick");
+        assert_eq!(nearby[0].caret_offset_chars, -1);
+        assert_eq!(nearby[1].word, "brown");
+        assert_eq!(nearby[1].caret_offset_chars, 5);
+    }
+
+    #[test]
+    fn apply_at_word_replaces_and_sets_caret() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the quick brown fox");
+        // Replace "brown" (bytes 10..15) with "red". Caret should
+        // land at 10 + 3 = 13.
+        buf.apply_at_word(10, 15, "red");
+        assert_eq!(buf.text(), "the quick red fox");
+        assert_eq!(buf.caret(), 13);
     }
 }
