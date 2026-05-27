@@ -309,7 +309,9 @@ pub fn install(host_port: u16) -> OpHandle {
 
 /// Start an existing stopped container.
 pub fn start() -> OpHandle {
-    spawn_op(OpKind::Start, || run_command("docker", &["start", CONTAINER]))
+    spawn_op(OpKind::Start, || {
+        run_command("docker", &["start", CONTAINER])
+    })
 }
 
 /// Stop a running container.
@@ -396,7 +398,10 @@ mod tests {
             host_port_from_url("http://localhost:8081/v2/check"),
             Some(8081)
         );
-        assert_eq!(host_port_from_url("https://lt.example.com:9000"), Some(9000));
+        assert_eq!(
+            host_port_from_url("https://lt.example.com:9000"),
+            Some(9000)
+        );
         assert_eq!(host_port_from_url("http://[::1]:8081"), Some(8081));
     }
 

@@ -458,10 +458,8 @@ impl eframe::App for PrefsApp {
                         // taller rect and paint the image into the
                         // lower 28 px so it lines up with the
                         // "hyprcorrect" cap height.
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(28.0, 34.0),
-                            egui::Sense::hover(),
-                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 34.0), egui::Sense::hover());
                         let icon_rect = egui::Rect::from_min_size(
                             rect.left_top() + egui::vec2(0.0, 6.0),
                             egui::vec2(28.0, 28.0),
@@ -781,10 +779,7 @@ impl PrefsApp {
                             self.ok(OpKind::Stop.label());
                         }
                         if ui
-                            .add_enabled(
-                                !op_in_flight,
-                                egui::Button::new("Remove").frame(false),
-                            )
+                            .add_enabled(!op_in_flight, egui::Button::new("Remove").frame(false))
                             .on_hover_text("Stop and delete the container. The image stays cached.")
                             .clicked()
                         {
@@ -834,10 +829,9 @@ impl PrefsApp {
                 format!("Docker unavailable: {msg}"),
                 egui::Color32::from_rgb(220, 160, 50),
             ),
-            DockerState::AbsentContainer => (
-                "Not installed.".to_string(),
-                egui::Color32::from_gray(170),
-            ),
+            DockerState::AbsentContainer => {
+                ("Not installed.".to_string(), egui::Color32::from_gray(170))
+            }
             DockerState::ContainerStopped => (
                 format!("Our container exists but is stopped. Start it to reach {url}."),
                 egui::Color32::from_rgb(220, 160, 50),
@@ -1334,8 +1328,7 @@ fn info_icon(ui: &mut egui::Ui) -> egui::Response {
     // hit-box.
     let font_size = egui::TextStyle::Body.resolve(ui.style()).size;
     let size = font_size;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return response;
     }

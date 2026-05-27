@@ -112,8 +112,7 @@ fn run_daemon() {
         eprintln!("hyprcorrect: could not refresh user icon ({e})");
     }
     if let Ok(exe) = std::env::current_exe()
-        && let Err(e) =
-            hyprcorrect_ui::autostart::ensure_apps_catalog_entry(&exe.to_string_lossy())
+        && let Err(e) = hyprcorrect_ui::autostart::ensure_apps_catalog_entry(&exe.to_string_lossy())
     {
         eprintln!("hyprcorrect: could not refresh apps-catalog entry ({e})");
     }
@@ -580,8 +579,15 @@ fn fix_last_word(
         at.word, at.chars_before_caret, at.chars_after_caret,
     );
     let bracketed = format_word_with_caret(&at.word, at.chars_before_caret, at.chars_after_caret);
-    let Some(plan) = pick_word_fix(buffer, &at, &bracketed, default, llm, languagetool, provider)
-    else {
+    let Some(plan) = pick_word_fix(
+        buffer,
+        &at,
+        &bracketed,
+        default,
+        llm,
+        languagetool,
+        provider,
+    ) else {
         return;
     };
     let word_chars = plan.original.chars().count();
@@ -1080,9 +1086,7 @@ fn word_in_sentence_bytes(
     if buffer_start < sentence.buffer_byte_start || buffer_end > sentence.buffer_byte_end {
         return None;
     }
-    Some(
-        (buffer_start - sentence.buffer_byte_start)..(buffer_end - sentence.buffer_byte_start),
-    )
+    Some((buffer_start - sentence.buffer_byte_start)..(buffer_end - sentence.buffer_byte_start))
 }
 
 /// The primary edit target derived from `word_at_caret`: the
@@ -1168,7 +1172,6 @@ fn char_step_left(text: &str, from: usize, steps: usize) -> usize {
     }
     pos
 }
-
 
 /// Render a word with the daemon's caret position bracketed,
 /// e.g. `spagheti` + caret after the 3rd char → `"spa[g]heti"`.
@@ -1421,9 +1424,7 @@ fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmP
     // sentence/review) routes through it. Gating on `smart` alone
     // silently denies fix-word when the user picks LLM as default
     // and something else as smart.
-    if config.providers.smart != ProviderId::Llm
-        && config.providers.default != ProviderId::Llm
-    {
+    if config.providers.smart != ProviderId::Llm && config.providers.default != ProviderId::Llm {
         return None;
     }
     match LlmProvider::from_config(&config.providers.llm) {
@@ -1529,7 +1530,11 @@ fn fix_last_sentence(
             buffer.apply_around_caret(backspaces, deletes, &insert);
             notify_info(
                 &format!("Corrected ({})", provider_label(used_provider)),
-                &format!("{} → {}", truncate(&at.sentence, 40), truncate(&corrected, 40)),
+                &format!(
+                    "{} → {}",
+                    truncate(&at.sentence, 40),
+                    truncate(&corrected, 40)
+                ),
             );
         }
         Err(e) => eprintln!("hyprcorrect: {e}"),

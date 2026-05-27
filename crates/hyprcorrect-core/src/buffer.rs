@@ -236,9 +236,7 @@ impl Buffer {
         let chars_before = self.text[s.buffer_byte_start..caret_in_range]
             .chars()
             .count();
-        let chars_after = self.text[caret_in_range..s.buffer_byte_end]
-            .chars()
-            .count();
+        let chars_after = self.text[caret_in_range..s.buffer_byte_end].chars().count();
         // Trailing whitespace between the sentence's right edge and
         // the caret. Present only when the caret has walked past the
         // sentence into trailing space.
