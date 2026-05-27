@@ -378,14 +378,29 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     s[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
 }
 
-/// The "word char" rule shared by `word_at_caret`, `Ctrl+Left`,
-/// and `Ctrl+Right`. Alphanumerics plus apostrophe — so
-/// contractions like `don't` stay one word, but commas, periods,
-/// quotes, and brackets are word boundaries. Matches what bash
-/// readline and most terminals/editors do for Ctrl+arrow, which
-/// is what the buffer's caret needs to mirror.
+/// The "word char" rule for `word_at_caret`. Alphanumerics plus
+/// apostrophe — so contractions like `don't` stay one word, but
+/// commas, periods, quotes, and brackets are word boundaries. This
+/// rule is intentionally stricter than the navigation rule below:
+/// when we pick a word to send to the spell-checker/LLM we want it
+/// clean of punctuation, even if the user's editor would consider
+/// the punctuation part of the same nav-word.
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '\''
+}
+
+/// The "word char" rule for `Ctrl+Left` / `Ctrl+Right` caret
+/// tracking. Looser than [`is_word_char`]: also includes `.`,
+/// `-`, `_` so runs like `deal...do`, `well-known`, and
+/// `snake_case_var` count as a single nav-word — that matches
+/// what most shells and terminals do for `Ctrl+arrow` (zsh's
+/// default `WORDCHARS` includes all three, and bash's
+/// readline-bound `forward-word` does similar). Keeping nav and
+/// lookup separate lets the buffer's caret stay in step with the
+/// editor without dragging punctuation into the word we hand to
+/// the corrector.
+fn is_nav_word_char(c: char) -> bool {
+    is_word_char(c) || matches!(c, '.' | '-' | '_')
 }
 
 /// Where the caret lands on `Ctrl+Left`. Walk past any non-word
@@ -396,14 +411,14 @@ fn prev_word_boundary(s: &str, from: usize) -> usize {
     let trim: usize = left
         .chars()
         .rev()
-        .take_while(|&c| !is_word_char(c))
+        .take_while(|&c| !is_nav_word_char(c))
         .map(char::len_utf8)
         .sum();
     let trimmed_end = left.len() - trim;
     let word_chars: usize = left[..trimmed_end]
         .chars()
         .rev()
-        .take_while(|&c| is_word_char(c))
+        .take_while(|&c| is_nav_word_char(c))
         .map(char::len_utf8)
         .sum();
     trimmed_end - word_chars
@@ -415,12 +430,12 @@ fn next_word_boundary(s: &str, from: usize) -> usize {
     let right = &s[from..];
     let skip: usize = right
         .chars()
-        .take_while(|&c| !is_word_char(c))
+        .take_while(|&c| !is_nav_word_char(c))
         .map(char::len_utf8)
         .sum();
     let word_chars: usize = right[skip..]
         .chars()
-        .take_while(|&c| is_word_char(c))
+        .take_while(|&c| is_nav_word_char(c))
         .map(char::len_utf8)
         .sum();
     from + skip + word_chars
@@ -762,5 +777,31 @@ mod tests {
         type_str(&mut buf, "don't");
         let at = buf.word_at_caret().expect("word at caret");
         assert_eq!(at.word, "don't");
+    }
+
+    #[test]
+    fn ctrl_right_skips_dot_runs_as_one_nav_word() {
+        // "deal...do you" — zsh and most shells treat "deal...do"
+        // as one Ctrl+Right hop because `.` is in WORDCHARS.
+        // Our nav-word definition has to match or the buffer's
+        // caret drifts on every dot-joined run.
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "deal...do you");
+        buf.push(Key::LineStart);
+        buf.push(Key::WordRight);
+        assert_eq!(buf.text_before_caret(), "deal...do");
+        buf.push(Key::WordRight);
+        assert_eq!(buf.text_before_caret(), "deal...do you");
+    }
+
+    #[test]
+    fn word_at_caret_does_not_pull_dot_neighbors_in() {
+        // Even though Ctrl+arrow nav treats `deal...do` as one
+        // nav-word, `word_at_caret` must still return just `do`
+        // so the corrector doesn't try to fix `deal...do`.
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "deal...do");
+        let at = buf.word_at_caret().expect("word at caret");
+        assert_eq!(at.word, "do");
     }
 }
