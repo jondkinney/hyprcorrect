@@ -725,15 +725,41 @@ fn pick_word_fix(
     } else if default == ProviderId::LanguageTool
         && let Some(lt) = languagetool
     {
-        match lt.check_text(&at.word) {
+        // Send the *sentence*, not the bare word, so LT's homonym /
+        // confusable rules (their/there/they're, your/you're, …) can
+        // fire. Then pick the first match whose span overlaps the
+        // target word's position inside the sentence.
+        //
+        // `primary_sentence` carries the buffer-byte range, so the
+        // target's in-sentence position is a subtraction —
+        // `PrimaryTarget` already holds buffer-byte positions.
+        let primary_sentence = buffer.sentence_containing(buffer.caret());
+        let target_in_sentence = primary_sentence
+            .as_ref()
+            .and_then(|s| word_in_sentence_bytes(s, primary.byte_start, primary.byte_end));
+        // Per-sentence corrections cache shared with the nearby
+        // scan: any nearby word whose containing sentence we've
+        // already checked reuses the result.
+        let mut sentence_cache = SentenceCache::new();
+        match lt.check_text(&sentence) {
             Ok(corrections) => {
-                if let Some(fix) = corrections
-                    .into_iter()
-                    .find_map(|c| c.suggestions.into_iter().next())
+                if let Some(s) = primary_sentence.as_ref() {
+                    sentence_cache.seed(s.buffer_byte_start, corrections.clone());
+                }
+                let pick = match &target_in_sentence {
+                    Some(range) => first_overlap_suggestion(&corrections, range),
+                    // No sentence context (very short buffer, etc.):
+                    // fall back to the old behavior of taking whatever
+                    // LT found first.
+                    None => corrections
+                        .iter()
+                        .find_map(|c| c.suggestions.first().cloned()),
+                };
+                if let Some(fix) = pick
                     && fix != at.word
                 {
                     eprintln!(
-                        "hyprcorrect: word-fix — LT picked {:?} for {:?}",
+                        "hyprcorrect: word-fix — LT picked {:?} for {:?} (with sentence context)",
                         fix, at.word
                     );
                     return Some(plan_for(&primary, fix, bracketed, ProviderId::LanguageTool));
@@ -742,7 +768,9 @@ fn pick_word_fix(
                     "hyprcorrect: word-fix — LT left {:?} unchanged, scanning nearby",
                     at.word
                 );
-                if let Some(plan) = scan_nearby_lt(buffer, &at.word, lt, max_chars) {
+                if let Some(plan) =
+                    scan_nearby_lt(buffer, &at.word, lt, max_chars, &mut sentence_cache)
+                {
                     return Some(plan);
                 }
                 notify_info(
@@ -891,17 +919,25 @@ fn scan_nearby_llm(
 }
 
 /// Walk words near the buffer caret and return a plan for the
-/// first one LanguageTool flags. Mirrors [`scan_nearby_llm`] —
-/// same per-word cap, same early-exit on provider error.
+/// first one LanguageTool flags, with the *containing sentence* sent
+/// as context — same machinery as the primary path so homonym /
+/// confusable rules can fire for nearby words too.
+///
+/// `cache` is a per-sentence corrections cache seeded by the caller
+/// with the caret-sentence result. Multiple nearby words that share
+/// a sentence (the common case for ±30-char scans) reuse one LT
+/// round-trip. Capped by [`MAX_NEARBY_LT_SENTENCES`] *unique*
+/// sentences per chord — sentences are bigger payloads than single
+/// words, so the cap is lower than the old per-word one.
 #[cfg(target_os = "linux")]
 fn scan_nearby_lt(
     buffer: &hyprcorrect_core::Buffer,
     primary_word: &str,
     lt: &hyprcorrect_core::LanguageToolProvider,
     max_chars: i32,
+    cache: &mut SentenceCache,
 ) -> Option<WordFixPlan> {
-    const MAX_NEARBY_LT_CALLS: usize = 4;
-    let mut calls = 0;
+    const MAX_NEARBY_LT_SENTENCES: usize = 2;
     for nw in buffer.words_near_caret() {
         if nw.word == primary_word && nw.caret_offset_chars.abs() <= 1 {
             continue;
@@ -909,41 +945,125 @@ fn scan_nearby_lt(
         if nw.caret_offset_chars.abs() > max_chars {
             break;
         }
-        if calls >= MAX_NEARBY_LT_CALLS {
+        let Some(sentence) = buffer.sentence_containing(nw.byte_start) else {
+            continue;
+        };
+        // Bail out only when we'd need to call LT for a *new*
+        // sentence we haven't seen yet and we've already used our
+        // budget. Already-cached sentences are free to consult.
+        if !cache.has(sentence.buffer_byte_start)
+            && cache.sentences_fetched() >= MAX_NEARBY_LT_SENTENCES
+        {
             break;
         }
-        calls += 1;
-        match lt.check_text(&nw.word) {
-            Ok(corrections) => {
-                if let Some(fix) = corrections
-                    .into_iter()
-                    .find_map(|c| c.suggestions.into_iter().next())
-                    && fix != nw.word
-                {
-                    eprintln!(
-                        "hyprcorrect: word-fix — nearby LT hit {:?} → {:?} (offset {})",
-                        nw.word, fix, nw.caret_offset_chars
-                    );
-                    return Some(WordFixPlan {
-                        original: nw.word.clone(),
-                        fix,
-                        byte_start: nw.byte_start,
-                        byte_end: nw.byte_end,
-                        label: nw.word,
-                        provider: hyprcorrect_core::ProviderId::LanguageTool,
-                    });
-                }
-            }
+        let corrections = match cache.get_or_fetch(&sentence, lt) {
+            Ok(cs) => cs,
             Err(e) => {
                 eprintln!("hyprcorrect: word-fix nearby LT call failed ({e}) — stopping scan");
                 return None;
             }
+        };
+        let Some(target) = word_in_sentence_bytes(&sentence, nw.byte_start, nw.byte_end) else {
+            continue;
+        };
+        if let Some(fix) = first_overlap_suggestion(corrections, &target)
+            && fix != nw.word
+        {
+            eprintln!(
+                "hyprcorrect: word-fix — nearby LT hit {:?} → {:?} (offset {}, with context)",
+                nw.word, fix, nw.caret_offset_chars
+            );
+            return Some(WordFixPlan {
+                original: nw.word.clone(),
+                fix,
+                byte_start: nw.byte_start,
+                byte_end: nw.byte_end,
+                label: nw.word,
+                provider: hyprcorrect_core::ProviderId::LanguageTool,
+            });
         }
     }
     None
 }
 
+/// Per-sentence corrections cache shared between the primary LT
+/// pass and [`scan_nearby_lt`]. Keyed by the sentence's
+/// `buffer_byte_start` so the same buffer region never gets two
+/// LT round-trips per chord.
+#[cfg(target_os = "linux")]
+struct SentenceCache {
+    entries: std::collections::HashMap<usize, Vec<hyprcorrect_core::Correction>>,
+    fetched: usize,
+}
 
+#[cfg(target_os = "linux")]
+impl SentenceCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            fetched: 0,
+        }
+    }
+
+    /// Pre-populate with a sentence we've already checked (e.g. the
+    /// caret-sentence the primary path queried). Counts toward the
+    /// fetched total so the nearby-scan cap accounts for it.
+    fn seed(&mut self, buffer_byte_start: usize, corrections: Vec<hyprcorrect_core::Correction>) {
+        if self
+            .entries
+            .insert(buffer_byte_start, corrections)
+            .is_none()
+        {
+            self.fetched += 1;
+        }
+    }
+
+    fn has(&self, buffer_byte_start: usize) -> bool {
+        self.entries.contains_key(&buffer_byte_start)
+    }
+
+    fn sentences_fetched(&self) -> usize {
+        self.fetched
+    }
+
+    /// Returns a shared reference to the cached corrections for
+    /// `sentence`, fetching via `lt` (and caching the result) if
+    /// the sentence isn't already known.
+    fn get_or_fetch(
+        &mut self,
+        sentence: &hyprcorrect_core::Sentence,
+        lt: &hyprcorrect_core::LanguageToolProvider,
+    ) -> Result<&Vec<hyprcorrect_core::Correction>, hyprcorrect_core::LanguageToolError> {
+        use std::collections::hash_map::Entry;
+        let key = sentence.buffer_byte_start;
+        match self.entries.entry(key) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let cs = lt.check_text(&sentence.sentence)?;
+                self.fetched += 1;
+                Ok(e.insert(cs))
+            }
+        }
+    }
+}
+
+/// Byte range of `[buffer_start, buffer_end)` translated into
+/// `sentence`-relative bytes. Returns `None` when the buffer range
+/// doesn't lie entirely within the sentence — defensive, in practice
+/// nearby words always fall fully inside their containing sentence.
+#[cfg(target_os = "linux")]
+fn word_in_sentence_bytes(
+    sentence: &hyprcorrect_core::Sentence,
+    buffer_start: usize,
+    buffer_end: usize,
+) -> Option<std::ops::Range<usize>> {
+    if buffer_start < sentence.buffer_byte_start || buffer_end > sentence.buffer_byte_end {
+        return None;
+    }
+    Some(
+        (buffer_start - sentence.buffer_byte_start)..(buffer_end - sentence.buffer_byte_start),
+    )
+}
 
 /// The primary edit target derived from `word_at_caret`: the
 /// word's byte range in the buffer. Used to build the plan for
@@ -980,6 +1100,24 @@ fn primary_target(
         byte_start,
         byte_end,
     }
+}
+
+/// First LanguageTool suggestion whose match span overlaps
+/// `target` (byte range inside the sentence we sent). Half-open
+/// overlap: `a.start < b.end && b.start < a.end`.
+#[cfg(target_os = "linux")]
+fn first_overlap_suggestion(
+    corrections: &[hyprcorrect_core::Correction],
+    target: &std::ops::Range<usize>,
+) -> Option<String> {
+    corrections.iter().find_map(|c| {
+        let overlaps = c.span.start < target.end && target.start < c.span.end;
+        if overlaps {
+            c.suggestions.first().cloned()
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1533,3 +1671,72 @@ fn not_yet(what: &str, milestone: &str) {
     eprintln!("hyprcorrect: {what} is not implemented yet ({milestone}) — see DESIGN.md");
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use hyprcorrect_core::{Correction, Sentence};
+
+    use super::{first_overlap_suggestion, word_in_sentence_bytes};
+
+    fn sentence(s: &str, start: usize) -> Sentence {
+        Sentence {
+            sentence: s.into(),
+            buffer_byte_start: start,
+            buffer_byte_end: start + s.len(),
+        }
+    }
+
+    #[test]
+    fn word_in_sentence_bytes_subtracts_buffer_offset() {
+        // Sentence starts at buffer byte 13; find "their" via the
+        // sentence text itself to avoid hand-counted offsets.
+        let buffer_offset = 13;
+        let s = sentence("The cat ran their way.", buffer_offset);
+        let in_sentence = s.sentence.find("their").unwrap();
+        let buf_start = buffer_offset + in_sentence;
+        let buf_end = buf_start + "their".len();
+        let r = word_in_sentence_bytes(&s, buf_start, buf_end).unwrap();
+        assert_eq!(&s.sentence[r], "their");
+    }
+
+    #[test]
+    fn word_in_sentence_bytes_rejects_out_of_range() {
+        let s = sentence("Hello.", 0);
+        // buffer_end past sentence end → None
+        assert!(word_in_sentence_bytes(&s, 0, 10).is_none());
+        // buffer_start before sentence start → None
+        let s2 = sentence("Hello.", 5);
+        assert!(word_in_sentence_bytes(&s2, 0, 4).is_none());
+    }
+
+    #[test]
+    fn first_overlap_picks_match_on_target_word() {
+        let target = 9..14; // bytes of "their" in "They went their way."
+        let corrections = vec![
+            Correction {
+                span: 0..4,
+                original: "They".into(),
+                suggestions: vec!["Them".into()],
+            },
+            Correction {
+                span: 9..14,
+                original: "their".into(),
+                suggestions: vec!["there".into()],
+            },
+        ];
+        assert_eq!(
+            first_overlap_suggestion(&corrections, &target),
+            Some("there".into())
+        );
+    }
+
+    #[test]
+    fn first_overlap_returns_none_when_nothing_touches_target() {
+        let target = 9..14;
+        let corrections = vec![Correction {
+            span: 0..4,
+            original: "They".into(),
+            suggestions: vec!["Them".into()],
+        }];
+        assert!(first_overlap_suggestion(&corrections, &target).is_none());
+    }
+}

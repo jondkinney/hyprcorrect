@@ -14,7 +14,7 @@ pub mod replace;
 pub mod runtime;
 pub mod secrets;
 
-pub use buffer::{Buffer, Key, NearbyWord, SentenceAtCaret, WordAtCaret};
+pub use buffer::{Buffer, Key, NearbyWord, Sentence, SentenceAtCaret, WordAtCaret};
 pub use chord::{Chord, ChordError};
 pub use config::{
     Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,

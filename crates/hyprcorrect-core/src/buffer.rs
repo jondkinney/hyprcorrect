@@ -62,6 +62,21 @@ pub struct WordAtCaret {
     pub chars_after_caret: usize,
 }
 
+/// A sentence in the buffer, located by [`Buffer::sentence_containing`].
+/// Carries enough information for a caller holding an in-buffer byte
+/// offset (e.g. a [`NearbyWord`]'s `byte_start`/`byte_end`) to map it
+/// into sentence-relative bytes via subtraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sentence {
+    /// The sentence's text, with surrounding whitespace trimmed.
+    pub sentence: String,
+    /// Byte offset of `sentence`'s first byte within the buffer's text.
+    pub buffer_byte_start: usize,
+    /// Byte offset one past `sentence`'s last byte within the buffer's
+    /// text. Half-open range: `[buffer_byte_start, buffer_byte_end)`.
+    pub buffer_byte_end: usize,
+}
+
 /// The sentence containing (or immediately to the left of) the caret,
 /// with metadata for the emit-side replace. Returned by
 /// [`Buffer::sentence_at_caret`].
@@ -215,8 +230,41 @@ impl Buffer {
     /// ender the sentence is the in-progress text after the previous
     /// one.
     pub fn sentence_at_caret(&self) -> Option<SentenceAtCaret> {
-        let text = &self.text;
         let caret = self.caret;
+        let s = self.sentence_containing(caret)?;
+        let caret_in_range = caret.clamp(s.buffer_byte_start, s.buffer_byte_end);
+        let chars_before = self.text[s.buffer_byte_start..caret_in_range]
+            .chars()
+            .count();
+        let chars_after = self.text[caret_in_range..s.buffer_byte_end]
+            .chars()
+            .count();
+        // Trailing whitespace between the sentence's right edge and
+        // the caret. Present only when the caret has walked past the
+        // sentence into trailing space.
+        let trailing = if caret > s.buffer_byte_end {
+            self.text[s.buffer_byte_end..caret].to_string()
+        } else {
+            String::new()
+        };
+        Some(SentenceAtCaret {
+            sentence: s.sentence,
+            trailing,
+            chars_before_caret: chars_before,
+            chars_after_caret: chars_after,
+        })
+    }
+
+    /// The sentence in the buffer that contains `byte_offset`, plus
+    /// the sentence's byte range within `self.text` — caller can
+    /// subtract `buffer_byte_start` from any in-buffer byte position
+    /// to land in sentence-relative bytes.
+    ///
+    /// Same "split on `.!?`, trim whitespace, prefer the later range
+    /// at a boundary" semantics as [`Self::sentence_at_caret`]; that
+    /// method projects this result onto the caret.
+    pub fn sentence_containing(&self, byte_offset: usize) -> Option<Sentence> {
+        let text = &self.text;
         if text.is_empty() {
             return None;
         }
@@ -237,14 +285,14 @@ impl Buffer {
         if ranges.is_empty() {
             return None;
         }
-        // Pick the latest range that contains the caret. When the
-        // caret sits exactly on a boundary (`caret == end`) the
-        // later range wins; if that later range is whitespace-only
-        // the caret is really in the previous sentence's trailing
+        // Pick the latest range that contains `byte_offset`. When
+        // it sits exactly on a boundary (`offset == end`) the later
+        // range wins; if that later range is whitespace-only the
+        // offset is really in the previous sentence's trailing
         // whitespace, so step back one.
         let mut idx = ranges
             .iter()
-            .rposition(|&(s, e)| s <= caret && caret <= e)?;
+            .rposition(|&(s, e)| s <= byte_offset && byte_offset <= e)?;
         if text[ranges[idx].0..ranges[idx].1].trim().is_empty() && idx > 0 {
             idx -= 1;
         }
@@ -256,23 +304,10 @@ impl Buffer {
         if sentence_start >= sentence_end {
             return None;
         }
-        let sentence = text[sentence_start..sentence_end].to_string();
-        let caret_in_range = caret.clamp(sentence_start, sentence_end);
-        let chars_before = text[sentence_start..caret_in_range].chars().count();
-        let chars_after = text[caret_in_range..sentence_end].chars().count();
-        // Trailing whitespace between the sentence's right edge and
-        // the caret. Present only when the caret has walked past the
-        // sentence into trailing space.
-        let trailing = if caret > sentence_end {
-            text[sentence_end..caret].to_string()
-        } else {
-            String::new()
-        };
-        Some(SentenceAtCaret {
-            sentence,
-            trailing,
-            chars_before_caret: chars_before,
-            chars_after_caret: chars_after,
+        Some(Sentence {
+            sentence: text[sentence_start..sentence_end].to_string(),
+            buffer_byte_start: sentence_start,
+            buffer_byte_end: sentence_end,
         })
     }
 
@@ -708,6 +743,53 @@ mod tests {
         assert_eq!(at.sentence, "the quick brown fox jumps");
         assert_eq!(at.chars_before_caret, 15);
         assert_eq!(at.chars_after_caret, 10);
+    }
+
+    #[test]
+    fn sentence_containing_returns_the_active_sentence_with_buffer_offsets() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hello world. The quick brown fox.");
+        // Find "fox" via the buffer's own text rather than a
+        // hand-counted offset — the contract under test is the
+        // "subtract buffer_byte_start to land in sentence-relative
+        // bytes" mapping, not arithmetic.
+        let fox_buf_start = buf.text().find("fox").unwrap();
+        let fox_buf_end = fox_buf_start + "fox".len();
+        let s = buf.sentence_containing(fox_buf_start).unwrap();
+        assert_eq!(s.sentence, "The quick brown fox.");
+        assert_eq!(s.buffer_byte_start, 13);
+        assert_eq!(s.buffer_byte_end, 33);
+        let start_in_sentence = fox_buf_start - s.buffer_byte_start;
+        let end_in_sentence = fox_buf_end - s.buffer_byte_start;
+        assert_eq!(&s.sentence[start_in_sentence..end_in_sentence], "fox");
+    }
+
+    #[test]
+    fn sentence_containing_picks_first_sentence_for_offset_in_it() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hello world. The quick brown fox.");
+        let s = buf.sentence_containing(3).unwrap();
+        assert_eq!(s.sentence, "Hello world.");
+        assert_eq!(s.buffer_byte_start, 0);
+        assert_eq!(s.buffer_byte_end, 12);
+    }
+
+    #[test]
+    fn sentence_containing_returns_none_for_whitespace_only_buffer() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "   ");
+        assert!(buf.sentence_containing(1).is_none());
+    }
+
+    #[test]
+    fn sentence_containing_steps_back_from_inter_sentence_whitespace() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "Hello world. ");
+        // Position the offset just after the trailing space — the
+        // boundary-stepping logic should keep us in the only real
+        // sentence rather than returning whitespace.
+        let s = buf.sentence_containing(13).unwrap();
+        assert_eq!(s.sentence, "Hello world.");
     }
 
     #[test]
