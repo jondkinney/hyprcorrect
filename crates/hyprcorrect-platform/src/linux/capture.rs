@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -104,27 +106,133 @@ pub fn start(
     let keyboards = keyboard_devices()?;
     let dedupe = Arc::new(Mutex::new(Dedupe::new()));
     let hold = Arc::new(HoldTracker::new(query_compositor_repeat()));
+    let mods = MODS_WATCH
+        .get_or_init(|| Arc::new(ModsWatch::new()))
+        .clone();
     let (tx, rx) = mpsc::channel();
-    for device in keyboards {
+    for (idx, device) in keyboards.into_iter().enumerate() {
         let tx = tx.clone();
         let keymap_text = keymap_text.clone();
         let triggers = triggers.clone();
         let chord_capture = chord_capture.clone();
         let dedupe = dedupe.clone();
         let hold = hold.clone();
+        let mods = mods.clone();
+        let device_id = idx as u32;
         thread::spawn(move || {
             read_device(
                 device,
+                device_id,
                 &keymap_text,
                 &triggers,
                 &chord_capture,
                 &dedupe,
                 &hold,
+                &mods,
                 &tx,
             )
         });
     }
     Ok(rx)
+}
+
+/// Block up to `timeout` for every chord modifier (Ctrl/Shift/Alt/
+/// Super) to be released across every keyboard device the daemon is
+/// watching. Returns `true` if everything cleared in time, `false` on
+/// timeout.
+///
+/// Called by [`crate::linux::emit`] before each wtype burst: many
+/// Wayland compositors deliver wtype's synthetic keys ORed with the
+/// user's physical modifier state, which would turn each `BackSpace`
+/// into `Ctrl+BackSpace` (delete-word in many terminals) while the
+/// chord is still being held. Waiting for release dodges that.
+///
+/// No-op (returns `true` immediately) before [`start`] has been
+/// called — useful for unit tests of the emit path.
+pub fn wait_mods_clear(timeout: Duration) -> bool {
+    let Some(watch) = MODS_WATCH.get() else {
+        return true;
+    };
+    watch.wait_clear(timeout)
+}
+
+static MODS_WATCH: OnceLock<Arc<ModsWatch>> = OnceLock::new();
+
+/// Shared tracker of which chord modifiers are currently held, keyed
+/// by input-device index. The capture thread per device writes its
+/// xkb modifier mask after every key event; [`wait_mods_clear`]
+/// reads the union.
+struct ModsWatch {
+    inner: Mutex<HashMap<u32, u8>>,
+    cv: Condvar,
+}
+
+const MOD_CTRL: u8 = 1 << 0;
+const MOD_ALT: u8 = 1 << 1;
+const MOD_SHIFT: u8 = 1 << 2;
+const MOD_SUPER: u8 = 1 << 3;
+
+impl ModsWatch {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Update this device's modifier mask. Notifies the condvar so
+    /// any `wait_clear` caller re-checks.
+    fn update(&self, device_id: u32, mask: u8) {
+        let mut guard = self.inner.lock().expect("mods poisoned");
+        let entry = guard.entry(device_id).or_insert(0);
+        if *entry != mask {
+            *entry = mask;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Returns `true` once every recorded device reports a zero
+    /// mask, or `false` if `timeout` elapses first.
+    fn wait_clear(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inner.lock().expect("mods poisoned");
+        loop {
+            if guard.values().all(|&m| m == 0) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, res) = self
+                .cv
+                .wait_timeout(guard, deadline - now)
+                .expect("mods poisoned");
+            guard = g;
+            if res.timed_out() && !guard.values().all(|&m| m == 0) {
+                return false;
+            }
+        }
+    }
+}
+
+/// Read the chord-modifier mask from `state`.
+fn mods_mask(state: &xkb::State) -> u8 {
+    let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
+    let mut mask = 0;
+    if active(xkb::MOD_NAME_CTRL) {
+        mask |= MOD_CTRL;
+    }
+    if active(xkb::MOD_NAME_ALT) {
+        mask |= MOD_ALT;
+    }
+    if active(xkb::MOD_NAME_SHIFT) {
+        mask |= MOD_SHIFT;
+    }
+    if active(xkb::MOD_NAME_LOGO) {
+        mask |= MOD_SUPER;
+    }
+    mask
 }
 
 /// Auto-repeat tuning the compositor uses to drive Wayland clients.
@@ -382,13 +490,19 @@ fn is_keyboard(device: &Device) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn read_device(
     mut device: Device,
+    device_id: u32,
     keymap_text: &str,
     triggers: &[TriggerSpec],
     chord_capture: &ChordCaptureSlot,
     dedupe: &Mutex<Dedupe>,
     hold: &HoldTracker,
+    mods: &ModsWatch,
     tx: &Sender<Key>,
 ) {
+    let _device_name = device
+        .name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "<unnamed>".to_string());
     // Each thread builds its own xkb state: Context/Keymap/State hold
     // raw pointers and are not Send, so they cannot cross the thread
     // boundary. The keymap text was already validated by `start`.
@@ -463,6 +577,12 @@ fn read_device(
                 xkb::KeyDirection::Down
             };
             state.update_key(keycode, direction);
+
+            // Publish this device's current chord-mod mask so the
+            // emit path can wait for everything to clear before
+            // typing — otherwise wtype's BackSpaces inherit the
+            // held Ctrl/etc. and turn into delete-word.
+            mods.update(device_id, mods_mask(&state));
         }
     }
 }

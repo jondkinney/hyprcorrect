@@ -7,6 +7,15 @@
 
 use std::io::ErrorKind;
 use std::process::Command;
+use std::time::Duration;
+
+use super::capture;
+
+/// How long we'll wait for the user to release the chord
+/// (Ctrl/Shift/Alt/Super) before giving up and emitting anyway.
+/// Tuned to feel instant when the user taps-and-releases, but
+/// generous enough to cover a slow release.
+const MODS_CLEAR_TIMEOUT_MS: u64 = 250;
 
 /// An error applying a text replacement.
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +93,15 @@ pub fn replace_around_caret_with_delay(
     text: &str,
     pause_per_backspace_ms: u32,
 ) -> Result<(), EmitError> {
+    // Wait for the user to release the trigger chord before we
+    // type anything. Many Wayland compositors deliver wtype's
+    // synthetic keys ORed with the user's physical modifier
+    // state, so a `BackSpace` while Ctrl is still held arrives at
+    // the focused window as Ctrl+BackSpace (delete-word, in most
+    // terminals). On timeout we fall through and emit anyway —
+    // the user may be holding an unrelated modifier on purpose.
+    let _ = capture::wait_mods_clear(Duration::from_millis(MODS_CLEAR_TIMEOUT_MS));
+
     // Implementation strategy: "delete N chars to the right of the
     // caret" is rewritten as "move caret right N, then backspace N
     // more." Every deletion ends up going through `BackSpace`,
