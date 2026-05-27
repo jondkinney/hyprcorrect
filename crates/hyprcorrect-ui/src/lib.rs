@@ -10,7 +10,7 @@
 
 mod apps;
 #[cfg(target_os = "linux")]
-mod autostart;
+pub mod autostart;
 mod docker;
 pub mod icon;
 mod prefs;

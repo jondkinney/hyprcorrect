@@ -102,6 +102,22 @@ fn run_daemon() {
         eprintln!("hyprcorrect: could not write PID file ({e}) — prefs reload won't work");
     }
 
+    // Keep the per-user icon copy + applications-catalog entry in
+    // sync with the running binary on every daemon start. Walker /
+    // fuzzel / rofi index `~/.local/share/applications/` (NOT the
+    // autostart dir), so an out-of-date entry here is the most
+    // common cause of "Walker shows the old icon." Both files are
+    // best-effort — failures fall through silently.
+    if let Err(e) = hyprcorrect_ui::autostart::ensure_user_icon() {
+        eprintln!("hyprcorrect: could not refresh user icon ({e})");
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Err(e) =
+            hyprcorrect_ui::autostart::ensure_apps_catalog_entry(&exe.to_string_lossy())
+    {
+        eprintln!("hyprcorrect: could not refresh apps-catalog entry ({e})");
+    }
+
     // Register the review-popup's Wayland class as a floating window
     // in Hyprland. Tiled, the popup would push the source window
     // around mid-edit and the user has nowhere to put it; floating
