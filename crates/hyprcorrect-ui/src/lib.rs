@@ -11,6 +11,7 @@
 mod apps;
 #[cfg(target_os = "linux")]
 mod autostart;
+mod docker;
 mod icon;
 mod prefs;
 mod review;

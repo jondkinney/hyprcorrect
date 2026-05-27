@@ -19,6 +19,7 @@ use hyprcorrect_platform::linux::chord_capture::{self, ChordRecording, ClientErr
 use crate::apps::AppRegistry;
 #[cfg(target_os = "linux")]
 use crate::autostart;
+use crate::docker::{self, DockerState, LanguageToolStatus, OpHandle, OpKind, StatusHandle};
 use crate::icon;
 
 #[cfg(target_os = "linux")]
@@ -135,6 +136,20 @@ struct PrefsApp {
     app_filter: String,
     /// Cached `.desktop` registry — display names + icons.
     app_registry: AppRegistry,
+    /// Cached LanguageTool status — combined URL probe + docker
+    /// inspection. Updated by the background [`StatusHandle`] worker;
+    /// the UI just reads this. `None` until the first probe lands.
+    lt_status: Option<LanguageToolStatus>,
+    /// Last status refresh — re-probed every few seconds while the
+    /// Providers panel is visible so a foreign container the user
+    /// just started shows up.
+    last_status_check: Instant,
+    /// In-flight URL+docker probe.
+    status_probe: Option<StatusHandle>,
+    /// In-flight docker operation (install / start / stop / remove).
+    /// `Some` while the background thread runs; cleared when the
+    /// result is picked up and surfaced in [`Status`].
+    docker_op: Option<OpHandle>,
 }
 
 impl PrefsApp {
@@ -165,9 +180,85 @@ impl PrefsApp {
             selected_app: None,
             app_filter: String::new(),
             app_registry: AppRegistry::discover(),
+            lt_status: None,
+            last_status_check: Instant::now() - Duration::from_secs(60),
+            status_probe: None,
+            docker_op: None,
         }
     }
 
+    /// Kick off a background URL+docker probe if one isn't already
+    /// running and enough time has passed since the last result.
+    /// Cheap: we run the slow part (HTTP probe up to ~1.5 s + a few
+    /// `docker` invocations) on a worker thread.
+    fn refresh_lt_status(&mut self, ctx: &egui::Context) {
+        if let Some(handle) = &self.status_probe
+            && let Some(status) = handle.poll()
+        {
+            self.lt_status = Some(status);
+            self.status_probe = None;
+            ctx.request_repaint();
+        }
+        if self.status_probe.is_some() {
+            // Still in flight; re-poll shortly without spawning
+            // another worker.
+            ctx.request_repaint_after(Duration::from_millis(200));
+            return;
+        }
+        if self.docker_op.is_some() {
+            // Docker op will trigger its own immediate refresh on
+            // completion — no need to probe in parallel.
+            return;
+        }
+        if self.last_status_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_status_check = Instant::now();
+        let url = self.config.providers.languagetool.url.clone();
+        self.status_probe = Some(docker::spawn_status_probe(url));
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
+    fn poll_docker_op(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.docker_op else {
+            return;
+        };
+        if let Some(result) = handle.poll() {
+            let kind = handle.kind();
+            self.docker_op = None;
+            // Force the next status probe to fire on the next frame so
+            // the UI reflects the post-op state without a 5 s wait.
+            self.last_status_check = Instant::now() - Duration::from_secs(60);
+            match result {
+                Ok(()) => {
+                    let msg = match kind {
+                        OpKind::Install => {
+                            // First install: turn the provider on so the
+                            // user doesn't have to remember the second
+                            // step.
+                            self.config.providers.languagetool.enabled = true;
+                            "LanguageTool installed and started."
+                        }
+                        OpKind::Start => "LanguageTool started.",
+                        OpKind::Stop => "LanguageTool stopped.",
+                        OpKind::Remove => "LanguageTool container removed.",
+                    };
+                    self.ok(msg);
+                }
+                Err(e) => {
+                    let verb = match kind {
+                        OpKind::Install => "install",
+                        OpKind::Start => "start",
+                        OpKind::Stop => "stop",
+                        OpKind::Remove => "remove",
+                    };
+                    self.err(format!("Docker {verb} failed: {e}"));
+                }
+            }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
 
     fn refresh_running_apps(&mut self) {
         if self.last_apps_refresh.elapsed() < Duration::from_secs(3) {
@@ -281,6 +372,10 @@ impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_style(ctx);
         self.refresh_stale_check();
+        self.poll_docker_op(ctx);
+        if self.section == Section::Providers {
+            self.refresh_lt_status(ctx);
+        }
 
         // Chord recording happens through the daemon (see
         // `hyprcorrect-platform/src/linux/chord_capture.rs`): egui
@@ -612,11 +707,242 @@ impl PrefsApp {
         ui.add_space(4.0);
         caption(ui, "POST endpoint of your self-hosted LanguageTool server.");
 
+        ui.add_space(SETTING_BLOCK_SPACING);
+        self.languagetool_docker_row(ui);
+
         if touched {
             self.clear_status();
         }
     }
 
+    /// One-click LanguageTool-in-Docker row under the LanguageTool
+    /// section. See `crate::docker` for the rationale — provider
+    /// integration is still URL-based, this is a UX convenience for
+    /// users who'd otherwise have to memorize a `docker run` invocation.
+    fn languagetool_docker_row(&mut self, ui: &mut egui::Ui) {
+        field_label(ui, "Local server (Docker)");
+        ui.add_space(4.0);
+
+        let url = self.config.providers.languagetool.url.clone();
+        let op_in_flight = self.docker_op.is_some();
+        let probe_in_flight = self.status_probe.is_some() && self.lt_status.is_none();
+
+        let Some(status) = self.lt_status.clone() else {
+            // First-ever probe still in flight — show a neutral
+            // "checking…" message instead of flashing a wrong state.
+            if probe_in_flight {
+                ui.colored_label(
+                    egui::Color32::from_gray(170),
+                    "Checking for a running LanguageTool server…",
+                );
+            }
+            return;
+        };
+
+        match status {
+            LanguageToolStatus::Reachable {
+                managed_container_running,
+            } => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(110, 200, 130),
+                    format!("Reachable at {url}"),
+                );
+                ui.add_space(8.0);
+                if managed_container_running {
+                    // This is our container — give the user the same
+                    // Stop / Remove controls they had before.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!op_in_flight, egui::Button::new("Stop"))
+                            .on_hover_text(format!(
+                                "docker stop {}\nLeaves the container in place; \
+                                 Start brings it back.",
+                                docker::CONTAINER
+                            ))
+                            .clicked()
+                        {
+                            self.docker_op = Some(docker::stop());
+                            self.ok(OpKind::Stop.label());
+                        }
+                        if ui
+                            .add_enabled(
+                                !op_in_flight,
+                                egui::Button::new("Remove").frame(false),
+                            )
+                            .on_hover_text("Stop and delete the container. The image stays cached.")
+                            .clicked()
+                        {
+                            self.docker_op = Some(docker::remove());
+                            self.ok(OpKind::Remove.label());
+                        }
+                    });
+                    ui.add_space(4.0);
+                    caption(
+                        ui,
+                        "Running in the hyprcorrect-managed container. Nothing else \
+                         to do.",
+                    );
+                } else {
+                    ui.add_space(4.0);
+                    caption(
+                        ui,
+                        "Detected an existing LanguageTool server — hyprcorrect will \
+                         use it as-is. No Docker setup needed.",
+                    );
+                }
+            }
+            LanguageToolStatus::Unreachable(docker_state) => {
+                self.docker_unreachable_row(ui, &docker_state, &url, op_in_flight);
+            }
+        }
+    }
+
+    /// The "URL didn't answer" branch — drives the install / start UI.
+    /// Split out so the parent function isn't a five-screen match.
+    fn docker_unreachable_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &DockerState,
+        url: &str,
+        op_in_flight: bool,
+    ) {
+        let (status_text, status_color) = match state {
+            DockerState::NotInstalled => (
+                format!(
+                    "Nothing answers at {url}, and Docker isn't installed — \
+                     install Docker or point the URL at an existing server."
+                ),
+                egui::Color32::from_gray(170),
+            ),
+            DockerState::DockerUnavailable(msg) => (
+                format!("Docker unavailable: {msg}"),
+                egui::Color32::from_rgb(220, 160, 50),
+            ),
+            DockerState::AbsentContainer => (
+                "Not installed.".to_string(),
+                egui::Color32::from_gray(170),
+            ),
+            DockerState::ContainerStopped => (
+                format!("Our container exists but is stopped. Start it to reach {url}."),
+                egui::Color32::from_rgb(220, 160, 50),
+            ),
+            DockerState::ContainerRunning => (
+                format!(
+                    "Our container is running but {url} doesn't answer — \
+                     likely a port-mapping mismatch."
+                ),
+                egui::Color32::from_rgb(220, 160, 50),
+            ),
+            DockerState::ForeignContainer { name, running } => (
+                if *running {
+                    format!(
+                        "Found another LanguageTool container ({name}) running, but \
+                         it doesn't answer at {url}. Update the URL to match its \
+                         port, or stop it and install ours."
+                    )
+                } else {
+                    format!(
+                        "Found another LanguageTool container ({name}), stopped. \
+                         Start it manually (`docker start {name}`) or install ours."
+                    )
+                },
+                egui::Color32::from_rgb(220, 160, 50),
+            ),
+        };
+        ui.colored_label(status_color, status_text);
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| match state {
+            DockerState::NotInstalled => {
+                let _ = ui
+                    .add_enabled(false, egui::Button::new("Install with Docker"))
+                    .on_disabled_hover_text(
+                        "Install Docker first: https://docs.docker.com/engine/install/",
+                    );
+            }
+            DockerState::DockerUnavailable(_) => {
+                if ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Retry"))
+                    .on_hover_text("Recheck whether the Docker daemon is reachable.")
+                    .clicked()
+                {
+                    self.last_status_check = Instant::now() - Duration::from_secs(60);
+                }
+            }
+            DockerState::AbsentContainer | DockerState::ForeignContainer { .. } => {
+                let port = docker::host_port_from_url(url);
+                let enabled = !op_in_flight && port.is_some();
+                let hover = match port {
+                    Some(p) => format!(
+                        "Runs:\n  docker run -d --name {} --restart=unless-stopped \\\
+                         \n      -p {}:8010 {}\nFirst run downloads ~600 MB.",
+                        docker::CONTAINER,
+                        p,
+                        docker::IMAGE,
+                    ),
+                    None => "URL needs an explicit port (e.g. http://localhost:8081) before \
+                             hyprcorrect can map it to the container."
+                        .to_string(),
+                };
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Install with Docker"))
+                    .on_hover_text(hover)
+                    .clicked()
+                    && let Some(port) = port
+                {
+                    self.docker_op = Some(docker::install(port));
+                    self.ok(OpKind::Install.label());
+                }
+            }
+            DockerState::ContainerStopped => {
+                if ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Start"))
+                    .clicked()
+                {
+                    self.docker_op = Some(docker::start());
+                    self.ok(OpKind::Start.label());
+                }
+                if ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Remove").frame(false))
+                    .on_hover_text("Delete the container. The image stays cached locally.")
+                    .clicked()
+                {
+                    self.docker_op = Some(docker::remove());
+                    self.ok(OpKind::Remove.label());
+                }
+            }
+            DockerState::ContainerRunning => {
+                // Misconfiguration path: container up but URL wrong.
+                // We can stop our container in case the user wants to
+                // rebind, but we can't fix the URL for them.
+                if ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Stop"))
+                    .on_hover_text(
+                        "Stop the container so you can adjust the URL or re-install \
+                         with a matching port.",
+                    )
+                    .clicked()
+                {
+                    self.docker_op = Some(docker::stop());
+                    self.ok(OpKind::Stop.label());
+                }
+                if ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Remove").frame(false))
+                    .clicked()
+                {
+                    self.docker_op = Some(docker::remove());
+                    self.ok(OpKind::Remove.label());
+                }
+            }
+        });
+        ui.add_space(4.0);
+        caption(
+            ui,
+            "Pulls the erikvl87/languagetool image and runs it locally, \
+             mapped to the port in your URL above. Use this if you don't \
+             already self-host LanguageTool elsewhere.",
+        );
+    }
 
     fn behavior_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Behavior");

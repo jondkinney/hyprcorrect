@@ -329,7 +329,7 @@ Shipped implementations:
 |---|---|---|---|
 | **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
 | **LLM** (Claude/OpenAI) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. |
-| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL. Off until a URL is set — for when you run your own server. No bundled Java. |
+| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. |
 
 **Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key

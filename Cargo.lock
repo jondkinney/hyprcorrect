@@ -1344,6 +1344,7 @@ dependencies = [
  "image",
  "resvg",
  "tiny-skia",
+ "ureq",
  "usvg",
 ]
 

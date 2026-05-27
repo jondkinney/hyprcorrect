@@ -17,3 +17,7 @@ resvg.workspace = true
 tiny-skia.workspace = true
 usvg.workspace = true
 image.workspace = true
+
+# Probing the configured LanguageTool URL so prefs can detect an
+# already-running server regardless of how it's hosted.
+ureq.workspace = true
