@@ -103,6 +103,48 @@ pub fn field_start_offset(segments: &[Segment], ordinal: usize) -> Option<usize>
     None
 }
 
+/// Byte ranges, within `text`, of the words that differ from `other`
+/// (those not in the two strings' longest common subsequence of words).
+/// Used to underline misspellings in the original
+/// (`changed_word_ranges(original, corrected)`, red) and the
+/// corrections in the proposed text (`changed_word_ranges(corrected,
+/// original)`, blue).
+pub fn changed_word_ranges(text: &str, other: &str) -> Vec<(usize, usize)> {
+    let text_spans = word_spans(text);
+    let other_words: Vec<&str> = word_spans(other).into_iter().map(|s| s.0).collect();
+    let text_words: Vec<&str> = text_spans.iter().map(|s| s.0).collect();
+    // `lcs_matched_b_indices` returns matched indices of its second
+    // argument, so pass `text_words` there to get matched text words.
+    let matched = lcs_matched_b_indices(&other_words, &text_words);
+    text_spans
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !matched.contains(i))
+        .map(|(_, &(_, s, e))| (s, e))
+        .collect()
+}
+
+/// Each word in `s` paired with its `[start, end)` byte range.
+fn word_spans(s: &str) -> Vec<(&str, usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_word = false;
+    for (i, c) in s.char_indices() {
+        let w = is_word_char(c);
+        if w && !in_word {
+            start = i;
+            in_word = true;
+        } else if !w && in_word {
+            out.push((&s[start..i], start, i));
+            in_word = false;
+        }
+    }
+    if in_word {
+        out.push((&s[start..], start, s.len()));
+    }
+    out
+}
+
 /// Append `text` to the trailing [`Static`](Segment::Static) if there
 /// is one, otherwise start a new static segment — keeps consecutive
 /// unchanged words and separators in a single label.
@@ -308,5 +350,15 @@ mod tests {
         assert_eq!(fields(&segs), vec!["café"]);
         assert_eq!(reconstruct(&segs), "café au lait");
         assert_eq!(field_start_offset(&segs, 0), Some(0));
+    }
+
+    #[test]
+    fn changed_word_ranges_marks_differing_words() {
+        // misspellings in the original (red squiggle targets).
+        let r = changed_word_ranges("teh quick browne fox", "the quick brown fox");
+        assert_eq!(r, vec![(0, 3), (10, 16)]); // "teh", "browne"
+        // corrections in the corrected text (blue squiggle targets).
+        let r2 = changed_word_ranges("the quick brown fox", "teh quick browne fox");
+        assert_eq!(r2, vec![(0, 3), (10, 15)]); // "the", "brown"
     }
 }

@@ -27,7 +27,7 @@ use crate::worddiff::{self, Segment};
 
 const APP_ID: &str = "hyprcorrect-review";
 const REFOCUS_DELAY_MS: u64 = 280;
-const WINDOW_WIDTH: f32 = 560.0;
+const WINDOW_WIDTH: f32 = 600.0;
 const MIN_WINDOW_HEIGHT: f32 = 240.0;
 const MAX_WINDOW_HEIGHT: f32 = 900.0;
 
@@ -96,6 +96,10 @@ struct ReviewApp {
     initialized: bool,
     /// The vim editor, built lazily on the first `Ctrl+E`.
     vim: Option<VimEdit>,
+    /// Byte ranges of the corrected words in the vim buffer, each
+    /// `Some` until the user edits within it (then `None`) — drives the
+    /// blue squiggles in vim mode.
+    vim_marks: Vec<Option<(usize, usize)>>,
 }
 
 impl ReviewApp {
@@ -117,6 +121,7 @@ impl ReviewApp {
             focus_caret: None,
             initialized: false,
             vim: None,
+            vim_marks: Vec::new(),
         }
     }
 
@@ -149,6 +154,12 @@ impl ReviewApp {
             .focused_field
             .and_then(|ord| worddiff::field_start_offset(&self.segments, ord))
             .unwrap_or(0);
+        // Blue-squiggle the words that differ from the original; each
+        // mark survives until the user edits within it.
+        self.vim_marks = worddiff::changed_word_ranges(&sentence, &self.request.original)
+            .into_iter()
+            .map(Some)
+            .collect();
         self.vim = Some(VimEdit::new(sentence, cursor));
         self.mode = EditMode::Vim;
     }
@@ -217,14 +228,21 @@ impl ReviewApp {
 
     fn render_word(&mut self, ui: &mut egui::Ui) {
         ui.heading("Review correction");
-        ui.add_space(10.0);
+        ui.add_space(16.0);
         section_label(ui, "Original");
-        show_block(ui, &self.request.original, egui::Color32::from_gray(170));
+        original_card(ui, &self.request.original, &self.request.corrected);
 
-        ui.add_space(12.0);
+        ui.add_space(18.0);
         if self.field_segments.is_empty() {
             section_label(ui, "Proposed  ·  Ctrl+E to edit in vim");
-            show_block(ui, &self.request.corrected, egui::Color32::from_gray(230));
+            let corrected = self.request.corrected.clone();
+            card(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(corrected)
+                        .font(prose_font())
+                        .color(TEXT_FG),
+                );
+            });
             return;
         }
         section_label(
@@ -237,63 +255,75 @@ impl ReviewApp {
         let mut new_caret: Option<(usize, usize, bool)> = None;
         let mut consumed_pending = false;
         let segments = &mut self.segments;
+        let font = prose_font();
 
-        egui::Frame::new()
-            .fill(egui::Color32::from_gray(40))
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let mut ordinal = 0usize;
-                    for (seg_idx, seg) in segments.iter_mut().enumerate() {
-                        match seg {
-                            Segment::Static(t) => {
-                                ui.label(
-                                    egui::RichText::new(t.as_str())
-                                        .size(15.0)
-                                        .color(egui::Color32::from_gray(210)),
-                                );
-                            }
-                            Segment::Field(t) => {
-                                let this_ord = ordinal;
-                                ordinal += 1;
-                                let id = egui::Id::new(("hc_review_field", seg_idx));
-                                let chars = t.chars().count();
-                                let width = (chars.max(3) as f32) * 9.5 + 12.0;
-                                let out = egui::TextEdit::singleline(t)
-                                    .id(id)
-                                    .desired_width(width)
-                                    .margin(egui::Margin::symmetric(4, 2))
-                                    .show(ui);
+        card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                let mut ordinal = 0usize;
+                for (seg_idx, seg) in segments.iter_mut().enumerate() {
+                    match seg {
+                        Segment::Static(t) => {
+                            ui.label(
+                                egui::RichText::new(t.as_str())
+                                    .font(font.clone())
+                                    .color(egui::Color32::from_gray(215)),
+                            );
+                        }
+                        Segment::Field(t) => {
+                            let this_ord = ordinal;
+                            ordinal += 1;
+                            let id = egui::Id::new(("hc_review_field", seg_idx));
+                            let chars = t.chars().count();
+                            // Size the borderless field to its exact text
+                            // width (+ a hair for the caret) so it grows and
+                            // shrinks as the user types.
+                            let w = measure_width(ui, t, &font).max(7.0) + 3.0;
+                            let out = egui::TextEdit::singleline(t)
+                                .id(id)
+                                .frame(false)
+                                .desired_width(w)
+                                .margin(egui::Margin::ZERO)
+                                .font(font.clone())
+                                .text_color(egui::Color32::from_gray(238))
+                                .show(ui);
 
-                                if pending == Some(this_ord) {
-                                    out.response.request_focus();
-                                    let mut state = out.state;
-                                    state.cursor.set_char_range(Some(CCursorRange::two(
-                                        CCursor::new(0),
-                                        CCursor::new(chars),
-                                    )));
-                                    state.store(ui.ctx(), id);
-                                    consumed_pending = true;
-                                    new_focused = Some(this_ord);
-                                    new_caret = Some((0, chars, true));
-                                } else if out.response.has_focus() {
-                                    new_focused = Some(this_ord);
-                                    let (caret, sel) = out
-                                        .cursor_range
-                                        .map(|r| {
-                                            (r.primary.index, r.primary.index != r.secondary.index)
-                                        })
-                                        .unwrap_or((chars, false));
-                                    new_caret = Some((caret, chars, sel));
-                                }
+                            // Blue squiggle marks the correction / tab target.
+                            let rect = out.response.rect;
+                            let focused = out.response.has_focus() || pending == Some(this_ord);
+                            let col = if focused {
+                                SQUIGGLE_BLUE
+                            } else {
+                                SQUIGGLE_BLUE.gamma_multiply(0.65)
+                            };
+                            squiggle(ui.painter(), rect.left(), rect.right(), rect.bottom(), col);
+
+                            if pending == Some(this_ord) {
+                                out.response.request_focus();
+                                let mut state = out.state;
+                                state.cursor.set_char_range(Some(CCursorRange::two(
+                                    CCursor::new(0),
+                                    CCursor::new(chars),
+                                )));
+                                state.store(ui.ctx(), id);
+                                consumed_pending = true;
+                                new_focused = Some(this_ord);
+                                new_caret = Some((0, chars, true));
+                            } else if out.response.has_focus() {
+                                new_focused = Some(this_ord);
+                                let (caret, sel) = out
+                                    .cursor_range
+                                    .map(|r| {
+                                        (r.primary.index, r.primary.index != r.secondary.index)
+                                    })
+                                    .unwrap_or((chars, false));
+                                new_caret = Some((caret, chars, sel));
                             }
                         }
                     }
-                });
+                }
             });
+        });
 
         if consumed_pending {
             self.pending_focus = None;
@@ -313,6 +343,7 @@ impl ReviewApp {
         });
 
         let keys = collect_vim_keys(ctx);
+        let before = self.vim.as_ref().map(|v| v.text().to_string());
         let mut outcome = VimOutcome::None;
         if let Some(vim) = self.vim.as_mut() {
             for k in keys {
@@ -320,6 +351,14 @@ impl ReviewApp {
                 if o != VimOutcome::None {
                     outcome = o;
                 }
+            }
+        }
+        // If the text changed, drop the squiggle on any touched word and
+        // shift the rest to track the edit.
+        if let (Some(before), Some(vim)) = (before, self.vim.as_ref()) {
+            let after = vim.text();
+            if before != after {
+                update_marks(&mut self.vim_marks, &before, after);
             }
         }
         match outcome {
@@ -333,23 +372,24 @@ impl ReviewApp {
         ui.heading("Edit sentence  ·  vim");
         ui.add_space(10.0);
         section_label(ui, "Original");
-        show_block(ui, &self.request.original, egui::Color32::from_gray(170));
-        ui.add_space(12.0);
+        original_card(ui, &self.request.original, &self.request.corrected);
+        ui.add_space(16.0);
 
         let (text, cursor, mode, status) = match self.vim.as_ref() {
             Some(v) => (v.text().to_string(), v.cursor(), v.mode(), v.status_line()),
             None => return,
         };
 
+        let marks = self.vim_marks.clone();
         let font = egui::FontId::monospace(15.0);
-        let fg = egui::Color32::from_gray(230);
+        let fg = TEXT_FG;
         let accent = egui::Color32::from_rgb(120, 190, 255);
         let on_block = egui::Color32::from_gray(20);
 
         egui::Frame::new()
-            .fill(egui::Color32::from_gray(40))
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 8))
+            .fill(CARD_BG)
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(14, 12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 let wrap_width = ui.available_width();
@@ -376,6 +416,27 @@ impl ReviewApp {
                 );
                 let origin = rect.min;
                 ui.painter().galley(origin, galley.clone(), fg);
+
+                // Blue squiggles under the corrections not yet touched.
+                for &(bs, be) in marks.iter().flatten() {
+                    if bs >= be || be > text.len() {
+                        continue;
+                    }
+                    let cs = text[..bs].chars().count();
+                    let ce = text[..be].chars().count();
+                    let r0 = galley
+                        .pos_from_cursor(CCursor::new(cs))
+                        .translate(origin.to_vec2());
+                    let r1 = galley
+                        .pos_from_cursor(CCursor::new(ce))
+                        .translate(origin.to_vec2());
+                    let x1 = if (r0.min.y - r1.min.y).abs() < 1.0 {
+                        r1.min.x
+                    } else {
+                        origin.x + galley.size().x
+                    };
+                    squiggle(ui.painter(), r0.min.x, x1, r0.max.y, SQUIGGLE_BLUE);
+                }
 
                 let at = cursor.min(text.len());
                 let char_idx = text[..at].chars().count();
@@ -472,7 +533,7 @@ impl eframe::App for ReviewApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::central_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(20, 18)),
+                    .inner_margin(egui::Margin::symmetric(26, 22)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -557,11 +618,11 @@ fn collect_vim_keys(ctx: &egui::Context) -> Vec<VimKey> {
 /// without truncation. Lightweight estimate; the surrounding
 /// `ScrollArea` covers any miss.
 fn estimate_window_height(request: &ReviewRequest) -> f32 {
-    const CHARS_PER_LINE: usize = 65;
-    const LINE_HEIGHT: f32 = 22.0;
-    // heading + section labels + two block paddings + the hint lines +
+    const CHARS_PER_LINE: usize = 60;
+    const LINE_HEIGHT: f32 = 24.0;
+    // heading + section labels + two card paddings + the hint lines +
     // the bottom action row + paint margins.
-    const CHROME: f32 = 240.0;
+    const CHROME: f32 = 270.0;
     let lines = |s: &str| -> usize {
         s.lines()
             .map(|line| line.chars().count().max(1).div_ceil(CHARS_PER_LINE))
@@ -574,19 +635,162 @@ fn estimate_window_height(request: &ReviewRequest) -> f32 {
 }
 
 fn section_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).strong().size(14.0));
-    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(text)
+            .strong()
+            .size(13.0)
+            .color(egui::Color32::from_gray(140)),
+    );
+    ui.add_space(6.0);
 }
 
-fn show_block(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+const SQUIGGLE_RED: egui::Color32 = egui::Color32::from_rgb(232, 92, 92);
+const SQUIGGLE_BLUE: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
+const CARD_BG: egui::Color32 = egui::Color32::from_gray(34);
+const TEXT_FG: egui::Color32 = egui::Color32::from_gray(225);
+
+/// The prose font for the Original / Proposed text, shared by the
+/// static words and the editable fields so they keep one baseline.
+fn prose_font() -> egui::FontId {
+    egui::FontId::proportional(16.0)
+}
+
+/// A rounded, padded container for a block of review text.
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
-        .fill(egui::Color32::from_gray(40))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .fill(CARD_BG)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(egui::RichText::new(text).color(color).size(14.0));
-        });
+            add(ui)
+        })
+        .inner
+}
+
+/// The "Original" card: the user's text with a red squiggle under each
+/// word the corrector changed.
+fn original_card(ui: &mut egui::Ui, original: &str, corrected: &str) {
+    let ranges = worddiff::changed_word_ranges(original, corrected);
+    card(ui, |ui| {
+        paint_text_with_squiggles(
+            ui,
+            original,
+            &ranges,
+            egui::Color32::from_gray(170),
+            SQUIGGLE_RED,
+        );
+    });
+}
+
+/// Paint wrapped `text` and draw a squiggle under each `[start, end)`
+/// byte range — used for the read-only Original block.
+fn paint_text_with_squiggles(
+    ui: &mut egui::Ui,
+    text: &str,
+    ranges: &[(usize, usize)],
+    text_color: egui::Color32,
+    squiggle_color: egui::Color32,
+) {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: prose_font(),
+            color: text_color,
+            ..Default::default()
+        },
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let origin = rect.min;
+    ui.painter().galley(origin, galley.clone(), text_color);
+    for &(bs, be) in ranges {
+        let cs = text[..bs].chars().count();
+        let ce = text[..be].chars().count();
+        let r0 = galley
+            .pos_from_cursor(CCursor::new(cs))
+            .translate(origin.to_vec2());
+        let r1 = galley
+            .pos_from_cursor(CCursor::new(ce))
+            .translate(origin.to_vec2());
+        let x1 = if (r0.min.y - r1.min.y).abs() < 1.0 {
+            r1.min.x
+        } else {
+            // Word wrapped to a new row; underline its first row to the edge.
+            origin.x + galley.size().x
+        };
+        squiggle(ui.painter(), r0.min.x, x1, r0.max.y, squiggle_color);
+    }
+}
+
+/// Width of `text` laid out in `font`, in points.
+fn measure_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+/// Draw a spell-checker-style sine-wave underline from `x0` to `x1` at
+/// baseline `y`.
+fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: egui::Color32) {
+    if x1 <= x0 {
+        return;
+    }
+    const AMP: f32 = 1.4;
+    const WAVELEN: f32 = 5.0;
+    const STEP: f32 = 1.0;
+    let mut pts = Vec::new();
+    let mut x = x0;
+    while x <= x1 {
+        let phase = (x - x0) / WAVELEN * std::f32::consts::TAU;
+        pts.push(egui::pos2(x, y + AMP * phase.sin()));
+        x += STEP;
+    }
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4, color)));
+}
+
+/// Adjust vim-mode squiggle marks after an edit turned `prev` into
+/// `curr`: drop any mark the edit overlapped, and shift marks that sit
+/// entirely after the edit so they keep tracking their word.
+fn update_marks(marks: &mut [Option<(usize, usize)>], prev: &str, curr: &str) {
+    let (s, pe, ce) = changed_region(prev, curr);
+    let delta = ce as isize - pe as isize;
+    for m in marks.iter_mut() {
+        if let Some((ws, we)) = *m {
+            if we <= s {
+                // entirely before the edit — unchanged
+            } else if ws >= pe {
+                let nws = ws as isize + delta;
+                let nwe = we as isize + delta;
+                *m = (nws >= 0 && nwe >= 0).then_some((nws as usize, nwe as usize));
+            } else {
+                *m = None; // the edit landed inside this word
+            }
+        }
+    }
+}
+
+/// The byte span that differs between `prev` and `curr`, as
+/// `(start, prev_end, curr_end)`: `prev[start..prev_end]` became
+/// `curr[start..curr_end]`.
+fn changed_region(prev: &str, curr: &str) -> (usize, usize, usize) {
+    let (pb, cb) = (prev.as_bytes(), curr.as_bytes());
+    let max = pb.len().min(cb.len());
+    let mut s = 0;
+    while s < max && pb[s] == cb[s] {
+        s += 1;
+    }
+    let (mut pe, mut ce) = (pb.len(), cb.len());
+    while pe > s && ce > s && pb[pe - 1] == cb[ce - 1] {
+        pe -= 1;
+        ce -= 1;
+    }
+    (s, pe, ce)
 }
 
 fn notify_daemon() {
@@ -601,4 +805,42 @@ fn notify_daemon() {
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_region_finds_the_edit() {
+        assert_eq!(changed_region("abc", "aXc"), (1, 2, 2)); // replace
+        assert_eq!(changed_region("abc", "abXc"), (2, 2, 3)); // insert
+        assert_eq!(changed_region("abc", "ac"), (1, 2, 1)); // delete
+    }
+
+    #[test]
+    fn editing_a_word_drops_its_mark_and_shifts_later_ones() {
+        // marks for "the"(0,3) and "brown"(10,15) in "the quick brown".
+        let mut marks = vec![Some((0usize, 3usize)), Some((10usize, 15usize))];
+        update_marks(&mut marks, "the quick brown", "tXe quick brown");
+        assert_eq!(marks[0], None); // 'h' -> 'X' touched it
+        assert_eq!(marks[1], Some((10, 15))); // same-length edit before it
+    }
+
+    #[test]
+    fn an_insertion_before_a_word_shifts_its_mark() {
+        let mut marks = vec![Some((0usize, 3usize)), Some((10usize, 15usize))];
+        // insert "AB" at the start: the words are unchanged, just moved
+        // right by 2, so both marks shift and neither drops.
+        update_marks(&mut marks, "the quick brown", "ABthe quick brown");
+        assert_eq!(marks[0], Some((2, 5)));
+        assert_eq!(marks[1], Some((12, 17)));
+    }
+
+    #[test]
+    fn edits_after_a_mark_leave_it_untouched() {
+        let mut marks = vec![Some((0usize, 3usize))];
+        update_marks(&mut marks, "the quick", "the quickly");
+        assert_eq!(marks[0], Some((0, 3)));
+    }
 }
