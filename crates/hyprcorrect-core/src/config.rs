@@ -64,8 +64,8 @@ impl Default for Hotkeys {
     fn default() -> Self {
         Self {
             fix_word: "CTRL+SHIFT+ALT+SUPER+F".into(),
-            fix_sentence: String::new(),
-            review: String::new(),
+            fix_sentence: "CTRL+SHIFT+ALT+SUPER+S".into(),
+            review: "CTRL+SHIFT+ALT+SUPER+R".into(),
         }
     }
 }

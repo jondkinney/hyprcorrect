@@ -96,8 +96,8 @@ required.
 | Action | Default chord | What it does |
 |---|---|---|
 | **Fix last word** | `Ctrl+Shift+Alt+Super+F` | Backspaces the last word in the focused window's buffer, types the top suggestion from the *Default* provider. With LLM as default, the surrounding sentence is sent for context so homophones (`their` / `there`) can be disambiguated. Falls back to the clipboard / selection path when the buffer is empty. |
-| **Fix last sentence** | *(unbound)* | Sends the last sentence through the *Smart* provider (LLM, LanguageTool, or spellbook). Bind it in Preferences. |
-| **Review correction** | *(unbound)* | Same as above, but shows a popup with the proposed correction first. Press Enter to apply or Esc to cancel. |
+| **Fix last sentence** | `Ctrl+Shift+Alt+Super+S` | Sends the last sentence through the *Smart* provider (LLM, LanguageTool, or spellbook). |
+| **Review correction** | `Ctrl+Shift+Alt+Super+R` | Same as above, but shows a popup with the proposed correction first. Press Enter to apply or Esc to cancel. |
 
 Set `HYPRCORRECT_CHORD=CTRL+J` (for example) to override
 *fix-last-word* for one-off dev runs without editing the config.
