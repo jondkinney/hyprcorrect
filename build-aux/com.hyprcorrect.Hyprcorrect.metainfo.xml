@@ -34,6 +34,14 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.1.1" date="2026-05-28">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>make SVG square so AppStream/Flatpak accept it</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-05-27"/>
   </releases>
   <url type="homepage">https://hyprcorrect.com</url>
