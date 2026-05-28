@@ -1,10 +1,11 @@
-<!-- viewBox cropped tight around the Ab + squiggle so the content
-     fills the rasterized slot in the tray / sidebar edge-to-edge.
-     Strokes thickened so the mark holds visual weight at tray
-     sizes — at small scales a thinner stroke renders sub-pixel
-     and disappears, which is what made earlier versions look
-     light compared to neighbors. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 36 256 220">
+<!-- Square 256×256 viewBox with intrinsic width/height — matches
+     the vernier / mousehop / tensaku siblings. AppStream's icon
+     validator (`appstreamcli compose`) rejects non-square SVG
+     sources with `icon-file-read-error`, which broke the Flatpak
+     build of v0.1.0 when this had a tighter cropped non-square
+     viewBox. Intrinsic size also helps older toolkits / GtkImage
+     paths that can't parse a viewBox alone. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
   <!-- Adwaita-style spell-check mark: blue "Ab" with a squiggly
        underline. Transparent background so the icon picks up
        whichever surface it sits on (tray, prefs sidebar, launcher
