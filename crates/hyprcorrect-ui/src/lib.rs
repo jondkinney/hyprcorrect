@@ -15,6 +15,8 @@ mod docker;
 pub mod icon;
 mod prefs;
 mod review;
+mod vimedit;
+mod worddiff;
 
 /// Open the preferences window. Blocks until the user closes it.
 ///

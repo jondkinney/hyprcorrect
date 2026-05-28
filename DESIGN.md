@@ -349,12 +349,33 @@ hotkey:
 - `fix-last-sentence` — quick, no UI.
 - `review` — open the popup for the last word / N words / sentence.
 
-The **review popup** (egui): shows the text with flagged words marked;
-←/→ or Tab moves between flagged words, ↑/↓ cycles suggestions, Enter
-accepts the current word, a key applies all, Esc cancels. On Wayland it
-is an egui window plus a shipped Hyprland window rule (float/pin/focus)
-for MVP; a real `wlr-layer-shell` surface is a later upgrade. On macOS it
-is a borderless `NSPanel`.
+The **review popup** (egui) opens with the proposed correction shown as
+editable text and has two modes:
+
+- **Word-edit mode** (default): the words the corrector *changed* render
+  as inline single-line fields; unchanged words stay static. The first
+  changed word opens focused with its text selected, so typing replaces
+  it. `Tab`/`Shift+Tab` and `←`/`→` move between fields, `Enter` applies,
+  `Esc` cancels. A word-level LCS diff of original vs corrected decides
+  which words are editable (`hyprcorrect-ui/src/worddiff.rs`).
+- **Vim mode** (`Ctrl+E`): the whole sentence becomes a small modal
+  editor — a deliberate *subset* of vim, for when the correction is
+  wrong and needs free-form fixing. NORMAL/INSERT/COMMAND; motions
+  `h l w b e 0 ^ $ j k` / `gg` / `G`; edits `x r s S D C dd cc`;
+  operators `d`/`c` over those motions and the `iw`/`aw` text objects
+  (so `ciw`, `dw`, `daw`, with vim's `cw`==`ce`); leading counts.
+  `:w`/`:wq`/`:x` and normal-mode `Enter` apply; `:q`/`:q!` cancel;
+  INSERT `Enter` inserts a newline. It is a self-contained Rust state
+  machine (`hyprcorrect-ui/src/vimedit.rs`), **not** real nvim — chosen
+  to stay in-window, dependency-free, and identical on macOS.
+  **Out of scope (v1):** undo/redo, registers/yank/paste, visual mode,
+  `.` repeat, marks, search, ex ranges.
+
+On apply the popup writes the (possibly edited) sentence back into the
+review-request file and signals the daemon, which performs the emit. On
+Wayland it is an egui window plus a shipped Hyprland window rule
+(float/pin/focus) for MVP; a real `wlr-layer-shell` surface is a later
+upgrade. On macOS it is a borderless `NSPanel`.
 
 ## Configuration & GUI
 
@@ -428,7 +449,7 @@ Wayland protocols.
 | **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → per-window buffers driven by Hyprland focus events; offline spell-check provider (spellbook); `wtype`-based synthetic input; one hyprctl-bound hotkey signaling `SIGUSR1`; ksni tray; `fix-last-word` working end-to-end on Hyprland incl. terminals. No GUI. Proves the riskiest path. |
 | **M2 — macOS parity** | `CGEventTap` capture, `CGEvent` emulation, Carbon hotkey, TCC permission flow. `fix-last-word` on macOS. Core now runs on both. |
 | **M3 — Config GUI + tray** | egui prefs (Hotkeys / Providers / Behavior / Privacy / About) running standalone via `hyprcorrect prefs`; `config.toml` with serde defaults; `keyring`-backed LLM API key storage; ksni tray expanded with Pause/Resume + Open Preferences + Quit, live status refresh; pause control gates the daemon; `SIGHUP` config reload with safe trigger rebind; daemon PID file for targeted reload. (Linux landed first; the macOS side is a `NSStatusItem` tray + a cfg-gated focus call — the UI itself is platform-independent.) |
-| **M4 — Review popup + sentence mode** | egui popup with keyboard nav; `fix-last-sentence`; multi-word review/apply; LLM provider wired in. |
+| **M4 — Review popup + sentence mode** | egui popup with two edit modes — inline word-field editing and a `Ctrl+E` in-app vim subset — that writes the edited sentence back to the daemon for emit; `fix-last-sentence`; LLM provider wired in. |
 | **M5 — Selection fallback + polish** | Clipboard/selection secondary mode; per-app behavior; inter-key delay tuning; LanguageTool-HTTP provider; IME caveats handled. |
 | **M6 — Packaging** | AUR (source/-bin/-git like `vernier`), macOS dmg (ad-hoc signed), GitHub releases via `release-plz`. Windows remains a stub. |
 
