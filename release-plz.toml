@@ -8,7 +8,7 @@
 
 [workspace]
 # Release only when the release PR is merged — not on every push.
-release_always = false
+release_always = true
 # Libraries publish to crates.io but get no tag, Release, or changelog
 # of their own; the app crate below owns all three.
 git_tag_enable = false
