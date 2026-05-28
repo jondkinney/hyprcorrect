@@ -71,16 +71,16 @@ modules:
       - cargo fetch --manifest-path Cargo.toml --verbose
       - cargo build --release --bin hyprcorrect
       - install -Dm0755 target/release/hyprcorrect /app/bin/hyprcorrect
-      - install -Dm0644 assets/icons/hicolor/scalable/apps/hyprcorrect.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
-      # Install a pre-rendered hicolor PNG ladder from the repo
-      # instead of rasterizing at build time. Our SVG uses a
-      # `<text>` element with serif fallbacks (DejaVu Serif /
-      # Liberation Serif / etc.) that aren't installed in the
-      # freedesktop platform runtime — rsvg-convert there would
-      # silently emit fontless PNGs and `appstreamcli compose`
-      # rejected them with `icon-file-read-error`. The ladder is
-      # rasterized once on a developer machine where the fonts
-      # are available, then shipped under assets/icons/hicolor/.
+      # Install ONLY the pre-rendered hicolor PNG ladder. The
+      # scalable SVG is deliberately NOT installed in the Flatpak:
+      # our SVG uses a `<text>` element with serif fallbacks
+      # (DejaVu Serif / Liberation Serif / etc.) that aren't
+      # available in the freedesktop platform runtime, so
+      # `appstreamcli compose`'s image loader (glycin) fails with
+      # `file-read-error` on the SVG and rejects the whole bundle.
+      # The PNG ladder is pre-rasterized on a developer machine
+      # where the fonts ARE available (see assets/icons/), so the
+      # icons render correctly at every standard size.
       - |
         for size in 16 22 24 32 48 64 128 256 512; do
           install -Dm0644 \
