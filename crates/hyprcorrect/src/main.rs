@@ -86,6 +86,10 @@ fn run_install_desktop() {
         }
     };
 
+    // Mark the one-shot first-launch step done so the daemon doesn't
+    // redo it on the next start.
+    hyprcorrect_ui::autostart::mark_install_done();
+
     println!("Installed hyprcorrect desktop integration:");
     if let Some(icon) = icon {
         println!("  icon           {}", icon.display());
@@ -153,19 +157,16 @@ fn run_daemon() {
         eprintln!("hyprcorrect: could not write PID file ({e}) — prefs reload won't work");
     }
 
-    // Keep the per-user icon copy + applications-catalog entry in
-    // sync with the running binary on every daemon start. Walker /
-    // fuzzel / rofi index `~/.local/share/applications/` (NOT the
-    // autostart dir), so an out-of-date entry here is the most
-    // common cause of "Walker shows the old icon." Both files are
-    // best-effort — failures fall through silently.
-    if let Err(e) = hyprcorrect_ui::autostart::ensure_user_icon() {
-        eprintln!("hyprcorrect: could not refresh user icon ({e})");
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Err(e) = hyprcorrect_ui::autostart::ensure_apps_catalog_entry(&exe.to_string_lossy())
-    {
-        eprintln!("hyprcorrect: could not refresh apps-catalog entry ({e})");
+    // On the first launch only, register the icon + applications-
+    // catalog entry so a `cargo install`ed binary shows up in
+    // launchers (Walker / fuzzel / rofi index
+    // `~/.local/share/applications/`, NOT the autostart dir). One-shot
+    // via a marker in the XDG state dir; skipped inside Flatpak and
+    // when an AUR / distro package already provides the entry. Run
+    // `hyprcorrect install-desktop` to force a refresh — e.g. after a
+    // dev rebuild changes the icon.
+    if let Ok(exe) = std::env::current_exe() {
+        hyprcorrect_ui::autostart::ensure_first_launch(&exe.to_string_lossy());
     }
 
     // Register the review-popup's Wayland class as a floating window

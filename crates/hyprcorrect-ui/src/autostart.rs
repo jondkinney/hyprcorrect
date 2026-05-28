@@ -85,14 +85,11 @@ pub fn enable(exec_path: &str) -> io::Result<()> {
 /// Returns the path on success, `Ok(None)` if neither XDG_DATA_HOME
 /// nor HOME is set (rare) or a write fails.
 ///
-/// Public so the daemon can call this on every startup to keep
-/// Walker / other XDG launchers in sync with whatever SVG the
-/// currently-installed binary has compiled in.
+/// Public so the one-shot first-launch hook, the explicit
+/// `install-desktop` command, and the autostart toggle can all place
+/// the icon.
 pub fn ensure_user_icon() -> io::Result<Option<PathBuf>> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    let Some(base) = base else {
+    let Some(base) = data_home() else {
         return Ok(None);
     };
     let dir = base.join("icons/hicolor/scalable/apps");
@@ -114,14 +111,16 @@ pub fn ensure_user_icon() -> io::Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// Write/refresh the XDG application-catalog entry at
+/// Write the XDG application-catalog entry at
 /// `$XDG_DATA_HOME/applications/hyprcorrect.desktop` so launchers
 /// (Walker, fuzzel, rofi, KDE Krunner, GNOME Shell) find an entry
-/// pointing at the *currently-running* binary + the freshly-refreshed
-/// SVG. Without this, dev-build users see whichever stale entry was
-/// laid down by an earlier install / `cargo install` run; AUR users
-/// see the system-wide entry from `/usr/share/applications/` and the
-/// user-level file just shadows it transparently.
+/// pointing at the *currently-running* binary + the bundled SVG. This
+/// is what makes a `cargo install`ed binary appear in launchers.
+///
+/// Always writes when called directly (the explicit `install-desktop`
+/// path). The daemon reaches it through [`ensure_first_launch`], which
+/// skips when an AUR / distro package already ships the entry — so it
+/// never shadows a system install.
 ///
 /// `exec_path` is the path to the running binary (caller passes
 /// `std::env::current_exe()`). On any I/O hiccup we fall through
@@ -131,10 +130,7 @@ pub fn ensure_user_icon() -> io::Result<Option<PathBuf>> {
 ///
 /// I/O errors only.
 pub fn ensure_apps_catalog_entry(exec_path: &str) -> io::Result<Option<PathBuf>> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    let Some(base) = base else {
+    let Some(base) = data_home() else {
         return Ok(None);
     };
     let dir = base.join("applications");
@@ -158,6 +154,111 @@ pub fn ensure_apps_catalog_entry(exec_path: &str) -> io::Result<Option<PathBuf>>
     );
     fs::write(&path, contents)?;
     Ok(Some(path))
+}
+
+/// `$XDG_DATA_HOME`, falling back to `$HOME/.local/share`. `None`
+/// when neither is set (extremely rare on a normal Linux session).
+fn data_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
+/// The user-local application-catalog entry path
+/// (`$XDG_DATA_HOME/applications/hyprcorrect.desktop`).
+fn user_apps_entry() -> Option<PathBuf> {
+    Some(
+        data_home()?
+            .join("applications")
+            .join("hyprcorrect.desktop"),
+    )
+}
+
+/// One-shot marker for the first-launch desktop install:
+/// `$XDG_STATE_HOME/hyprcorrect/desktop-install-done` (or
+/// `$HOME/.local/state/...`). Its presence means the daemon's
+/// one-time first-launch integration has already run.
+fn first_launch_marker() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("hyprcorrect").join("desktop-install-done"))
+}
+
+/// Does a system XDG data dir already provide `hyprcorrect.desktop`?
+/// An AUR / distro / `make install` package drops it under
+/// `/usr/share/applications` (or `/usr/local/share/...`), in which
+/// case a user-local copy would only shadow it.
+fn packaged_entry_exists() -> bool {
+    let dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    std::env::split_paths(&dirs).any(|d| d.join("applications/hyprcorrect.desktop").is_file())
+}
+
+/// Install the icon + applications-catalog entry on the first daemon
+/// launch only, so a `cargo install`ed hyprcorrect appears in
+/// launchers without the user knowing to run `install-desktop`.
+///
+/// One-shot: a marker in the XDG state dir records that this ran, so
+/// it never repeats — not even if the user later removes the entry on
+/// purpose (a *first-launch* action happens once). Skipped inside
+/// Flatpak (the runtime ships the entry and sandboxed XDG dirs make a
+/// user-local copy pointless) and when a system package already
+/// provides the entry (the user-local copy would only shadow it).
+/// Best-effort: any failure is swallowed and retried next launch;
+/// `install-desktop` is the loud, explicit refresh path.
+///
+/// `exec_path` is the running binary (caller passes `current_exe()`).
+pub fn ensure_first_launch(exec_path: &str) {
+    let _ = try_ensure_first_launch(exec_path);
+}
+
+fn try_ensure_first_launch(exec_path: &str) -> io::Result<()> {
+    if std::env::var_os("FLATPAK_ID").is_some() {
+        return Ok(());
+    }
+    let Some(marker) = first_launch_marker() else {
+        return Ok(());
+    };
+    if marker.exists() {
+        return Ok(());
+    }
+
+    // Install only if nothing already provides the entry — neither an
+    // earlier `install-desktop` run nor a system package.
+    let already = user_apps_entry().is_some_and(|p| p.exists()) || packaged_entry_exists();
+    if !already {
+        ensure_user_icon()?;
+        ensure_apps_catalog_entry(exec_path)?;
+    }
+
+    // Record completion last, so a failed install above is retried on
+    // the next launch rather than marked done.
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &marker,
+        "hyprcorrect ran its one-time first-launch desktop integration.\n",
+    )
+}
+
+/// Record that the desktop integration is installed so the daemon's
+/// one-shot first-launch step won't redo it. Called after the explicit
+/// `install-desktop` command. Best-effort.
+pub fn mark_install_done() {
+    let Some(marker) = first_launch_marker() else {
+        return;
+    };
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(
+        &marker,
+        "hyprcorrect desktop integration installed via install-desktop.\n",
+    );
 }
 
 /// Remove the autostart file. Idempotent — a missing file is not
