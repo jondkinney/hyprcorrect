@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/jondkinney/hyprcorrect/compare/v0.1.2...v0.1.3) - 2026-05-28
+
+### Added
+
+- *(app)* add install-desktop subcommand for cargo-install users
+
+### Fixed
+
+- *(app)* gate install-desktop to Linux so macOS builds
+
+### Other
+
+- *(app)* install desktop integration once, not every daemon start
+
 ## [0.1.2](https://github.com/jondkinney/hyprcorrect/compare/v0.1.1...v0.1.2) - 2026-05-28
 
 ### Added
