@@ -1,11 +1,13 @@
-# hyprcorrect
+# HyprCorrect
 
 Keyboard-driven spelling and typo correction for the whole desktop.
-Press a hotkey and the word — or sentence — you just typed is checked
+Press a chord and the word — or sentence — you just typed is checked
 and fixed in place, in whatever app has focus, terminals included.
 
 Hyprland-first on Linux; macOS is a sibling target ([`DESIGN.md`](DESIGN.md)
 covers the platform interface). Windows is a stub.
+
+Site: <https://hyprcorrect.com>
 
 ## Highlights
 
@@ -13,20 +15,29 @@ covers the platform interface). Windows is a stub.
   switching windows doesn't poison the buffer of another, and
   returning to a window restores its prior state.
 - **Configurable chord(s)**: `fix-last-word`, `fix-last-sentence`,
-  and a `review` popup are each bindable to any Super/Ctrl/Shift/Alt
-  combination + a key.
+  and a `review` popup are each bindable to any
+  Ctrl / Shift / Alt / Super combination plus a key, recorded
+  directly in Preferences (the daemon mediates the recording over
+  IPC so Super-containing chords work too).
 - **Three correction providers**:
-  - `spellbook` — bundled, offline, instant (Hunspell-compatible).
-  - `llm` — Anthropic Messages API; key lives in the OS keychain.
-  - `languagetool` — POST to your own self-hosted server's
-    `/v2/check`.
-  Failures fall back to spellbook so the chord never silently no-ops.
+  - `spellbook` — bundled, offline, instant (Hunspell-compatible
+    en_US dictionary).
+  - `languagetool` — POST to a self-hosted LanguageTool server's
+    `/v2/check`. Preferences ships a one-click "Install with Docker"
+    convenience that pulls `erikvl87/languagetool` and runs it
+    locally on the port in your URL.
+  - `llm` — Anthropic Messages API (Haiku by default); the key
+    lives in the OS keychain.
+
+  Any provider failure (no key, network error, LanguageTool down)
+  falls back to spellbook and fires a desktop toast so the chord
+  never silently no-ops.
 - **Privacy blocklist** — pick running apps from a dropdown
-  (populated from `hyprctl clients`) whose keys should never be
-  buffered.
+  (populated from `hyprctl clients`, with `.desktop` icons and
+  display names) whose keys should never be buffered.
 - **Pause control + clean shutdown** from the tray; the daemon
-  uninstalls its Hyprland keybind on exit and removes its PID file
-  so dev rebuilds don't accumulate stale binds.
+  uninstalls its Hyprland keybind on exit and removes its PID
+  file so dev rebuilds don't accumulate stale binds.
 
 ## Install
 
@@ -40,8 +51,9 @@ yay -S hyprcorrect-bin      # prebuilt binary from the GitHub release
 yay -S hyprcorrect-git      # tracks main
 ```
 
-PKGBUILDs live in [`packaging/aur/`](packaging/aur), `packaging/aur-bin/`,
-and `packaging/aur-git/`.
+PKGBUILDs live in [`packaging/aur/`](packaging/aur),
+[`packaging/aur-bin/`](packaging/aur-bin), and
+[`packaging/aur-git/`](packaging/aur-git).
 
 ### From source
 
@@ -55,7 +67,8 @@ cargo install --path crates/hyprcorrect
 You also need the runtime dependencies the AUR packages declare:
 `wtype`, `hyprland`, `libxkbcommon`, `libsecret`, `wayland`,
 `libglvnd`, `fontconfig`, `freetype2`. `wl-clipboard` is optional
-(enables the empty-buffer clipboard fallback).
+(enables the empty-buffer clipboard fallback). Rust 1.85+ is
+required.
 
 ## Setup
 
@@ -69,41 +82,53 @@ You also need the runtime dependencies the AUR packages declare:
    …and log back in. (`getent group input` should now show your
    user.)
 
-2. **Start the daemon.** Run `hyprcorrect` in a terminal, or have
-   your session manager autostart it
-   (`hyprcorrect.desktop` ships with `X-GNOME-Autostart-enabled=true`).
+2. **Start the daemon.** Run `hyprcorrect` in a terminal, or enable
+   *Behavior → Start at login* in Preferences — that drops a
+   `~/.config/autostart/hyprcorrect.desktop` entry so the daemon
+   launches with your session.
 
-3. **Press Super+Ctrl+Shift+Alt+F** in any window to fix the last
-   word. The default chord is configurable in
-   *Preferences → Hotkeys* (Right-click the tray icon → Open
-   Preferences…).
+3. **Press Ctrl+Shift+Alt+Super+F** in any window to fix the last
+   word. The default chord is configurable in *Preferences →
+   Hotkeys* (right-click the tray icon → *Open Preferences…*).
 
 ## Usage
 
 | Action | Default chord | What it does |
 |---|---|---|
-| **Fix last word** | `Super+Ctrl+Shift+Alt+F` | Backspaces the last word in the focused window's buffer, types the top spellbook suggestion. Falls back to the clipboard / selection path when the buffer is empty. |
-| **Fix last sentence** | *(unbound)* | Sends the last sentence through the *Smart provider* (LLM, LanguageTool, or spellbook). Bind it in Preferences. |
+| **Fix last word** | `Ctrl+Shift+Alt+Super+F` | Backspaces the last word in the focused window's buffer, types the top suggestion from the *Default* provider. With LLM as default, the surrounding sentence is sent for context so homophones (`their` / `there`) can be disambiguated. Falls back to the clipboard / selection path when the buffer is empty. |
+| **Fix last sentence** | *(unbound)* | Sends the last sentence through the *Smart* provider (LLM, LanguageTool, or spellbook). Bind it in Preferences. |
 | **Review correction** | *(unbound)* | Same as above, but shows a popup with the proposed correction first. Press Enter to apply or Esc to cancel. |
 
-The trigger letter override `$HYPRCORRECT_CHORD="SUPER+CTRL+J"` is
-honored for one-off dev runs without editing the config.
+Set `HYPRCORRECT_CHORD=CTRL+J` (for example) to override
+*fix-last-word* for one-off dev runs without editing the config.
 
 ## Preferences
 
-Run `hyprcorrect prefs` or click "Open Preferences…" in the tray.
+Run `hyprcorrect prefs` or click *Open Preferences…* in the tray.
 
-- **Hotkeys** — record chord(s) for each action.
-- **Providers** — pick the default and smart providers, configure
-  the LLM (model + API key) and LanguageTool (URL).
-- **Behavior** — `inter_key_delay_ms` slider (raise it if some app
-  drops characters under wtype's default fast speed).
-- **Privacy** — app blocklist; the dropdown lists running window
-  classes from `hyprctl clients`.
-- **About** — version + source + license links.
+- **Hotkeys** — record a chord for each action by clicking the chip
+  and pressing the combo (Esc cancels). The daemon temporarily
+  releases its bind during capture so the chord you're recording
+  isn't intercepted.
+- **Providers** — pick the *Default* and *Smart* providers,
+  configure the LLM (backend, model, API key — stored in the OS
+  keychain) and LanguageTool (URL plus the one-click Docker
+  installer).
+- **Behavior** — *Start at login* toggle; *Pause per backspace*
+  slider (0–30 ms, default 8 ms; raise it if a slow app leaves a
+  prefix of the original on screen after a fix); *Buffer reset
+  keys* — checkboxes for Enter, Tab, Esc, the arrow keys, Page
+  Up/Down, forward Delete, and Insert, which let you choose which
+  keys clear the per-window typing buffer.
+- **Privacy** — app blocklist. The dropdown shows window classes
+  reported by `hyprctl clients`, with icons and display names
+  resolved from your `.desktop` registry; there's also a manual
+  text-entry field for apps that aren't running yet.
+- **About** — version, source link, license.
 
-Save sends `SIGHUP` to the running daemon, which reloads everything
-without a restart.
+Save writes the config to disk, persists the API key to the OS
+keychain, and sends `SIGHUP` to the running daemon so it picks up
+the change without a restart.
 
 ## Troubleshooting
 
@@ -112,33 +137,28 @@ without a restart.
 `hyprctl binds | grep hyprcorrect`. If the chord echoes its raw
 escape sequence (e.g. `^[[102;8u`) into a terminal, Hyprland isn't
 intercepting it — make sure the daemon has been signaled to install
-the bind (re-save from prefs, or restart).
+the bind (re-save from Preferences, or restart the daemon).
 
 **Capture sees no keys.** Verify you're in the `input` group:
 `groups | grep input`. The session group list is set at login —
 `sudo usermod -aG input "$USER"` requires logging out and back in.
 The daemon prints a clear error if it can't read `/dev/input/event*`.
 
-**Tray icon disappears when paused.** Fixed — the daemon stays
-`Status::Active` and swaps the icon glyph instead of using the SNI
-"this isn't important" hint that Waybar hides by default.
+**Tray icon disappears when paused.** The daemon stays SNI-active
+and swaps the icon glyph instead of using the "this isn't
+important" hint that Waybar hides by default — so Pause keeps the
+tray entry visible.
 
-**The chord chip in Preferences can't capture Super combos.**
-egui-winit on Linux/Wayland doesn't surface the Super key in its
-`Modifiers` struct, so the in-app chord-capture chip will only
-record `Ctrl` / `Shift` / `Alt`. The daemon temporarily releases
-its bind during capture so you *can* re-record the existing
-Super+Ctrl+Shift+Alt+F default — just press the same combo. For
-fresh Super combos that aren't already bound, edit
-`~/.config/hyprcorrect/config.toml` directly:
+**Provider failed silently.** Provider errors (LLM network failure,
+missing API key, LanguageTool unreachable) raise a desktop
+notification via `notify-send` and the daemon falls back to
+spellbook. Install `libnotify` if no toast appears.
 
-```toml
-[hotkeys]
-fix_word = "SUPER+R"
-```
-
-The daemon will re-bind on the next Save in Preferences (or a
-SIGHUP).
+**LanguageTool URL maps to the wrong port.** The Docker installer
+parses the host port out of *Providers → LanguageTool → URL* — so
+set the URL first (e.g. `http://localhost:8081`), then click
+*Install with Docker*. The button is disabled until the URL has
+an explicit port.
 
 ## Architecture
 
@@ -146,16 +166,16 @@ The full design — per-OS interface contract, signal protocol, IPC
 shape — is in [`DESIGN.md`](DESIGN.md). Briefly:
 
 - A **4-crate workspace**: `hyprcorrect-core` (pure logic),
-  `hyprcorrect-platform` (per-OS capture/emit/hotkey/tray/focus),
-  `hyprcorrect-ui` (platform-independent egui),
+  `hyprcorrect-platform` (per-OS capture / emit / hotkey / tray /
+  focus), `hyprcorrect-ui` (platform-independent egui),
   `hyprcorrect` (the binary).
-- Linux M3+: `evdev` capture, `xkbcommon` translation, per-window
+- Linux: `evdev` capture, `xkbcommon` translation, per-window
   buffers via Hyprland IPC, `wtype` emit, `hyprctl keyword bind`
-  for the chord (signals `SIGUSR1` with a discriminator action
-  file), `ksni` tray, `keyring` for secrets, egui prefs.
-- macOS M2 is the contract on the Linux side: the platform
-  modules mirror the same interface using `CGEventTap`,
-  `RegisterEventHotKey`, and `NSStatusItem`.
+  for the chord (whose `exec` raises `SIGUSR1` on the daemon),
+  `ksni` tray, `keyring` for secrets, egui prefs.
+- macOS is on the contract side of the Linux implementation: the
+  platform modules will mirror the same interface using
+  `CGEventTap`, `RegisterEventHotKey`, and `NSStatusItem`.
 
 ## License
 
