@@ -66,10 +66,14 @@ pub enum Mode {
 #[derive(Debug)]
 pub struct VimEdit {
     text: String,
-    /// Byte offset into `text`; always a char boundary. In NORMAL mode
-    /// it sits *on* a character (never on a `\n` or past the last char
-    /// of a non-empty line); INSERT mode allows end-of-line.
+    /// Byte offset into `text`; always a char boundary. With
+    /// virtualedit the NORMAL-mode caret may sit at end-of-line (one
+    /// past the last char), like INSERT mode.
     cursor: usize,
+    /// Desired visual column (chars from line start) for vertical
+    /// motion — vim's `curswant`. `j`/`k` aim for this column so moving
+    /// down through a short line and back up restores the column.
+    vcol: usize,
     mode: Mode,
     /// The `:`-command being typed (includes the leading `:`), valid
     /// only in [`Mode::Command`].
@@ -97,6 +101,7 @@ impl VimEdit {
         let mut v = Self {
             text,
             cursor: 0,
+            vcol: 0,
             mode: Mode::Normal,
             cmdline: String::new(),
             status: None,
@@ -111,6 +116,7 @@ impl VimEdit {
             v.cursor -= 1;
         }
         v.clamp_normal();
+        v.vcol = v.col(v.cursor);
         v
     }
 
@@ -172,6 +178,7 @@ impl VimEdit {
             self.await_g = false;
             if matches!(key, VimKey::Char('g')) {
                 self.cursor = 0;
+                self.vcol = 0;
                 self.clamp_normal();
             }
             self.reset_pending();
@@ -332,6 +339,7 @@ impl VimEdit {
 
     fn move_motion(&mut self, c: char) {
         let n = self.count.take().unwrap_or(1);
+        let vertical = matches!(c, 'j' | 'k');
         let mut p = self.cursor;
         match c {
             'h' => {
@@ -359,14 +367,24 @@ impl VimEdit {
                     p = self.next_word_end(p);
                 }
             }
+            // j/k aim for the preserved desired column (`vcol`), so
+            // descending through a short line and back up keeps it.
             'j' => {
                 for _ in 0..n {
-                    p = self.line_down(p);
+                    let le = self.line_end(p);
+                    if le >= self.text.len() {
+                        break;
+                    }
+                    p = self.place_col(le + 1, self.vcol);
                 }
             }
             'k' => {
                 for _ in 0..n {
-                    p = self.line_up(p);
+                    let ls = self.line_start(p);
+                    if ls == 0 {
+                        break;
+                    }
+                    p = self.place_col(self.line_start(ls - 1), self.vcol);
                 }
             }
             '0' => p = self.line_start(p),
@@ -377,6 +395,9 @@ impl VimEdit {
         }
         self.cursor = p;
         self.clamp_normal();
+        if !vertical {
+            self.vcol = self.col(self.cursor);
+        }
     }
 
     /// The byte range an operator should act over for `motion`,
@@ -435,6 +456,7 @@ impl VimEdit {
             self.mode = Mode::Insert;
         } else {
             self.clamp_normal();
+            self.vcol = self.col(self.cursor);
         }
     }
 
@@ -463,6 +485,7 @@ impl VimEdit {
             self.text.replace_range(start..end, "");
             self.cursor = self.line_start(start.min(self.text.len()));
             self.clamp_normal();
+            self.vcol = self.col(self.cursor);
         }
     }
 
@@ -482,6 +505,7 @@ impl VimEdit {
             self.text.replace_range(start..end, "");
             self.cursor = start.min(self.text.len());
             self.clamp_normal();
+            self.vcol = self.col(self.cursor);
         }
     }
 
@@ -503,6 +527,7 @@ impl VimEdit {
         // Land on the last replaced char (vim leaves the cursor there).
         self.cursor = self.cursor + repl_len - c.len_utf8();
         self.clamp_normal();
+        self.vcol = self.col(self.cursor);
     }
 
     // ----------------------------------------------------------------
@@ -519,6 +544,7 @@ impl VimEdit {
                     self.cursor = self.prev_boundary(self.cursor);
                 }
                 self.clamp_normal();
+                self.vcol = self.col(self.cursor);
             }
             VimKey::Enter => {
                 self.text.insert(self.cursor, '\n');
@@ -585,13 +611,15 @@ impl VimEdit {
     // cursor / line / word geometry (all return char boundaries)
     // ----------------------------------------------------------------
 
-    /// Keep the NORMAL-mode cursor on a char boundary and never past
-    /// the last character of its line.
+    /// Keep the cursor on a char boundary and within its line. With
+    /// virtualedit the NORMAL-mode caret may rest at end-of-line (one
+    /// past the last char), so we clamp to the line end, not the last
+    /// character.
     fn clamp_normal(&mut self) {
         while self.cursor > 0 && !self.text.is_char_boundary(self.cursor) {
             self.cursor -= 1;
         }
-        let last = self.line_last_char(self.cursor);
+        let last = self.line_end(self.cursor);
         if self.cursor > last {
             self.cursor = last;
         }
@@ -652,10 +680,11 @@ impl VimEdit {
         }
     }
 
-    /// NORMAL-mode `l`: stops on the last char of the line.
+    /// NORMAL-mode `l`: with virtualedit it may reach end-of-line (one
+    /// past the last char).
     fn step_right_on_line(&self, pos: usize) -> usize {
-        let last = self.line_last_char(pos);
-        if pos < last {
+        let end = self.line_end(pos);
+        if pos < end {
             self.next_boundary(pos)
         } else {
             pos
@@ -1064,5 +1093,31 @@ mod tests {
         assert_eq!(v.cursor(), 5); // 'e' on line 2, same column
         feed(&mut v, "k");
         assert_eq!(v.cursor(), 1); // back to 'b'
+    }
+
+    #[test]
+    fn l_reaches_end_of_line_with_virtualedit() {
+        let mut v = VimEdit::new("ab".into(), 0);
+        feed(&mut v, "l");
+        assert_eq!(v.cursor(), 1);
+        feed(&mut v, "l");
+        assert_eq!(v.cursor(), 2); // one past the last char (EOL)
+        feed(&mut v, "l");
+        assert_eq!(v.cursor(), 2); // stays at EOL
+    }
+
+    #[test]
+    fn vertical_motion_preserves_desired_column() {
+        // Column 8 on a long line, down through a short line, down to a
+        // long line — the column is restored (vim's curswant).
+        let mut v = VimEdit::new("hello world\nhi\ngoodbye all".into(), 0);
+        for _ in 0..8 {
+            feed(&mut v, "l");
+        }
+        assert_eq!(v.cursor(), 8);
+        feed(&mut v, "j"); // line 2 "hi" is short → land at its end
+        assert!((12..=14).contains(&v.cursor()));
+        feed(&mut v, "j"); // line 3 is long → column 8 restored
+        assert_eq!(v.cursor(), 15 + 8);
     }
 }
