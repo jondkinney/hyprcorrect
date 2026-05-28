@@ -60,8 +60,12 @@ fn main() {
 /// `~/.cargo/bin` — no icon, no `.desktop` entry — so a crates.io
 /// install wouldn't surface in launchers or file managers. This is
 /// the loud, explicit path to register it; the daemon performs the
-/// same writes silently on every start, so AUR / autostart users
-/// never need to run it.
+/// same write on first launch, so AUR / autostart users never need
+/// to run it.
+///
+/// XDG desktop entries are a Linux concept; the `autostart` module
+/// that backs this is Linux-only, so the non-Linux build gets a stub.
+#[cfg(target_os = "linux")]
 fn run_install_desktop() {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -99,6 +103,14 @@ fn run_install_desktop() {
     }
     println!();
     println!("hyprcorrect should now appear in your application launcher.");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_install_desktop() {
+    eprintln!(
+        "hyprcorrect: install-desktop writes XDG `.desktop` + icon files \
+         and is Linux-only so far — macOS support is milestone M2."
+    );
 }
 
 /// Run the background daemon: load config, register the trigger,
