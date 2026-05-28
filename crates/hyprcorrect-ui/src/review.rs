@@ -100,6 +100,9 @@ struct ReviewApp {
     /// `Some` until the user edits within it (then `None`) — drives the
     /// blue squiggles in vim mode.
     vim_marks: Vec<Option<(usize, usize)>>,
+    /// Index into the focused field's suggestion dropdown that is
+    /// highlighted via Up/Down, or `None` when nothing is highlighted.
+    dropdown_highlight: Option<usize>,
 }
 
 impl ReviewApp {
@@ -122,7 +125,56 @@ impl ReviewApp {
             initialized: false,
             vim: None,
             vim_marks: Vec::new(),
+            dropdown_highlight: None,
         }
+    }
+
+    /// Ranked backup options to show for the focused field `ordinal`,
+    /// minus whatever equals the field's current text, capped at 5.
+    /// Pairs by position (daemon emits left-to-right, matching the
+    /// fields); if the counts ever drift it matches by word instead.
+    fn options_for_field(&self, ordinal: usize, current: &str) -> Vec<String> {
+        let aligned = self.request.suggestions.len() == self.field_segments.len();
+        let chosen = if aligned {
+            self.request.suggestions.get(ordinal)
+        } else {
+            self.request
+                .suggestions
+                .iter()
+                .find(|ws| ws.word == current)
+                .or_else(|| self.request.suggestions.get(ordinal))
+        };
+        chosen
+            .map(|ws| {
+                ws.options
+                    .iter()
+                    .filter(|o| o.as_str() != current)
+                    .take(5)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The current text of editable field `ordinal`.
+    fn field_word(&self, ordinal: usize) -> String {
+        self.field_segments
+            .get(ordinal)
+            .and_then(|&seg| self.segments.get(seg))
+            .map(|s| s.text().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Replace field `ordinal`'s text with `option`, re-focus it (so the
+    /// new word is selected and typing replaces), and close the dropdown.
+    fn insert_suggestion(&mut self, ordinal: usize, option: &str) {
+        if let Some(&seg) = self.field_segments.get(ordinal) {
+            if let Some(Segment::Field(t)) = self.segments.get_mut(seg) {
+                *t = option.to_string();
+            }
+        }
+        self.pending_focus = Some(ordinal);
+        self.dropdown_highlight = None;
     }
 
     /// Commit the (possibly edited) sentence and close. The actual
@@ -173,6 +225,7 @@ impl ReviewApp {
         let cur = self.focused_field.unwrap_or(0) as isize;
         let next = (cur + delta).rem_euclid(len as isize) as usize;
         self.pending_focus = Some(next);
+        self.dropdown_highlight = None;
     }
 
     // ---- word-edit mode -------------------------------------------
@@ -182,6 +235,52 @@ impl ReviewApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
             self.enter_vim();
             return;
+        }
+
+        // Suggestion dropdown for the focused field — handled before the
+        // field-level Enter/Esc/arrows. Down/Up highlight, Enter inserts
+        // the highlight, 1–5 insert directly (only while the field is
+        // still fully selected, so digits don't hijack normal typing),
+        // Esc closes the dropdown.
+        if let Some(ord) = self.focused_field {
+            let current = self.field_word(ord);
+            let opts = self.options_for_field(ord, &current);
+            if !opts.is_empty() {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                    let next = self
+                        .dropdown_highlight
+                        .map_or(0, |h| (h + 1).min(opts.len() - 1));
+                    self.dropdown_highlight = Some(next);
+                    return;
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                    self.dropdown_highlight = match self.dropdown_highlight {
+                        Some(0) | None => None,
+                        Some(h) => Some(h - 1),
+                    };
+                    return;
+                }
+                let pristine = self.focus_caret.map(|(_, _, sel)| sel).unwrap_or(false);
+                if pristine {
+                    for d in 1..=opts.len().min(5) {
+                        if take_digit(ctx, d) {
+                            self.insert_suggestion(ord, &opts[d - 1]);
+                            return;
+                        }
+                    }
+                }
+                if let Some(h) = self.dropdown_highlight {
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                        let opt = opts[h].clone();
+                        self.insert_suggestion(ord, &opt);
+                        return;
+                    }
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        self.dropdown_highlight = None;
+                        return;
+                    }
+                }
+            }
         }
 
         let (enter, esc) = ctx.input(|i| {
@@ -253,6 +352,7 @@ impl ReviewApp {
         let pending = self.pending_focus;
         let mut new_focused: Option<usize> = None;
         let mut new_caret: Option<(usize, usize, bool)> = None;
+        let mut focused_rect: Option<egui::Rect> = None;
         let mut consumed_pending = false;
         let segments = &mut self.segments;
         let font = prose_font();
@@ -291,6 +391,9 @@ impl ReviewApp {
                             // Blue squiggle marks the correction / tab target.
                             let rect = out.response.rect;
                             let focused = out.response.has_focus() || pending == Some(this_ord);
+                            if focused {
+                                focused_rect = Some(rect);
+                            }
                             let col = if focused {
                                 SQUIGGLE_BLUE
                             } else {
@@ -330,6 +433,19 @@ impl ReviewApp {
         }
         self.focused_field = new_focused;
         self.focus_caret = new_caret;
+
+        // Auto-expanded backup-suggestion dropdown under the focused field.
+        if let (Some(ord), Some(rect)) = (self.focused_field, focused_rect) {
+            let current = self.field_word(ord);
+            let opts = self.options_for_field(ord, &current);
+            if !opts.is_empty() {
+                if let Some(pick) =
+                    render_suggestion_dropdown(ui, rect, &opts, self.dropdown_highlight)
+                {
+                    self.insert_suggestion(ord, &opts[pick]);
+                }
+            }
+        }
     }
 
     // ---- vim mode -------------------------------------------------
@@ -752,6 +868,64 @@ fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: egui::Colo
         x += STEP;
     }
     painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4, color)));
+}
+
+/// Render the auto-expanded suggestion list as a floating panel just
+/// below `anchor` (the focused field). Returns the clicked option index.
+fn render_suggestion_dropdown(
+    ui: &egui::Ui,
+    anchor: egui::Rect,
+    options: &[String],
+    highlight: Option<usize>,
+) -> Option<usize> {
+    let mut clicked = None;
+    egui::Area::new(egui::Id::new("hc_suggestion_dropdown"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor.left_bottom() + egui::vec2(0.0, 6.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(CARD_BG)
+                .corner_radius(egui::CornerRadius::same(6))
+                .show(ui, |ui| {
+                    ui.set_min_width(170.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (i, opt) in options.iter().enumerate() {
+                        let label = egui::RichText::new(format!("{}   {opt}", i + 1))
+                            .font(prose_font())
+                            .color(TEXT_FG);
+                        if ui.selectable_label(highlight == Some(i), label).clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+        });
+    clicked
+}
+
+/// If digit `d` (1–5) was pressed, consume both its key and text events
+/// (so it never lands in the focused field) and return `true`. Lets a
+/// bare number key pick a suggestion without hijacking normal typing —
+/// the caller only invokes this while the field is freshly selected.
+fn take_digit(ctx: &egui::Context, d: usize) -> bool {
+    let key = match d {
+        1 => egui::Key::Num1,
+        2 => egui::Key::Num2,
+        3 => egui::Key::Num3,
+        4 => egui::Key::Num4,
+        5 => egui::Key::Num5,
+        _ => return false,
+    };
+    let digit = d.to_string();
+    ctx.input_mut(|i| {
+        if !i.key_pressed(key) {
+            return false;
+        }
+        i.events.retain(|e| {
+            !matches!(e, egui::Event::Key { key: k, pressed: true, .. } if *k == key)
+                && !matches!(e, egui::Event::Text(t) if *t == digit)
+        });
+        true
+    })
 }
 
 /// Adjust vim-mode squiggle marks after an edit turned `prev` into
