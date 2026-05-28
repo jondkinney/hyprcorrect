@@ -55,6 +55,20 @@ PKGBUILDs live in [`packaging/aur/`](packaging/aur),
 [`packaging/aur-bin/`](packaging/aur-bin), and
 [`packaging/aur-git/`](packaging/aur-git).
 
+### From crates.io
+
+```sh
+cargo install hyprcorrect
+hyprcorrect install-desktop   # register the icon + launcher entry
+```
+
+`cargo install` drops only the binary in `~/.cargo/bin`, so
+`install-desktop` writes the app icon and `.desktop` entry into your
+XDG data dir to make hyprcorrect appear in launchers and file
+managers. (The daemon does this on every start too, so it's optional
+— but it's the one explicit step for a launcher entry before the
+first run.)
+
 ### From source
 
 ```sh

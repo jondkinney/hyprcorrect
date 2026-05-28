@@ -27,6 +27,12 @@ enum Command {
     Review,
     /// Open the preferences window.
     Prefs,
+    /// Install the desktop entry and app icon into the XDG data
+    /// directory, then exit — without starting the daemon. The
+    /// daemon does this on every start anyway, so this is only
+    /// needed to register a freshly `cargo install`ed binary with
+    /// app launchers before its first run.
+    InstallDesktop,
 }
 
 fn main() {
@@ -43,7 +49,52 @@ fn main() {
         Some(Command::FixSentence) => not_yet("fix-sentence as a CLI subcommand", "M5"),
         Some(Command::Review) => hyprcorrect_ui::run_review(),
         Some(Command::Prefs) => hyprcorrect_ui::run_preferences(),
+        Some(Command::InstallDesktop) => run_install_desktop(),
     }
+}
+
+/// `install-desktop`: write the app icon + application-catalog entry
+/// into the user's XDG data dir and report what landed.
+///
+/// `cargo install hyprcorrect` places only the executable in
+/// `~/.cargo/bin` — no icon, no `.desktop` entry — so a crates.io
+/// install wouldn't surface in launchers or file managers. This is
+/// the loud, explicit path to register it; the daemon performs the
+/// same writes silently on every start, so AUR / autostart users
+/// never need to run it.
+fn run_install_desktop() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hyprcorrect: could not locate the running binary: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let icon = match hyprcorrect_ui::autostart::ensure_user_icon() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hyprcorrect: could not install app icon: {e}");
+            std::process::exit(1);
+        }
+    };
+    let entry = match hyprcorrect_ui::autostart::ensure_apps_catalog_entry(&exe.to_string_lossy()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hyprcorrect: could not install desktop entry: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("Installed hyprcorrect desktop integration:");
+    if let Some(icon) = icon {
+        println!("  icon           {}", icon.display());
+    }
+    if let Some(entry) = entry {
+        println!("  desktop entry  {}", entry.display());
+    }
+    println!();
+    println!("hyprcorrect should now appear in your application launcher.");
 }
 
 /// Run the background daemon: load config, register the trigger,
