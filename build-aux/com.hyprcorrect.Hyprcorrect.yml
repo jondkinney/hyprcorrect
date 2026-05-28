@@ -71,17 +71,21 @@ modules:
       - cargo fetch --manifest-path Cargo.toml --verbose
       - cargo build --release --bin hyprcorrect
       - install -Dm0755 target/release/hyprcorrect /app/bin/hyprcorrect
-      - install -Dm0644 crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
-      # Render a hicolor PNG ladder from the source SVG so hosts that
-      # prefer fixed-size raster icons get a sharp render without
-      # scaling the SVG at runtime. rsvg-convert ships with the
-      # freedesktop runtime.
+      - install -Dm0644 assets/icons/hicolor/scalable/apps/hyprcorrect.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      # Install a pre-rendered hicolor PNG ladder from the repo
+      # instead of rasterizing at build time. Our SVG uses a
+      # `<text>` element with serif fallbacks (DejaVu Serif /
+      # Liberation Serif / etc.) that aren't installed in the
+      # freedesktop platform runtime — rsvg-convert there would
+      # silently emit fontless PNGs and `appstreamcli compose`
+      # rejected them with `icon-file-read-error`. The ladder is
+      # rasterized once on a developer machine where the fonts
+      # are available, then shipped under assets/icons/hicolor/.
       - |
         for size in 16 22 24 32 48 64 128 256 512; do
-          install -d ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps
-          rsvg-convert -w $size -h $size \
-            crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect.svg \
-            -o ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
+          install -Dm0644 \
+            assets/icons/hicolor/${size}x${size}/apps/hyprcorrect.png \
+            ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/${FLATPAK_ID}.png
         done
       - install -Dm0644 packaging/hyprcorrect.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       # The shipped desktop file uses `Icon=hyprcorrect` and `Exec=hyprcorrect prefs`

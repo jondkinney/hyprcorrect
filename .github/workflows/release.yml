@@ -80,14 +80,22 @@ jobs:
           VERSION="${{ steps.tag.outputs.version }}"
           NAME="hyprcorrect-${VERSION}-x86_64"
           STAGE="$RUNNER_TEMP/$NAME"
-          install -d "$STAGE/icons/hicolor/scalable/apps"
           install -m755 target/release/hyprcorrect             "$STAGE/hyprcorrect"
           install -m644 packaging/hyprcorrect.desktop          "$STAGE/hyprcorrect.desktop"
-          install -m644 crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect.svg \
-                                                               "$STAGE/icons/hicolor/scalable/apps/hyprcorrect.svg"
           install -m644 README.md                              "$STAGE/README.md"
           install -m644 LICENSE-MIT                            "$STAGE/LICENSE-MIT"
           install -m644 LICENSE-APACHE                         "$STAGE/LICENSE-APACHE"
+          # Ship the hicolor PNG ladder + scalable SVG, mirroring
+          # what the AUR install drops under /usr/share/icons. The
+          # PNGs are pre-rendered in-repo (see assets/icons/) so
+          # consumers don't need rsvg-convert with our fonts to make
+          # the icon resolve.
+          install -Dm644 assets/icons/hicolor/scalable/apps/hyprcorrect.svg \
+                        "$STAGE/icons/hicolor/scalable/apps/hyprcorrect.svg"
+          for size in 16 22 24 32 48 64 128 256 512; do
+            install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/hyprcorrect.png" \
+                          "$STAGE/icons/hicolor/${size}x${size}/apps/hyprcorrect.png"
+          done
           TARBALL="$RUNNER_TEMP/$NAME.tar.gz"
           tar -C "$RUNNER_TEMP" -czf "$TARBALL" "$NAME"
           sha256sum "$TARBALL"
@@ -153,14 +161,22 @@ jobs:
           VERSION="${{ steps.tag.outputs.version }}"
           NAME="hyprcorrect-${VERSION}-aarch64"
           STAGE="$RUNNER_TEMP/$NAME"
-          install -d "$STAGE/icons/hicolor/scalable/apps"
           install -m755 target/release/hyprcorrect             "$STAGE/hyprcorrect"
           install -m644 packaging/hyprcorrect.desktop          "$STAGE/hyprcorrect.desktop"
-          install -m644 crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect.svg \
-                                                               "$STAGE/icons/hicolor/scalable/apps/hyprcorrect.svg"
           install -m644 README.md                              "$STAGE/README.md"
           install -m644 LICENSE-MIT                            "$STAGE/LICENSE-MIT"
           install -m644 LICENSE-APACHE                         "$STAGE/LICENSE-APACHE"
+          # Ship the hicolor PNG ladder + scalable SVG, mirroring
+          # what the AUR install drops under /usr/share/icons. The
+          # PNGs are pre-rendered in-repo (see assets/icons/) so
+          # consumers don't need rsvg-convert with our fonts to make
+          # the icon resolve.
+          install -Dm644 assets/icons/hicolor/scalable/apps/hyprcorrect.svg \
+                        "$STAGE/icons/hicolor/scalable/apps/hyprcorrect.svg"
+          for size in 16 22 24 32 48 64 128 256 512; do
+            install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/hyprcorrect.png" \
+                          "$STAGE/icons/hicolor/${size}x${size}/apps/hyprcorrect.png"
+          done
           TARBALL="$RUNNER_TEMP/$NAME.tar.gz"
           tar -C "$RUNNER_TEMP" -czf "$TARBALL" "$NAME"
           sha256sum "$TARBALL"
