@@ -1319,8 +1319,8 @@ fn start_review(
     let Some(at) = buffer.sentence_at_caret() else {
         return;
     };
-    let (corrected, _used_provider) =
-        correct_sentence(&at.sentence, smart, llm, languagetool, provider);
+    let (corrected, _used_provider, suggestions) =
+        correct_sentence_with_suggestions(&at.sentence, smart, llm, languagetool, provider);
     eprintln!(
         "hyprcorrect: review-build — original ({} chars): {:?}",
         at.sentence.chars().count(),
@@ -1331,9 +1331,10 @@ fn start_review(
         return;
     }
     eprintln!(
-        "hyprcorrect: review-build — corrected ({} chars): {:?}",
+        "hyprcorrect: review-build — corrected ({} chars): {:?}, {} suggestion set(s)",
         corrected.chars().count(),
-        corrected
+        corrected,
+        suggestions.len(),
     );
     let request = ReviewRequest {
         original: at.sentence,
@@ -1342,6 +1343,7 @@ fn start_review(
         chars_before_caret: at.chars_before_caret,
         chars_after_caret: at.chars_after_caret,
         window_address: address.to_string(),
+        suggestions,
     };
     if let Err(e) = write_review_request(&request) {
         eprintln!("hyprcorrect: could not write review request: {e}");
@@ -1677,6 +1679,78 @@ fn correct_sentence(
     }
 }
 
+/// Like [`correct_sentence`] but also gathers ranked per-word backup
+/// suggestions for the review popup's dropdown. Used only by the review
+/// path: the LLM branch makes one structured call that returns the
+/// corrected sentence plus alternatives; spellbook/LanguageTool reuse
+/// the ranked lists they already produce. The no-UI quick paths keep
+/// using [`correct_sentence`] (plain, no extra LLM cost).
+#[cfg(target_os = "linux")]
+fn correct_sentence_with_suggestions(
+    text: &str,
+    smart: hyprcorrect_core::ProviderId,
+    llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
+    spell: &hyprcorrect_core::OfflineProvider,
+) -> (
+    String,
+    hyprcorrect_core::ProviderId,
+    Vec<hyprcorrect_core::runtime::WordSuggestions>,
+) {
+    use hyprcorrect_core::ProviderId;
+    // Offline fallback shared by every provider's error/none arm — the
+    // dropdown still gets spellbook's ranked alternatives.
+    let spellbook_fallback = || {
+        let (corrected, suggestions) = apply_with_suggestions(text, spell.check_text(text));
+        (corrected, ProviderId::Spellbook, suggestions)
+    };
+    match smart {
+        ProviderId::Llm => match llm {
+            Some(llm) => match llm.rewrite_with_alternatives(text) {
+                Ok((corrected, alts)) => {
+                    let suggestions = order_alternatives_by_position(&corrected, alts);
+                    (corrected, ProviderId::Llm, suggestions)
+                }
+                Err(e) => {
+                    let msg = format!("LLM call failed: {e}");
+                    eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                    notify_warning("LLM unavailable", &msg);
+                    spellbook_fallback()
+                }
+            },
+            None => {
+                let msg = "Smart provider is set to LLM, but no API key is configured. \
+                           Open Preferences → Providers → LLM and paste your Anthropic key.";
+                eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                notify_warning("LLM key not set", msg);
+                spellbook_fallback()
+            }
+        },
+        ProviderId::LanguageTool => match languagetool {
+            Some(lt) => match lt.check_text(text) {
+                Ok(corrections) => {
+                    let (corrected, suggestions) = apply_with_suggestions(text, corrections);
+                    (corrected, ProviderId::LanguageTool, suggestions)
+                }
+                Err(e) => {
+                    let msg = format!("LanguageTool call failed: {e}");
+                    eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                    notify_warning("LanguageTool unavailable", &msg);
+                    spellbook_fallback()
+                }
+            },
+            None => {
+                let msg = "Smart provider is set to LanguageTool, but it is disabled or has \
+                           no URL configured. Open Preferences → Providers → LanguageTool.";
+                eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                notify_warning("LanguageTool not configured", msg);
+                spellbook_fallback()
+            }
+        },
+        ProviderId::Spellbook => spellbook_fallback(),
+    }
+}
+
 /// Fire a best-effort desktop notification via `notify-send` so the
 /// user sees provider failures without tailing logs. Silently skips
 /// when `notify-send` (libnotify) isn't installed.
@@ -1767,6 +1841,53 @@ fn apply_corrections(text: &str, provider: &hyprcorrect_core::OfflineProvider) -
     out
 }
 
+/// Apply each correction's top suggestion to `text` and, in the same
+/// pass, collect the full ranked option list per corrected word
+/// (left-to-right) for the review dropdown. The applied fix is
+/// `options[0]`; the rest are backups. Works for spellbook and
+/// LanguageTool corrections alike.
+#[cfg(target_os = "linux")]
+fn apply_with_suggestions(
+    text: &str,
+    mut corrections: Vec<hyprcorrect_core::Correction>,
+) -> (String, Vec<hyprcorrect_core::runtime::WordSuggestions>) {
+    use hyprcorrect_core::runtime::WordSuggestions;
+    if corrections.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    // Left-to-right for the dropdown ordering (matches the popup fields).
+    corrections.sort_by_key(|c| c.span.start);
+    let suggestions: Vec<WordSuggestions> = corrections
+        .iter()
+        .filter_map(|c| {
+            c.suggestions.first().map(|applied| WordSuggestions {
+                word: applied.clone(),
+                options: c.suggestions.iter().take(6).cloned().collect(),
+            })
+        })
+        .collect();
+    // Apply right-to-left so earlier byte offsets stay valid.
+    let mut out = text.to_string();
+    corrections.sort_by_key(|c| std::cmp::Reverse(c.span.start));
+    for c in &corrections {
+        if let Some(fix) = c.suggestions.first() {
+            out.replace_range(c.span.clone(), fix);
+        }
+    }
+    (out, suggestions)
+}
+
+/// Order LLM word alternatives by where each word first appears in
+/// `corrected`, so they line up with the popup's left-to-right fields.
+#[cfg(target_os = "linux")]
+fn order_alternatives_by_position(
+    corrected: &str,
+    mut alts: Vec<hyprcorrect_core::runtime::WordSuggestions>,
+) -> Vec<hyprcorrect_core::runtime::WordSuggestions> {
+    alts.sort_by_key(|a| corrected.find(&a.word).unwrap_or(usize::MAX));
+    alts
+}
+
 #[cfg(not(target_os = "linux"))]
 fn run_daemon() {
     println!(
@@ -1784,7 +1905,32 @@ fn not_yet(what: &str, milestone: &str) {
 mod tests {
     use hyprcorrect_core::{Correction, Sentence};
 
-    use super::{first_overlap_suggestion, word_in_sentence_bytes};
+    use super::{apply_with_suggestions, first_overlap_suggestion, word_in_sentence_bytes};
+
+    #[test]
+    fn apply_with_suggestions_orders_left_to_right_and_keeps_backups() {
+        // Corrections deliberately out of order; the result must apply
+        // both and emit suggestions left-to-right with full ranked lists.
+        let corrections = vec![
+            Correction {
+                span: 10..16,
+                original: "browne".into(),
+                suggestions: vec!["brown".into(), "crown".into(), "browse".into()],
+            },
+            Correction {
+                span: 0..3,
+                original: "teh".into(),
+                suggestions: vec!["the".into(), "then".into()],
+            },
+        ];
+        let (corrected, sugg) = apply_with_suggestions("teh quick browne fox", corrections);
+        assert_eq!(corrected, "the quick brown fox");
+        assert_eq!(sugg.len(), 2);
+        assert_eq!(sugg[0].word, "the"); // applied fix = options[0]
+        assert_eq!(sugg[0].options, vec!["the", "then"]);
+        assert_eq!(sugg[1].word, "brown");
+        assert_eq!(sugg[1].options, vec!["brown", "crown", "browse"]);
+    }
 
     fn sentence(s: &str, start: usize) -> Sentence {
         Sentence {

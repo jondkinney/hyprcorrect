@@ -54,6 +54,18 @@ pub fn review_path() -> PathBuf {
     runtime_dir().join("hyprcorrect.review")
 }
 
+/// Ranked alternative spellings for one corrected word, for the review
+/// popup's per-field suggestion dropdown. `options` is best-first and
+/// the first entry is normally the applied correction; the popup drops
+/// whatever matches the field's current text and shows the rest.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WordSuggestions {
+    /// The corrected word these options belong to.
+    pub word: String,
+    /// Candidate replacements, best first.
+    pub options: Vec<String>,
+}
+
 /// A pending review request — what the user typed, what the smart
 /// provider suggested, and where to emit the result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -79,6 +91,11 @@ pub struct ReviewRequest {
     /// the daemon uses it to update that window's buffer when the
     /// user accepts.
     pub window_address: String,
+    /// Ranked backup suggestions for each changed word, ordered by the
+    /// word's position in `corrected` so it lines up with the popup's
+    /// editable fields. Empty when no provider offered alternatives.
+    #[serde(default)]
+    pub suggestions: Vec<WordSuggestions>,
 }
 
 /// Write a fresh review request to disk. Overwrites any pending one.

@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use crate::runtime::WordSuggestions;
 use crate::secrets;
 
 /// The keyring entry name the prefs UI writes to and the daemon
@@ -35,6 +36,15 @@ const WORD_SYSTEM_PROMPT: &str = "You correct ONE word at a time using sentence 
      (their/there/they're, its/it's, your/you're, etc.) and to pick the right fix for typos. \
      Preserve the original casing of the word's first letter. If the word is already correct \
      in context, return it unchanged.";
+
+const ALTERNATIVES_SYSTEM_PROMPT: &str = "You are a spelling, typo, and minor-grammar corrector. \
+     Correct the user's text and reply with ONLY a JSON object — no preamble, no commentary, no code \
+     fences — shaped exactly like: {\"corrected\": \"<the corrected text>\", \"alternatives\": \
+     [{\"word\": \"<a word you changed>\", \"options\": [\"best\", \"next\", \"...\"]}]}. Include an \
+     `alternatives` entry only for words you changed; give 3 to 5 ranked options each, best first, with \
+     the option you actually used in `corrected` listed first. Use sentence context for homophones \
+     (their/there/they're, its/it's, your/you're). Preserve the user's voice, register, casing, and \
+     punctuation. If the text is already correct, return it unchanged with an empty `alternatives` array.";
 
 /// Errors from an LLM correction request.
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +141,28 @@ impl LlmProvider {
             .to_string())
     }
 
+    /// Correct `text` AND return ranked alternative spellings for each
+    /// word the model changed, in one structured (JSON) call — this
+    /// powers the review popup's per-word suggestion dropdown. Returns
+    /// the corrected sentence and the alternatives (best-first, the
+    /// applied option first).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Response`] if the reply isn't the expected
+    /// JSON — the daemon falls back to `rewrite` + offline suggestions,
+    /// so the dropdown still appears.
+    pub fn rewrite_with_alternatives(
+        &self,
+        text: &str,
+    ) -> Result<(String, Vec<WordSuggestions>), LlmError> {
+        if text.trim().is_empty() {
+            return Ok((text.to_string(), Vec::new()));
+        }
+        let reply = self.request(ALTERNATIVES_SYSTEM_PROMPT, text.to_string())?;
+        parse_alternatives(&reply)
+    }
+
     fn request(&self, system: &str, content: String) -> Result<String, LlmError> {
         let agent: ureq::Agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
@@ -168,10 +200,82 @@ impl LlmProvider {
     }
 }
 
+/// Parse the JSON reply from [`LlmProvider::rewrite_with_alternatives`]
+/// into the corrected text and per-word alternatives. Tolerates a model
+/// that wraps the object in prose or ``` fences by slicing to the outer
+/// braces first.
+fn parse_alternatives(reply: &str) -> Result<(String, Vec<WordSuggestions>), LlmError> {
+    let json = json_object_slice(reply);
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| LlmError::Response(format!("alternatives JSON: {e}")))?;
+    let corrected = v["corrected"]
+        .as_str()
+        .ok_or_else(|| LlmError::Response("no `corrected` string in response".into()))?
+        .to_string();
+    let mut alternatives = Vec::new();
+    if let Some(arr) = v["alternatives"].as_array() {
+        for item in arr {
+            let Some(word) = item["word"].as_str() else {
+                continue;
+            };
+            let options: Vec<String> = item["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.as_str().map(str::to_string))
+                .collect();
+            if !options.is_empty() {
+                alternatives.push(WordSuggestions {
+                    word: word.to_string(),
+                    options,
+                });
+            }
+        }
+    }
+    Ok((corrected, alternatives))
+}
+
+/// The substring from the first `{` to the last `}`, so a stray prose
+/// preamble or ```json fence around the object doesn't break parsing.
+fn json_object_slice(s: &str) -> &str {
+    match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if b >= a => &s[a..=b],
+        _ => s,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::LlmConfig;
+
+    #[test]
+    fn parses_alternatives_reply() {
+        let reply = r#"{"corrected":"the quick brown fox",
+            "alternatives":[
+                {"word":"the","options":["the","then","they"]},
+                {"word":"brown","options":["brown","browne","crown"]}
+            ]}"#;
+        let (corrected, alts) = parse_alternatives(reply).unwrap();
+        assert_eq!(corrected, "the quick brown fox");
+        assert_eq!(alts.len(), 2);
+        assert_eq!(alts[0].word, "the");
+        assert_eq!(alts[0].options, vec!["the", "then", "they"]);
+        assert_eq!(alts[1].word, "brown");
+    }
+
+    #[test]
+    fn tolerates_code_fences_and_preamble() {
+        let reply = "Here you go:\n```json\n{\"corrected\":\"hi there\",\"alternatives\":[]}\n```";
+        let (corrected, alts) = parse_alternatives(reply).unwrap();
+        assert_eq!(corrected, "hi there");
+        assert!(alts.is_empty());
+    }
+
+    #[test]
+    fn non_json_reply_is_an_error() {
+        assert!(parse_alternatives("sorry, I cannot do that").is_err());
+    }
 
     #[test]
     fn unsupported_backend_is_rejected_cleanly() {
