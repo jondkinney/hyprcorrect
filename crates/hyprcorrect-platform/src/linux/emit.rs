@@ -139,12 +139,7 @@ pub fn replace_around_caret_with_delay(
         run(cmd)?;
         sleep_ms(pause_per_backspace_ms, total_backspaces);
     }
-    if !text.is_empty() {
-        let mut cmd = Command::new("wtype");
-        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
-        cmd.arg("--").arg(text);
-        run(cmd)?;
-    }
+    type_text(text)?;
     Ok(())
 }
 
@@ -203,11 +198,33 @@ pub fn anchored_replace_with_delay(
         run(cmd)?;
         sleep_ms(pause_per_backspace_ms, word_chars);
     }
-    if !insert.is_empty() {
-        let mut cmd = Command::new("wtype");
-        cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
-        cmd.arg("--").arg(insert);
-        run(cmd)?;
+    type_text(insert)?;
+    Ok(())
+}
+
+/// Type `text` as a `wtype` burst, emitting embedded newlines as
+/// Shift+Enter rather than a bare Return. A plain Return submits
+/// chat-style inputs (the Claude Code prompt, Slack, Discord, …);
+/// Shift+Enter inserts a line break instead, so applying a multi-line
+/// correction never sends the message. Each line is its own text burst
+/// with a Shift+Enter key event between them; a string with no newline
+/// is a single burst, identical to the old behavior. Empty input is a
+/// no-op.
+fn type_text(text: &str) -> Result<(), EmitError> {
+    let mut first = true;
+    for line in text.split('\n') {
+        if !first {
+            let mut cmd = Command::new("wtype");
+            cmd.args(["-M", "shift", "-k", "Return", "-m", "shift"]);
+            run(cmd)?;
+        }
+        first = false;
+        if !line.is_empty() {
+            let mut cmd = Command::new("wtype");
+            cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+            cmd.arg("--").arg(line);
+            run(cmd)?;
+        }
     }
     Ok(())
 }

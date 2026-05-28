@@ -372,8 +372,11 @@ editable text and has two modes:
   `.` repeat, marks, search, ex ranges.
 
 On apply the popup writes the (possibly edited) sentence back into the
-review-request file and signals the daemon, which performs the emit. On
-Wayland it is an egui window plus a shipped Hyprland window rule
+review-request file and signals the daemon, which performs the emit.
+Newlines in a correction are emitted as Shift+Enter (not a bare Return)
+so a multi-line edit inserts line breaks rather than submitting
+chat-style inputs like the Claude Code prompt. On Wayland it is an egui
+window plus a shipped Hyprland window rule
 (float/pin/focus) for MVP; a real `wlr-layer-shell` surface is a later
 upgrade. On macOS it is a borderless `NSPanel`.
 
