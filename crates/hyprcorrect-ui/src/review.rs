@@ -671,18 +671,24 @@ impl ReviewApp {
         ui.heading("Edit sentence  ·  vim");
         ui.add_space(10.0);
         section_label(ui, "Original");
-        // No column alignment in vim mode — the editor buffer below isn't
-        // column-padded, so there's nothing to line up against.
-        original_card(ui, &self.request.original, &self.request.corrected, None);
-        ui.add_space(16.0);
 
         let (text, cursor, mode, status) = match self.vim.as_ref() {
             Some(v) => (v.text().to_string(), v.cursor(), v.mode(), v.status_line()),
-            None => return,
+            None => {
+                original_card(ui, &self.request.original, &self.request.corrected, None);
+                return;
+            }
         };
 
+        // Align the Original to the *live* buffer so each original word
+        // sits above the word it became, the same column grid as word-edit
+        // mode.
+        let layout = worddiff::align(&self.request.original, &text);
+        original_card(ui, &self.request.original, &text, layout.as_ref());
+        ui.add_space(16.0);
+
         let marks = self.vim_marks.clone();
-        let font = egui::FontId::monospace(15.0);
+        let font = mono_font();
         let fg = TEXT_FG;
         let accent = egui::Color32::from_rgb(120, 190, 255);
         let on_block = egui::Color32::from_gray(20);
@@ -694,15 +700,28 @@ impl ReviewApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 let wrap_width = ui.available_width();
+                let cw = char_width(ui, &font);
                 let row_h = ui.fonts(|f| f.row_height(&font));
 
-                // Lay the text out plainly — the caret is painted on top
-                // as an overlay so switching to/from INSERT never inserts
-                // a glyph and never shifts the text.
+                // Column-pad the buffer for display so it lines up under the
+                // Original, breaking at the same columns. `map` turns a raw
+                // buffer char index into its index in the padded string, so
+                // the vim caret and squiggles (which index the raw buffer)
+                // still land correctly. The caret is painted as an overlay,
+                // so switching INSERT/NORMAL never shifts a glyph.
+                let (disp, map) = match &layout {
+                    Some(l) if !text.is_empty() => {
+                        let rows = wrap_columns(&l.col_widths, wrap_width, cw);
+                        aligned_display(&text, l, &rows)
+                    }
+                    _ => (text.clone(), (0..=text.chars().count()).collect()),
+                };
+                let d = |raw: usize| -> usize { map.get(raw).copied().unwrap_or(0) };
+
                 let mut job = LayoutJob::default();
                 job.wrap.max_width = wrap_width;
                 job.append(
-                    &text,
+                    &disp,
                     0.0,
                     egui::TextFormat {
                         font_id: font.clone(),
@@ -723,8 +742,8 @@ impl ReviewApp {
                     if bs >= be || be > text.len() {
                         continue;
                     }
-                    let cs = text[..bs].chars().count();
-                    let ce = text[..be].chars().count();
+                    let cs = d(text[..bs].chars().count());
+                    let ce = d(text[..be].chars().count());
                     let r0 = galley
                         .pos_from_cursor(CCursor::new(cs))
                         .translate(origin.to_vec2());
@@ -740,7 +759,7 @@ impl ReviewApp {
                 }
 
                 let at = cursor.min(text.len());
-                let char_idx = text[..at].chars().count();
+                let char_idx = d(text[..at].chars().count());
                 let caret = galley
                     .pos_from_cursor(CCursor::new(char_idx))
                     .translate(origin.to_vec2());
@@ -752,18 +771,10 @@ impl ReviewApp {
                         ui.painter().rect_filled(ibeam, 0.0, accent);
                     }
                     _ => {
-                        // Block over the character under the cursor.
-                        let next = galley
-                            .pos_from_cursor(CCursor::new(char_idx + 1))
-                            .translate(origin.to_vec2());
-                        let advance = next.min.x - caret.min.x;
-                        let w = if advance > 1.0 && advance < 200.0 {
-                            advance
-                        } else {
-                            ui.fonts(|f| f.glyph_width(&font, ' '))
-                        };
+                        // Block over the character under the cursor — one
+                        // monospace cell wide (never the padding after it).
                         let block =
-                            egui::Rect::from_min_size(caret.min, egui::vec2(w, caret.height()));
+                            egui::Rect::from_min_size(caret.min, egui::vec2(cw, caret.height()));
                         ui.painter().rect_filled(block, 0.0, accent);
                         if let Some(ch) = text[at..].chars().next() {
                             if ch != '\n' {
@@ -1168,6 +1179,103 @@ fn wrap_columns(col_widths: &[usize], avail: f32, cw: f32) -> Vec<(usize, usize)
     }
     rows.push((start, col_widths.len()));
     rows
+}
+
+/// Column-pad `buffer` (the corrected side of `layout`) into a monospace
+/// display string that lines up under the Original card, breaking at the
+/// same `rows`. Returns the padded string plus a map from each raw char
+/// index (`0..=char_len`) to its char index in the padded string — so the
+/// vim caret and squiggles, which index the raw buffer, land in the right
+/// place. Padding is appended *after* each word (and gaps/newlines are
+/// inserted), so every raw char keeps its identity and maps cleanly.
+fn aligned_display(
+    buffer: &str,
+    layout: &worddiff::AlignLayout,
+    rows: &[(usize, usize)],
+) -> (String, Vec<usize>) {
+    let raw_len = buffer.chars().count();
+    let mut map = vec![0usize; raw_len + 1];
+    let mut disp = String::new();
+    let mut di = 0usize; // display char count so far
+
+    // Buffer words and the separator following each, with raw char offsets.
+    let mut words: Vec<(usize, String)> = Vec::new();
+    let mut seps: Vec<(usize, String)> = Vec::new();
+    let mut leading: Option<(usize, String)> = None;
+    let mut rc = 0usize;
+    for (is_word, t) in worddiff::split_tokens(buffer) {
+        let len = t.chars().count();
+        if is_word {
+            words.push((rc, t));
+            seps.push((rc + len, String::new()));
+        } else if let Some(last) = seps.last_mut() {
+            *last = (rc, t);
+        } else {
+            leading = Some((rc, t));
+        }
+        rc += len;
+    }
+
+    let ncols = layout.col_widths.len();
+    let mut col_word: Vec<Option<usize>> = vec![None; ncols];
+    for (k, &c) in layout.corr_cols.iter().enumerate() {
+        if c < ncols {
+            col_word[c] = Some(k);
+        }
+    }
+    let mut is_row_start = vec![false; ncols];
+    for &(c0, _) in rows.iter().skip(1) {
+        if c0 < ncols {
+            is_row_start[c0] = true;
+        }
+    }
+
+    let push = |disp: &mut String, di: &mut usize, ch: char| {
+        disp.push(ch);
+        *di += 1;
+    };
+
+    if let Some((start, sep)) = leading {
+        for (ci, ch) in sep.chars().enumerate() {
+            map[start + ci] = di;
+            push(&mut disp, &mut di, ch);
+        }
+    }
+    for c in 0..ncols {
+        if is_row_start[c] {
+            push(&mut disp, &mut di, '\n');
+        }
+        let width = layout.col_widths[c];
+        let Some(k) = col_word[c] else {
+            // Deletion column — blank gap (display-only) + a separator space.
+            for _ in 0..width + 1 {
+                push(&mut disp, &mut di, ' ');
+            }
+            continue;
+        };
+        let (wstart, word) = &words[k];
+        let wlen = word.chars().count();
+        for (ci, ch) in word.chars().enumerate() {
+            map[wstart + ci] = di;
+            push(&mut disp, &mut di, ch);
+        }
+        let (sep_start, sep) = &seps[k];
+        let (punct, ws) = worddiff::split_separator(sep);
+        let punct_len = punct.chars().count();
+        for (ci, ch) in punct.chars().enumerate() {
+            map[sep_start + ci] = di;
+            push(&mut disp, &mut di, ch);
+        }
+        for _ in 0..width.saturating_sub(wlen + punct_len) {
+            push(&mut disp, &mut di, ' ');
+        }
+        for (ci, ch) in ws.chars().enumerate() {
+            map[sep_start + punct_len + ci] = di;
+            push(&mut disp, &mut di, if ch == '\n' { ' ' } else { ch });
+        }
+    }
+    map[raw_len] = di;
+    (disp, map)
 }
 
 /// The words of `s` in order, each paired with the separator run that

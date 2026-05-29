@@ -382,7 +382,10 @@ editable text and has two modes:
   `iw`/`aw` text objects (so `ciw`, `dw`, `daw`, with vim's `cw`==`ce`);
   leading counts; undo `u`, redo `Ctrl+R`, and repeat `.`. `:w`/`:wq`/`:x`
   and normal-mode `Enter` apply; `:q`/`:q!` cancel; INSERT `Enter` inserts
-  a newline. It is a self-contained Rust state machine
+  a newline. The Original is shown column-aligned above the editor on the
+  same grid as word-edit mode (the buffer's *display* is space-padded to
+  the columns while the vim cursor/motions keep working on the raw text,
+  via a raw→display index map). It is a self-contained Rust state machine
   (`hyprcorrect-ui/src/vimedit.rs`), **not** real nvim — chosen to stay
   in-window, dependency-free, and identical on macOS.
   **Out of scope (v1):** registers/yank/paste, visual mode, marks, search,
