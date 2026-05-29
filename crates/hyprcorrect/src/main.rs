@@ -1329,6 +1329,7 @@ fn start_review(
     // original and polls for the finished request) so a slow provider —
     // an LLM round-trip especially — doesn't leave the chord feeling
     // dead. Then correct and write the finished request.
+    let screen_width = focused_monitor_width();
     let pending = ReviewRequest {
         original: at.sentence.clone(),
         corrected: at.sentence.clone(),
@@ -1338,6 +1339,7 @@ fn start_review(
         window_address: address.to_string(),
         suggestions: Vec::new(),
         pending: true,
+        screen_width,
     };
     if let Err(e) = write_review_request(&pending) {
         eprintln!("hyprcorrect: could not write pending review request: {e}");
@@ -1368,10 +1370,44 @@ fn start_review(
         window_address: address.to_string(),
         suggestions,
         pending: false,
+        screen_width,
     };
     if let Err(e) = write_review_request(&request) {
         eprintln!("hyprcorrect: could not write finished review request: {e}");
     }
+}
+
+/// Logical width (points) of the focused Hyprland monitor — its pixel
+/// width divided by its scale — so the review popup can size itself up to
+/// half the screen. Returns `0.0` when hyprctl is unavailable or the
+/// output can't be parsed; the popup then uses a fixed fallback cap.
+#[cfg(target_os = "linux")]
+fn focused_monitor_width() -> f32 {
+    use std::process::Command;
+    let Ok(out) = Command::new("hyprctl").args(["monitors", "-j"]).output() else {
+        return 0.0;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return 0.0;
+    };
+    let Some(monitors) = json.as_array() else {
+        return 0.0;
+    };
+    let monitor = monitors
+        .iter()
+        .find(|m| m["focused"].as_bool() == Some(true))
+        .or_else(|| monitors.first());
+    let Some(monitor) = monitor else {
+        return 0.0;
+    };
+    let width = monitor["width"].as_f64().unwrap_or(0.0) as f32;
+    let scale = monitor["scale"].as_f64().unwrap_or(1.0) as f32;
+    if scale > 0.0 { width / scale } else { width }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn focused_monitor_width() -> f32 {
+    0.0
 }
 
 /// Install per-class Hyprland windowrules so the review popup

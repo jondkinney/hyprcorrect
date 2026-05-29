@@ -1304,6 +1304,7 @@ dependencies = [
  "hyprcorrect-core",
  "hyprcorrect-platform",
  "hyprcorrect-ui",
+ "serde_json",
 ]
 
 [[package]]

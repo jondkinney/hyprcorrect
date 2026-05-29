@@ -103,6 +103,11 @@ pub struct ReviewRequest {
     /// with `pending: false`.
     #[serde(default)]
     pub pending: bool,
+    /// Logical width (points) of the monitor the source window sits on,
+    /// so the popup can grow with the sentence up to half the screen.
+    /// Zero when unknown — the popup then falls back to a fixed cap.
+    #[serde(default)]
+    pub screen_width: f32,
 }
 
 /// Write a fresh review request to disk. Overwrites any pending one.

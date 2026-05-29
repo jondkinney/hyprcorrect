@@ -124,23 +124,103 @@ pub fn changed_word_ranges(text: &str, other: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Per-column display width (char count) so each corrected word can sit
-/// directly under the original word it replaces: `max(original_word,
-/// corrected_word)` for each column. `None` when the two sentences don't
-/// have the same number of words (then the popup renders without column
-/// alignment).
-pub fn align_widths(original: &str, corrected: &str) -> Option<Vec<usize>> {
-    let o = word_list(original);
-    let c = word_list(corrected);
-    if o.is_empty() || o.len() != c.len() {
+/// A shared column grid that lets each corrected word sit directly under
+/// the original word it replaces — even when the correction added or
+/// removed words. Built from the LCS word pairing: matched words share a
+/// column, substituted words pair 1:1, and an inserted or deleted word
+/// gets a column to itself (a blank gap on the other row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignLayout {
+    /// Display width (char count) of each column — the wider of the two
+    /// words occupying it (a one-sided column uses just its word).
+    pub col_widths: Vec<usize>,
+    /// Column index of each original word, in order.
+    pub orig_cols: Vec<usize>,
+    /// Column index of each corrected word, in order.
+    pub corr_cols: Vec<usize>,
+}
+
+/// Lay the original and corrected words out in shared columns so the
+/// popup can render one directly above the other. `None` only when
+/// neither sentence has a word (nothing to align).
+pub fn align(original: &str, corrected: &str) -> Option<AlignLayout> {
+    let orig_owned = word_list(original);
+    let corr_owned = word_list(corrected);
+    if orig_owned.is_empty() && corr_owned.is_empty() {
         return None;
     }
-    Some(
-        o.iter()
-            .zip(&c)
-            .map(|(a, b)| a.chars().count().max(b.chars().count()))
-            .collect(),
-    )
+    let orig: Vec<&str> = orig_owned.iter().map(String::as_str).collect();
+    let corr: Vec<&str> = corr_owned.iter().map(String::as_str).collect();
+
+    let mut layout = AlignLayout {
+        col_widths: Vec::new(),
+        orig_cols: vec![0; orig.len()],
+        corr_cols: vec![0; corr.len()],
+    };
+    let (mut i, mut j) = (0usize, 0usize);
+    for (mi, mj) in lcs_matched_pairs(&orig, &corr) {
+        emit_run(&mut layout, &orig, &corr, &mut i, &mut j, mi, mj);
+        // The matched word: shared column, advance past it on both sides.
+        let col = layout.col_widths.len();
+        layout.orig_cols[i] = col;
+        layout.corr_cols[j] = col;
+        layout
+            .col_widths
+            .push(orig[i].chars().count().max(corr[j].chars().count()));
+        i += 1;
+        j += 1;
+    }
+    // Trailing unmatched words after the last LCS anchor.
+    emit_run(
+        &mut layout,
+        &orig,
+        &corr,
+        &mut i,
+        &mut j,
+        orig.len(),
+        corr.len(),
+    );
+    Some(layout)
+}
+
+/// Assign columns to the unmatched run `orig[i..ai]` / `corr[j..aj]`:
+/// pair words 1:1 as substitutions up to the shorter side, then give any
+/// leftover original (deletion) or corrected (insertion) word its own
+/// column. Advances `i`/`j` to `ai`/`aj`.
+fn emit_run(
+    layout: &mut AlignLayout,
+    orig: &[&str],
+    corr: &[&str],
+    i: &mut usize,
+    j: &mut usize,
+    ai: usize,
+    aj: usize,
+) {
+    let (da, db) = (ai - *i, aj - *j);
+    let sub = da.min(db);
+    for k in 0..sub {
+        let col = layout.col_widths.len();
+        layout.orig_cols[*i + k] = col;
+        layout.corr_cols[*j + k] = col;
+        layout.col_widths.push(
+            orig[*i + k]
+                .chars()
+                .count()
+                .max(corr[*j + k].chars().count()),
+        );
+    }
+    for k in sub..da {
+        let col = layout.col_widths.len();
+        layout.orig_cols[*i + k] = col;
+        layout.col_widths.push(orig[*i + k].chars().count());
+    }
+    for k in sub..db {
+        let col = layout.col_widths.len();
+        layout.corr_cols[*j + k] = col;
+        layout.col_widths.push(corr[*j + k].chars().count());
+    }
+    *i = ai;
+    *j = aj;
 }
 
 /// The whitespace/punctuation-delimited words of `s`, in order.
@@ -258,6 +338,16 @@ fn is_word_char(c: char) -> bool {
 /// Indices into `b` of the words matched by an LCS of `a` and `b`.
 /// Those corrected words (`b`) are "unchanged"; the rest are editable.
 fn lcs_matched_b_indices(a: &[&str], b: &[&str]) -> HashSet<usize> {
+    lcs_matched_pairs(a, b)
+        .into_iter()
+        .map(|(_, j)| j)
+        .collect()
+}
+
+/// The `(a_index, b_index)` pairs matched by an LCS of `a` and `b`, in
+/// increasing order on both sides. [`lcs_matched_b_indices`] keeps just
+/// the `b` side; [`align`] needs both to map original words to corrected.
+fn lcs_matched_pairs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
     let (n, m) = (a.len(), b.len());
     // dp[i][j] = LCS length of a[i..] and b[j..].
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
@@ -270,11 +360,11 @@ fn lcs_matched_b_indices(a: &[&str], b: &[&str]) -> HashSet<usize> {
             };
         }
     }
-    let mut matched = HashSet::new();
+    let mut pairs = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
         if a[i] == b[j] {
-            matched.insert(j);
+            pairs.push((i, j));
             i += 1;
             j += 1;
         } else if dp[i + 1][j] >= dp[i][j + 1] {
@@ -283,7 +373,7 @@ fn lcs_matched_b_indices(a: &[&str], b: &[&str]) -> HashSet<usize> {
             j += 1;
         }
     }
-    matched
+    pairs
 }
 
 #[cfg(test)]
@@ -392,13 +482,49 @@ mod tests {
     }
 
     #[test]
-    fn align_widths_pairs_columns_when_word_counts_match() {
-        assert_eq!(
-            align_widths("teh quick browne fox jumpd", "the quick brown fox jumped"),
-            Some(vec![3, 5, 6, 3, 6]),
-        );
-        // Different word counts → no column alignment.
-        assert_eq!(align_widths("the fox", "the quick fox"), None);
+    fn align_substitutions_share_columns() {
+        // Same word count: every word pairs into its own column, width =
+        // the wider of the two.
+        let a = align("teh quick browne fox jumpd", "the quick brown fox jumped").unwrap();
+        assert_eq!(a.col_widths, vec![3, 5, 6, 3, 6]);
+        assert_eq!(a.orig_cols, vec![0, 1, 2, 3, 4]);
+        assert_eq!(a.corr_cols, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn align_inserted_word_gets_its_own_column() {
+        // "quick" inserted: the original has no word in that column.
+        let a = align("the fox", "the quick fox").unwrap();
+        assert_eq!(a.col_widths, vec![3, 5, 3]);
+        assert_eq!(a.orig_cols, vec![0, 2]); // the→col0, fox→col2
+        assert_eq!(a.corr_cols, vec![0, 1, 2]); // the, quick(col1), fox
+    }
+
+    #[test]
+    fn align_deleted_word_gets_its_own_column() {
+        // "quick" deleted: the corrected has no word in that column.
+        let a = align("the quick fox", "the fox").unwrap();
+        assert_eq!(a.col_widths, vec![3, 5, 3]);
+        assert_eq!(a.orig_cols, vec![0, 1, 2]); // the, quick(col1), fox
+        assert_eq!(a.corr_cols, vec![0, 2]); // the→col0, fox→col2
+    }
+
+    #[test]
+    fn align_split_word_substitutes_then_inserts() {
+        // "alot"→"a lot": "a" substitutes alot (col2, width 4), "lot" is
+        // an insertion in col3 (a gap below it in the original); the
+        // shared "eat"/"of"/"food" keep both rows lined up.
+        let a = align("i eat alot of food", "I eat a lot of food").unwrap();
+        assert_eq!(a.col_widths, vec![1, 3, 4, 3, 2, 4]);
+        assert_eq!(a.orig_cols, vec![0, 1, 2, 4, 5]); // i,eat,alot,of,food
+        assert_eq!(a.corr_cols, vec![0, 1, 2, 3, 4, 5]); // I,eat,a,lot,of,food
+    }
+
+    #[test]
+    fn align_none_only_when_wordless() {
+        assert!(align("", "").is_none());
+        assert!(align("hi", "").is_some());
+        assert!(align("", "hi").is_some());
     }
 
     #[test]

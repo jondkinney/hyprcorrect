@@ -358,6 +358,20 @@ editable text and has two modes:
   it. `Tab`/`Shift+Tab` and `←`/`→` move between fields, `Enter` applies,
   `Esc` cancels. A word-level LCS diff of original vs corrected decides
   which words are editable (`hyprcorrect-ui/src/worddiff.rs`).
+  The original sentence is shown above the proposed one in monospace,
+  **column-aligned** so each correction sits directly under the word it
+  replaces — the same LCS pairing assigns both rows to a shared column
+  grid, padding words and leaving a blank gap on whichever row inserted
+  or deleted a word (`worddiff::align`). Misspellings carry a red
+  squiggle, corrections a blue one. Each focused field shows a ranked
+  **suggestion list** inline below (number keys or `↑`/`↓`+`Enter`;
+  picking one advances to the next correction, or applies on the last).
+  The popup grows with the sentence up to **half the monitor width**
+  (the daemon passes the focused monitor's logical width); longer
+  sentences wrap, with both rows broken at identical columns and ~1.5
+  line-height between wrapped lines. (Mid-sentence punctuation the
+  correction *adds or removes* can nudge alignment after that point —
+  the words still pair up, the column just shifts by the separator.)
 - **Vim mode** (`Ctrl+E`): the whole sentence becomes a small modal
   editor — a deliberate *subset* of vim, for when the correction is
   wrong and needs free-form fixing. NORMAL/INSERT/COMMAND; motions
