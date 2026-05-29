@@ -191,6 +191,21 @@ struct PrefsApp {
     /// `Some` while the background thread runs; cleared when the
     /// result is picked up and surfaced in [`Status`].
     docker_op: Option<OpHandle>,
+    /// Floating-width cap bookkeeping (Linux/Hyprland). Hyprland gives the
+    /// app no way to clamp a floating window's live resize — a Wayland
+    /// max-size hint force-floats the toplevel (breaking tiling), the
+    /// `maxsize` windowrule is open-time only, and a client self-resize
+    /// (`ViewportCommand::InnerSize`) is ignored for a mapped window. So
+    /// when a *floating* prefs grows past the cap we snap it back with
+    /// `hyprctl dispatch resizewindowpixel` (a no-op on tiled windows, which
+    /// the compositor owns). These fields track the resize settle so we snap
+    /// once it stops rather than fighting an in-progress drag.
+    #[cfg(target_os = "linux")]
+    cap_last_w: f32,
+    #[cfg(target_os = "linux")]
+    cap_settle_at: Instant,
+    #[cfg(target_os = "linux")]
+    cap_done: bool,
 }
 
 impl PrefsApp {
@@ -248,7 +263,53 @@ impl PrefsApp {
             last_status_check: Instant::now() - Duration::from_secs(60),
             status_probe: None,
             docker_op: None,
+            #[cfg(target_os = "linux")]
+            cap_last_w: 0.0,
+            #[cfg(target_os = "linux")]
+            cap_settle_at: Instant::now(),
+            #[cfg(target_os = "linux")]
+            cap_done: false,
         }
+    }
+
+    /// Cap the width of a *floating* prefs window at `MAX_W` logical px.
+    /// Hyprland offers no way to clamp a floating window's live resize from
+    /// the app: a Wayland max-size hint force-floats the toplevel (breaking
+    /// tiling), the `maxsize` windowrule is open-time only, and a client
+    /// self-resize (`ViewportCommand::InnerSize`) is ignored for a mapped
+    /// window. What works is a compositor-side `resizewindowpixel` targeted
+    /// by class — and it's a no-op on a tiled window (the compositor owns its
+    /// size), so tiling is left intact. We wait for the resize to settle
+    /// before snapping so we don't fight an in-progress drag. Logical units
+    /// (egui points == Hyprland's coords) keep it correct on 1x and 2x.
+    #[cfg(target_os = "linux")]
+    fn enforce_floating_width_cap(&mut self, ctx: &egui::Context) {
+        const MAX_W: f32 = 900.0;
+        const SETTLE: Duration = Duration::from_millis(180);
+        let rect = ctx.screen_rect();
+        let w = rect.width();
+        if (w - self.cap_last_w).abs() > 1.0 {
+            self.cap_last_w = w;
+            self.cap_settle_at = Instant::now();
+            self.cap_done = false;
+        }
+        if self.cap_done || w <= MAX_W + 1.0 {
+            return;
+        }
+        if self.cap_settle_at.elapsed() < SETTLE {
+            // Still resizing — re-check shortly so we snap once it settles.
+            ctx.request_repaint_after(Duration::from_millis(60));
+            return;
+        }
+        self.cap_done = true;
+        let h = rect.height().round().max(1.0) as i64;
+        let _ = std::process::Command::new("hyprctl")
+            .args([
+                "dispatch",
+                "resizewindowpixel",
+                &format!("exact {} {h},class:{APP_ID}", MAX_W as i64),
+            ])
+            .output();
     }
 
     /// Kick off a background URL+docker probe if one isn't already
@@ -583,6 +644,8 @@ impl PrefsApp {
 impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_style(ctx);
+        #[cfg(target_os = "linux")]
+        self.enforce_floating_width_cap(ctx);
         self.refresh_stale_check();
         self.poll_docker_op(ctx);
         self.poll_ngram_download(ctx);

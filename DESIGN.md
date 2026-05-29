@@ -433,14 +433,19 @@ upgrade. On macOS it is a borderless `NSPanel`.
 - egui preferences window (`hyprcorrect-ui`, pattern from
   `vernier-ui/prefs.rs`), panels: Hotkeys, Providers, Behavior
   (inter-key delay, reset sensitivity), Privacy (app blocklist, password
-  handling), About. It opens **tiled** (no float rule). Note: a floating
-  prefs window's width can't be hard-capped from the app on Hyprland — a
+  handling), About. It opens **tiled** (no float rule); when *floating* it
+  caps its width at 900 logical px. That cap is non-obvious on Hyprland: a
   Wayland max-size hint makes Hyprland treat the toplevel as a fixed dialog
-  and force-float it (defeating tiling), a client self-resize
-  (`ViewportCommand::InnerSize`) is ignored for a mapped window, and the
+  and force-float it (defeating tiling); a client self-resize
+  (`ViewportCommand::InnerSize`) is ignored for a mapped window; and the
   `maxsize` windowrule is open-time only (it doesn't clamp a live
-  drag-resize). So width restraint, if any, is applied to the form *content*
-  inside egui rather than to the window frame.
+  drag-resize). The one thing that works is a compositor-side
+  `hyprctl dispatch resizewindowpixel exact 900 <h>,class:hyprcorrect-prefs`
+  — which is a **no-op on a tiled window** (the compositor owns its size), so
+  tiling stays intact. `update` watches its own width (egui points ==
+  Hyprland's logical coords, so 1x/2x both work) and, once a too-wide resize
+  *settles* (so it doesn't fight an in-progress drag), snaps a floating
+  window back to 900.
 
 ```toml
 # config.toml sketch
