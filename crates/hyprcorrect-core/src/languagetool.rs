@@ -71,9 +71,12 @@ impl LanguageToolProvider {
             return Ok(Vec::new());
         }
         let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
+        // `level=picky` turns on LanguageTool's extra grammar/style rules
+        // (more than the default set). Real-word confusions like
+        // wear/where still need the server's optional n-gram data loaded.
         let response = agent
             .post(&self.endpoint)
-            .send_form(&[("text", text), ("language", "en-US")])
+            .send_form(&[("text", text), ("language", "en-US"), ("level", "picky")])
             .map_err(|e| LanguageToolError::Request(e.to_string()))?;
         let json: serde_json::Value = response
             .into_json()
