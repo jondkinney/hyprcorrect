@@ -853,8 +853,8 @@ fn pick_word_fix(
             "hyprcorrect: word-fix — default provider is LLM but no key configured; falling back to spellbook"
         );
         notify_warning(
-            "LLM key not set",
-            "Open Preferences → Providers → LLM and paste your Anthropic key.",
+            "LLM API key not set",
+            "Open Preferences → Providers → LLM and paste your Anthropic API key.",
         );
     } else if default == ProviderId::LanguageTool
         && let Some(lt) = languagetool
@@ -1444,7 +1444,7 @@ fn reprocess_review_with_llm(
         eprintln!("hyprcorrect: review-llm — no LLM configured; opening Preferences");
         notify_warning(
             "LLM not configured",
-            "Add an LLM key in Preferences → Providers to escalate corrections.",
+            "Add an LLM API key in Preferences → Providers to escalate corrections.",
         );
         spawn_prefs_window_section(Some("providers"));
         return;
@@ -1877,7 +1877,7 @@ fn correct_sentence(
                            key (or its backend isn't supported yet). Open Preferences → \
                            Providers → LLM.";
                 eprintln!("hyprcorrect: {msg} — falling back");
-                notify_warning("LLM key not set", msg);
+                notify_warning("LLM API key not set", msg);
                 llm_unavailable_fallback(text, languagetool, spell)
             }
         },
@@ -1950,7 +1950,7 @@ fn correct_sentence_with_suggestions(
                            key (or its backend isn't supported yet). Open Preferences → \
                            Providers → LLM.";
                 eprintln!("hyprcorrect: {msg} — falling back");
-                notify_warning("LLM key not set", msg);
+                notify_warning("LLM API key not set", msg);
                 llm_unavailable_fallback_with_suggestions(text, languagetool, spell)
             }
         },

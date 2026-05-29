@@ -300,19 +300,23 @@ impl ReviewApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// "Ask LLM": tell the daemon to re-process the original sentence with
-    /// the LLM (it reloads us via the request file). With an LLM
-    /// configured, flip our own request to `pending` so "Checking…" shows
-    /// at once; without one, the daemon opens Preferences → Providers so
-    /// the user can add a key — the button stays either way.
+    /// "Ask LLM": with an LLM key configured, tell the daemon to re-process
+    /// the original sentence through the LLM (it reloads us via the request
+    /// file) and flip to `pending` so "Checking…" shows at once. Without a
+    /// key, open Preferences → Providers directly so the user can add one.
     fn escalate_llm(&mut self) {
-        if self.request.llm_available {
-            let mut req = self.request.clone();
-            req.pending = true;
-            let _ = runtime::write_review_request(&req);
-            self.ready = false;
-            self.reprocessing = true;
+        // No API key yet → take the user straight to where they add one.
+        // Done here rather than via the daemon so it works even when the
+        // daemon isn't around to handle the action.
+        if !self.request.llm_available {
+            open_prefs_providers();
+            return;
         }
+        let mut req = self.request.clone();
+        req.pending = true;
+        let _ = runtime::write_review_request(&req);
+        self.ready = false;
+        self.reprocessing = true;
         if let Err(e) = std::fs::write(runtime::action_path(), "review-llm") {
             eprintln!("hyprcorrect: could not write review-llm action: {e}");
             return;
@@ -908,6 +912,7 @@ impl ReviewApp {
         let layout = worddiff::align(&self.request.original, &text);
         original_card(ui, &self.request.original, &text, layout.as_ref());
         ui.add_space(16.0);
+        section_label(ui, "Corrected");
 
         let marks = self.vim_marks.clone();
         let font = mono_font();
@@ -1029,14 +1034,37 @@ impl ReviewApp {
 
         ui.add_space(8.0);
         ui.label(egui::RichText::new(status).monospace().color(accent));
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(
-                "ciw dw cw x r · z= suggest · u Ctrl+R . · w b 0 $ · i a o · :wq/Enter apply · Esc/:q cancel",
-            )
-            .size(11.0)
-            .color(egui::Color32::from_gray(130)),
-        );
+        ui.add_space(8.0);
+        // One row per command group so a new user can get oriented at a
+        // glance instead of parsing one dense line.
+        egui::Grid::new("vim_help")
+            .num_columns(2)
+            .spacing(egui::vec2(16.0, 3.0))
+            .show(ui, |ui| {
+                for (cmd, desc) in [
+                    ("ciw  dw  cw", "change or delete a word"),
+                    ("x   r", "delete or replace a character"),
+                    ("i   a   o", "insert, append, or open a line"),
+                    ("w  b  0  $", "move by word, to line start / end"),
+                    ("z=", "show spelling suggestions for the word"),
+                    ("u  Ctrl+R  .", "undo, redo, repeat the last change"),
+                    ("Enter  :wq", "apply the correction"),
+                    ("Esc  :q", "cancel"),
+                ] {
+                    ui.label(
+                        egui::RichText::new(cmd)
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(170)),
+                    );
+                    ui.label(
+                        egui::RichText::new(desc)
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(125)),
+                    );
+                    ui.end_row();
+                }
+            });
     }
 }
 
@@ -1108,7 +1136,13 @@ impl eframe::App for ReviewApp {
                     ui.spacing_mut().button_padding = egui::vec2(18.0, 9.0);
                     ui.add_space(12.0); // inset from the left edge
                     if ui
-                        .button(egui::RichText::new("Cancel  (Esc)").size(15.0))
+                        .button(
+                            // ⎋ (Esc) from the bundled symbol font — the
+                            // default body font may lack the key glyph.
+                            egui::RichText::new("Cancel  ⎋")
+                                .family(egui::FontFamily::Name("shortcut".into()))
+                                .size(15.0),
+                        )
                         .clicked()
                     {
                         do_cancel = true;
@@ -1120,7 +1154,10 @@ impl eframe::App for ReviewApp {
                     let (llm_label, llm_hint) = if self.request.llm_available {
                         ("Ask LLM", "Re-run this sentence through the LLM")
                     } else {
-                        ("Ask LLM…", "Set up an LLM key in Preferences to escalate")
+                        (
+                            "Ask LLM…",
+                            "Opens Preferences → Providers to add an LLM API key",
+                        )
                     };
                     if ui
                         .button(egui::RichText::new(llm_label).size(15.0))
@@ -1133,7 +1170,9 @@ impl eframe::App for ReviewApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0); // inset from the right edge
                         let apply = egui::Button::new(
-                            egui::RichText::new("Apply  (Enter)")
+                            // ↵ (Enter) from the bundled symbol font.
+                            egui::RichText::new("Apply  ↵")
+                                .family(egui::FontFamily::Name("shortcut".into()))
                                 .size(15.0)
                                 .strong()
                                 .color(egui::Color32::from_rgb(228, 245, 233)),
@@ -1791,6 +1830,26 @@ fn notify_daemon() {
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+/// Open Preferences straight to the Providers tab — used when the user asks
+/// to escalate but no LLM API key is configured yet. Spawns a detached
+/// `hyprcorrect prefs` (the prefs window is a singleton, so a second spawn
+/// just focuses the open one); the section is passed via
+/// `$HYPRCORRECT_PREFS_SECTION`, mirroring the daemon's launcher.
+fn open_prefs_providers() {
+    use std::process::{Command, Stdio};
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("hyprcorrect: cannot find own executable to open Preferences");
+        return;
+    };
+    let _ = Command::new(exe)
+        .arg("prefs")
+        .env("HYPRCORRECT_PREFS_SECTION", "providers")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 #[cfg(test)]
