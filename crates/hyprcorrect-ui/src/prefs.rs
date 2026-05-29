@@ -654,9 +654,16 @@ impl eframe::App for PrefsApp {
         egui::TopBottomPanel::bottom("actions")
             .resizable(false)
             .min_height(54.0)
+            // 20px horizontal padding to line the action row up with the
+            // content column above it.
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(4.0);
+                    // 20px between buttons.
+                    ui.spacing_mut().item_spacing.x = 20.0;
                     let quit_label = egui::RichText::new("Quit hyprcorrect")
                         .color(egui::Color32::from_rgb(220, 90, 90));
                     if ui.add(egui::Button::new(quit_label)).clicked() {
@@ -675,7 +682,6 @@ impl eframe::App for PrefsApp {
                     }
 
                     if !self.status.text.is_empty() {
-                        ui.add_space(8.0);
                         let color = if self.status.is_error {
                             ui.visuals().error_fg_color
                         } else {
@@ -685,7 +691,7 @@ impl eframe::App for PrefsApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.x = 20.0;
                         if ui
                             .add_enabled(self.dirty(), egui::Button::new("Save"))
                             .clicked()
@@ -890,7 +896,7 @@ impl PrefsApp {
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "Smart provider");
+        field_label_with_info(ui, "Smart provider", SMART_PROVIDER_TOOLTIP);
         caption(ui, "Used for fix-last-sentence and the review popup.");
         ui.add_space(4.0);
         touched |= provider_radio(ui, &mut self.config.providers.smart, None);
@@ -1768,6 +1774,22 @@ chord never silently no-ops.
 Privacy: your typed text leaves your machine on every chord. \
 Pick Spellbook if that's a concern.";
 
+/// Tooltip for the *Smart provider* `(i)` — the smart path operates on a
+/// whole sentence, so it warns about that explicitly.
+const SMART_PROVIDER_TOOLTIP: &str = "\
+Fix-last-sentence and the review popup send the whole sentence around \
+the caret to the chosen provider — not just one word.
+
+With the LLM, it returns a corrected version of the ENTIRE sentence, so \
+any word in it can change to fix spelling, typos, and minor grammar \
+(including homophones like their/there). It's told to preserve your \
+wording, voice, and punctuation and to leave already-correct text \
+unchanged — it won't freely rephrase. LanguageTool changes only the \
+spans it flags; Spellbook only fixes individual misspelled words.
+
+Privacy: the whole sentence leaves your machine when the provider is \
+the LLM or a remote LanguageTool.";
+
 /// Render a provider-id radio group; returns `true` if the user
 /// changed the selection in this frame. When `llm_tooltip` is
 /// `Some`, an info icon next to the LLM radio surfaces that
@@ -2014,7 +2036,14 @@ fn editable_combo(
         );
         changed |= edit.changed();
         let btn = combo_arrow_button(ui, edit.rect.height());
+        // The whole field is the dropdown trigger: clicking the field OR the
+        // chevron toggles the menu (you can still type to enter a custom
+        // value). Position it below the wide field — anchoring to the narrow
+        // chevron made egui clamp the menu to a sliver against the screen.
+        let toggled = edit.clicked() || btn.clicked();
         egui::Popup::menu(&btn)
+            .anchor(&edit)
+            .open_memory(toggled.then_some(egui::SetOpenCommand::Toggle))
             .id(ui.make_persistent_id((id_salt, "popup")))
             .width(field_w + TEXT_EDIT_MARGIN_X)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
@@ -2647,6 +2676,13 @@ fn apply_style(ctx: &egui::Context) {
         // combo-box drop buttons were being clipped under the float lane.
         style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.visuals.widgets.inactive.expansion = 0.0;
+        // 4px rounding on inputs, buttons, and other widgets.
+        let r = egui::CornerRadius::same(4);
+        style.visuals.widgets.noninteractive.corner_radius = r;
+        style.visuals.widgets.inactive.corner_radius = r;
+        style.visuals.widgets.hovered.corner_radius = r;
+        style.visuals.widgets.active.corner_radius = r;
+        style.visuals.widgets.open.corner_radius = r;
     });
 }
 
