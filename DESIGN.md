@@ -350,9 +350,13 @@ hotkey:
 - `review` — open the popup for the last word / N words / sentence.
 
 The **review popup** (egui) opens with the proposed correction shown as
-editable text and has two modes:
+editable text and has two modes that `Ctrl+E` toggles between. The popup
+opens in word-edit by default, or straight into vim when
+`behavior.review_starts_in_vim` is set (in which case `Ctrl+E` flips to
+word-edit); switching from vim re-diffs the edited sentence so vim edits
+carry into the word fields:
 
-- **Word-edit mode** (default): the words the corrector *changed* render
+- **Word-edit mode**: the words the corrector *changed* render
   as inline single-line fields; unchanged words stay static. The first
   changed word opens focused with its text selected, so typing replaces
   it. `Tab`/`Shift+Tab` and `←`/`→` move between fields, `Enter` applies,
@@ -375,7 +379,7 @@ editable text and has two modes:
   line-height between wrapped lines. Column widths track each field's
   *current* length, so a field grown by typing re-wraps with the rest of
   the line instead of running off the edge.
-- **Vim mode** (`Ctrl+E`): the whole sentence becomes a small modal
+- **Vim mode**: the whole sentence becomes a small modal
   editor — a deliberate *subset* of vim, for when the correction is
   wrong and needs free-form fixing. NORMAL/INSERT/COMMAND; motions
   `h l w b e 0 ^ $ j k` / `gg` / `G` / Home / End (with `virtualedit`-style

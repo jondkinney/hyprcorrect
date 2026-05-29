@@ -1268,36 +1268,50 @@ impl PrefsApp {
             return;
         }
 
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !op_in_flight && base.is_some(),
-                    egui::Button::new("Download n-grams (~8.4 GB)"),
-                )
-                .on_hover_text(
-                    "Downloads LanguageTool's English n-gram data to the app's data \
-                     folder and enables it. Needs ~24 GB free while unzipping.",
-                )
-                .clicked()
-                && let Some(d) = base.clone()
-            {
-                self.ngram_download = Some(crate::ngrams::spawn_ngram_download(d));
-                self.ok("Downloading n-grams…");
-            }
-            if let (Some(dir), Some(port)) = (user_dir.as_deref(), port) {
-                if ui
-                    .add_enabled(
-                        !op_in_flight,
-                        egui::Button::new("Enable n-grams").frame(false),
+        // A valid user-supplied folder (contains en/) → Enable as a real
+        // button and hide Download. Clearing the field (no valid data) brings
+        // Download back — a presence/validity check, not the act of editing.
+        let user_valid = user_dir
+            .as_deref()
+            .and_then(|d| crate::ngrams::data_root(std::path::Path::new(d)));
+        if let Some(valid_root) = user_valid {
+            let mount = valid_root.to_string_lossy().to_string();
+            if let Some(port) = port
+                && ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Enable n-grams"))
+                    .on_hover_text(
+                        "Mounts the n-gram data at the folder below and recreates the \
+                         container.",
                     )
-                    .on_hover_text("Use n-gram data you already have at the folder below.")
                     .clicked()
-                {
-                    self.docker_op = Some(docker::enable_ngrams(port, dir));
-                    self.ok(OpKind::EnableNgrams.label());
-                }
+            {
+                self.docker_op = Some(docker::enable_ngrams(port, &mount));
+                self.ok(OpKind::EnableNgrams.label());
             }
-        });
+            ui.add_space(4.0);
+            caption(
+                ui,
+                "Off — n-gram data found at the folder below. Click Enable to turn it on.",
+            );
+            return;
+        }
+
+        // No data anywhere → the one-click download.
+        if ui
+            .add_enabled(
+                !op_in_flight && base.is_some(),
+                egui::Button::new("Download n-grams (~8.4 GB)"),
+            )
+            .on_hover_text(
+                "Downloads LanguageTool's English n-gram data to the app's data \
+                 folder and enables it. Needs ~24 GB free while unzipping.",
+            )
+            .clicked()
+            && let Some(d) = base.clone()
+        {
+            self.ngram_download = Some(crate::ngrams::spawn_ngram_download(d));
+            self.ok("Downloading n-grams…");
+        }
         ui.add_space(4.0);
         caption(
             ui,
@@ -1491,14 +1505,33 @@ impl PrefsApp {
                 self.clear_status();
             }
             ui.add_space(6.0);
-            caption(
+            caption_with_code(
                 ui,
-                "Drops a `hyprcorrect.desktop` into `~/.config/\
-                 autostart/` so the daemon starts with your session. \
-                 Takes effect on save.",
+                "Drops a `hyprcorrect.desktop` into `~/.config/autostart/` \
+                 so the daemon starts with your session. Takes effect on save.",
             );
             ui.add_space(SETTING_BLOCK_SPACING);
         }
+
+        field_label(ui, "Review popup");
+        ui.add_space(4.0);
+        if ui
+            .checkbox(
+                &mut self.config.behavior.review_starts_in_vim,
+                "Open in vim mode",
+            )
+            .changed()
+        {
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption_with_code(
+            ui,
+            "Start the review popup in vim mode — modal editing of the whole \
+             sentence — instead of word-edit (Tab) mode. `Ctrl+E` toggles between \
+             the two either way, so with this on it flips to word-edit.",
+        );
+        ui.add_space(SETTING_BLOCK_SPACING);
 
         field_label(ui, "Pause per backspace");
         caption(
@@ -1666,9 +1699,10 @@ impl PrefsApp {
                 .selected_text(selected_display)
                 .width(combo_w)
                 .show_ui(ui, |ui| {
-                    // Open the dropdown as wide as the combo (it otherwise
-                    // shrinks to the narrowest entry).
+                    // Match the combo width, plus a hair of top space so the
+                    // search field isn't flush against the combo button.
                     ui.set_min_width(combo_w);
+                    ui.add_space(2.0);
                     ui.add(
                         egui::TextEdit::singleline(filter)
                             .hint_text("Search")
@@ -1679,6 +1713,9 @@ impl PrefsApp {
                     let needle = filter.to_ascii_lowercase();
                     egui::ScrollArea::vertical()
                         .max_height(260.0)
+                        // Full width so the scrollbar sits at the right edge,
+                        // not floating in the middle behind narrow rows.
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for c in &candidates {
                                 if !needle.is_empty()
@@ -1689,21 +1726,44 @@ impl PrefsApp {
                                 }
                                 let is_selected =
                                     selected_ref.as_deref() == Some(c.identifier.as_str());
-                                let row = ui
-                                    .horizontal(|ui| {
-                                        if let Some(handle) = &c.icon {
-                                            ui.add(
-                                                egui::Image::new(handle)
-                                                    .fit_to_exact_size(egui::vec2(20.0, 20.0)),
-                                            );
-                                        } else {
-                                            placeholder_app_icon(ui);
-                                        }
-                                        ui.add_space(6.0);
-                                        ui.selectable_label(is_selected, &c.display_name)
-                                    })
-                                    .inner;
-                                if row.clicked() {
+                                // Full-width clickable row: icon (or placeholder
+                                // tile) + name with a tight gap, and a
+                                // selection/hover highlight spanning the row.
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 26.0),
+                                    egui::Sense::click(),
+                                );
+                                if ui.is_rect_visible(rect) {
+                                    let vis = ui.style().interact_selectable(&resp, is_selected);
+                                    if is_selected || resp.hovered() {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            egui::CornerRadius::same(4),
+                                            vis.bg_fill,
+                                        );
+                                    }
+                                    let icon_rect = egui::Rect::from_min_size(
+                                        egui::pos2(rect.left() + 4.0, rect.center().y - 10.0),
+                                        egui::vec2(20.0, 20.0),
+                                    );
+                                    if let Some(handle) = &c.icon {
+                                        egui::Image::new(handle).paint_at(ui, icon_rect);
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            icon_rect.shrink(1.0),
+                                            egui::CornerRadius::same(4),
+                                            egui::Color32::from_gray(58),
+                                        );
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(icon_rect.right() + 6.0, rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &c.display_name,
+                                        egui::TextStyle::Body.resolve(ui.style()),
+                                        vis.text_color(),
+                                    );
+                                }
+                                if resp.clicked() {
                                     *selected_ref = Some(c.identifier.clone());
                                 }
                             }
@@ -1727,10 +1787,12 @@ impl PrefsApp {
         field_label(ui, "Or add by class name");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let resp = ui.add(
+            let w = (ui.available_width() - 80.0).max(80.0);
+            let resp = bordered_text_edit(
+                ui,
                 egui::TextEdit::singleline(&mut self.blocklist_entry)
                     .margin(egui::Margin::symmetric(8, 6))
-                    .desired_width(ui.available_width() - 80.0),
+                    .desired_width(w),
             );
             let add_clicked = ui.button("Add").clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
@@ -2512,6 +2574,34 @@ fn caption(ui: &mut egui::Ui, text: &str) {
             .line_height(Some(CAPTION_LINE_HEIGHT))
             .color(egui::Color32::from_gray(170)),
     );
+}
+
+/// Like [`caption`] but renders backtick-delimited spans as inline code
+/// chips (monospace with a faint background), e.g. `` `~/.config/` ``.
+/// The text wraps as one flowing paragraph (a single `LayoutJob`).
+fn caption_with_code(ui: &mut egui::Ui, text: &str) {
+    let mut job = egui::text::LayoutJob::default();
+    let plain = egui::TextFormat {
+        font_id: egui::FontId::proportional(CAPTION_SIZE),
+        color: egui::Color32::from_gray(170),
+        line_height: Some(CAPTION_LINE_HEIGHT),
+        ..Default::default()
+    };
+    let code = egui::TextFormat {
+        font_id: egui::FontId::monospace(CAPTION_SIZE - 1.0),
+        color: egui::Color32::from_gray(220),
+        background: ui.visuals().code_bg_color,
+        line_height: Some(CAPTION_LINE_HEIGHT),
+        ..Default::default()
+    };
+    // Even segments are plain text, odd segments sat between backticks.
+    for (i, part) in text.split('`').enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        job.append(part, 0.0, if i % 2 == 1 { code.clone() } else { plain.clone() });
+    }
+    ui.label(job);
 }
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;

@@ -138,10 +138,17 @@ struct ReviewApp {
     /// True between an "Ask LLM" escalation and its reloaded result, so a
     /// no-change LLM pass doesn't trigger the initial close-on-no-op.
     reprocessing: bool,
+    /// When set (from `behavior.review_starts_in_vim`), the first
+    /// successful `load_review` flips straight into vim mode. Cleared
+    /// after, so flipping back to word mode (Ctrl+E) sticks.
+    pending_initial_vim: bool,
 }
 
 impl ReviewApp {
     fn new(request: ReviewRequest) -> Self {
+        let start_in_vim = hyprcorrect_core::Config::load()
+            .map(|c| c.behavior.review_starts_in_vim)
+            .unwrap_or(false);
         let mut app = Self {
             request,
             decision: None,
@@ -160,6 +167,7 @@ impl ReviewApp {
             field_originals: Vec::new(),
             vim_suggest: None,
             reprocessing: false,
+            pending_initial_vim: start_in_vim,
         };
         if !app.request.pending {
             app.load_review();
@@ -191,6 +199,12 @@ impl ReviewApp {
         };
         self.initialized = false; // re-run focus init on the next frame
         self.ready = true;
+        // Honor "open in vim mode" on the first load only — so a later
+        // flip back to word mode (Ctrl+E) isn't undone on rebuild.
+        if self.pending_initial_vim {
+            self.pending_initial_vim = false;
+            self.enter_vim();
+        }
     }
 
     /// Dropdown entries for the focused field: the ranked alternatives,
@@ -322,6 +336,16 @@ impl ReviewApp {
             .collect();
         self.vim = Some(VimEdit::new(sentence, cursor));
         self.mode = EditMode::Vim;
+    }
+
+    /// Flip from vim back to word-edit mode, re-diffing the vim buffer
+    /// against the original so any vim edits carry into the word fields.
+    fn exit_vim(&mut self) {
+        if let Some(text) = self.vim.as_ref().map(|v| v.text().to_string()) {
+            self.request.corrected = text;
+        }
+        self.load_review();
+        self.mode = EditMode::Word;
     }
 
     /// Move focus `delta` fields from the current one, wrapping.
@@ -689,6 +713,12 @@ impl ReviewApp {
     // ---- vim mode -------------------------------------------------
 
     fn input_vim(&mut self, ctx: &egui::Context) {
+        // Ctrl+E flips back to word-edit mode. Consume it first so the 'e'
+        // never reaches the vim editor as a motion.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
+            self.exit_vim();
+            return;
+        }
         // Vim doesn't use Tab; swallow it so egui doesn't move focus
         // onto the action buttons.
         ctx.input_mut(|i| {

@@ -1520,27 +1520,20 @@ fn focused_monitor_width() -> f32 {
 #[cfg(target_os = "linux")]
 fn install_window_rules() {
     use std::process::Command;
-    // The review popup's Wayland app_id (set via egui's
-    // `ViewportBuilder::with_app_id`). Hyprland sees it as the
-    // window's `class:`. Prefs intentionally stays tile-managed —
-    // it's a regular standalone window that's fine to dock.
+    // Only the transient review popup is floated/centered by us. The
+    // prefs window is deliberately left alone — no float rule — so it
+    // obeys Hyprland's normal tiling (and any rule the user sets). Its
+    // width is constrained from the app instead (ViewportBuilder
+    // `with_max_inner_size`), per request, rather than a Hyprland rule.
+    // (A stale `float on, hyprcorrect-prefs` rule injected by an older
+    // daemon clears on `hyprctl reload`.)
     const REVIEW_CLASS: &str = "hyprcorrect-review";
-    const PREFS_CLASS: &str = "hyprcorrect-prefs";
     // Hyprland's current syntax (post-deprecation of windowrulev2):
-    // `windowrule = <rule>, match:class <CLASS>`. State-bearing
-    // rules require the `on` suffix (`float on`, not bare `float`).
-    //
-    // The two `float off` lines neutralize any leftover rules a
-    // previous daemon may have keyword-injected before we narrowed
-    // the float to review-only. Runtime keyword rules persist
-    // until Hyprland restarts, so without these overrides the
-    // prefs window would keep floating on subsequent daemon
-    // restarts. Cheap to send on every startup.
+    // `windowrule = <rule>, match:class <CLASS>`. State-bearing rules
+    // require the `on` suffix (`float on`, not bare `float`).
     for rule in [
         format!("float on, match:class {REVIEW_CLASS}"),
         format!("center on, match:class {REVIEW_CLASS}"),
-        format!("float off, match:class {PREFS_CLASS}"),
-        format!("center off, match:class {PREFS_CLASS}"),
     ] {
         let result = Command::new("hyprctl")
             .args(["keyword", "windowrule", &rule])

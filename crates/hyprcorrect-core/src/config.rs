@@ -199,12 +199,18 @@ pub struct Behavior {
     /// on so a subsequent fix-word can still operate on the
     /// already-typed text.
     pub reset_keys: ResetKeys,
+
+    /// Open the review popup straight into vim mode instead of the
+    /// word-edit (Tab) mode. `Ctrl+E` still toggles between the two — so
+    /// when this is on, `Ctrl+E` flips *to* word-edit mode.
+    pub review_starts_in_vim: bool,
 }
 impl Default for Behavior {
     fn default() -> Self {
         Self {
             pause_per_backspace_ms: 8,
             reset_keys: ResetKeys::default(),
+            review_starts_in_vim: false,
         }
     }
 }
