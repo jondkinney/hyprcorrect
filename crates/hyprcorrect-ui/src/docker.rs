@@ -87,6 +87,8 @@ pub enum OpKind {
     Start,
     Stop,
     Remove,
+    /// Recreate the container with the n-gram data mounted.
+    EnableNgrams,
 }
 
 impl OpKind {
@@ -96,8 +98,19 @@ impl OpKind {
             Self::Start => "Starting container…",
             Self::Stop => "Stopping container…",
             Self::Remove => "Removing container…",
+            Self::EnableNgrams => "Recreating the container with n-grams…",
         }
     }
+}
+
+/// Combined result of a status probe: reachability/lifecycle plus whether
+/// the *managed* container is running with the n-gram dataset mounted
+/// (`Some(true)`/`Some(false)`), or `None` when there's no managed
+/// container to inspect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeResult {
+    pub status: LanguageToolStatus,
+    pub ngrams: Option<bool>,
 }
 
 /// Result reported by the background worker — `Ok(())` on success,
@@ -127,11 +140,11 @@ impl OpHandle {
 /// Handle to a background status probe (URL probe + docker
 /// inspection). Same poll pattern as [`OpHandle`].
 pub struct StatusHandle {
-    result: Arc<Mutex<Option<LanguageToolStatus>>>,
+    result: Arc<Mutex<Option<ProbeResult>>>,
 }
 
 impl StatusHandle {
-    pub fn poll(&self) -> Option<LanguageToolStatus> {
+    pub fn poll(&self) -> Option<ProbeResult> {
         self.result.lock().ok().and_then(|mut g| g.take())
     }
 }
@@ -144,17 +157,17 @@ pub fn spawn_status_probe(url: String) -> StatusHandle {
     thread::Builder::new()
         .name("hyprcorrect-lt-probe".into())
         .spawn(move || {
-            let status = probe_status_blocking(&url);
+            let res = probe_status_blocking(&url);
             if let Ok(mut g) = result_for_thread.lock() {
-                *g = Some(status);
+                *g = Some(res);
             }
         })
         .ok();
     StatusHandle { result }
 }
 
-fn probe_status_blocking(url: &str) -> LanguageToolStatus {
-    if probe_url(url) {
+fn probe_status_blocking(url: &str) -> ProbeResult {
+    let status = if probe_url(url) {
         let managed_container_running =
             matches!(check_docker_state(), DockerState::ContainerRunning);
         LanguageToolStatus::Reachable {
@@ -162,7 +175,27 @@ fn probe_status_blocking(url: &str) -> LanguageToolStatus {
         }
     } else {
         LanguageToolStatus::Unreachable(check_docker_state())
+    };
+    ProbeResult {
+        status,
+        ngrams: managed_ngrams(),
     }
+}
+
+/// Whether *our* container is configured with the n-gram dataset, by
+/// inspecting its env for `langtool_languageModel`. `None` when the
+/// managed container doesn't exist (nothing to inspect).
+fn managed_ngrams() -> Option<bool> {
+    let output = Command::new("docker")
+        .args(["inspect", "--format", "{{json .Config.Env}}", CONTAINER])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None; // no such container
+    }
+    let env = String::from_utf8_lossy(&output.stdout);
+    Some(env.contains("langtool_languageModel"))
 }
 
 /// Hit `<url>/v2/languages` — LanguageTool's no-parameter GET endpoint
@@ -295,28 +328,45 @@ fn find_container_by_image(image: &str) -> Option<ForeignContainer> {
 /// n-gram confusion rules (wear/where). The folder must be the unzipped
 /// n-gram data — the directory holding `en/`.
 pub fn install(host_port: u16, ngram_dir: Option<&str>) -> OpHandle {
-    let port_map = format!("{host_port}:{IMAGE_PORT}");
     let ngram = ngram_dir.map(str::to_string);
     spawn_op(OpKind::Install, move || {
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "-d".into(),
-            "--name".into(),
-            CONTAINER.into(),
-            "--restart=unless-stopped".into(),
-            "-p".into(),
-            port_map,
-        ];
-        // Options must precede the image name in `docker run`.
-        if let Some(dir) = ngram.as_deref().filter(|d| !d.trim().is_empty()) {
-            args.push("-v".into());
-            args.push(format!("{dir}:/ngrams"));
-            args.push("-e".into());
-            args.push("langtool_languageModel=/ngrams".into());
-        }
-        args.push(IMAGE.into());
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_command("docker", &refs)
+        run_install(host_port, ngram.as_deref())
+    })
+}
+
+/// `docker run` the container, optionally with the n-gram data mounted.
+/// Shared by [`install`] and [`enable_ngrams`].
+fn run_install(host_port: u16, ngram_dir: Option<&str>) -> OpResult {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        CONTAINER.into(),
+        "--restart=unless-stopped".into(),
+        "-p".into(),
+        format!("{host_port}:{IMAGE_PORT}"),
+    ];
+    // Options must precede the image name in `docker run`.
+    if let Some(dir) = ngram_dir.filter(|d| !d.trim().is_empty()) {
+        args.push("-v".into());
+        args.push(format!("{dir}:/ngrams"));
+        args.push("-e".into());
+        args.push("langtool_languageModel=/ngrams".into());
+    }
+    args.push(IMAGE.into());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_command("docker", &refs)
+}
+
+/// Recreate the managed container with the n-gram dataset mounted. A
+/// mount/env can't be added to a running container, so this removes ours
+/// (if present) and runs a fresh one — independent of the basic install,
+/// and re-runnable to pick up a changed `ngram_dir`.
+pub fn enable_ngrams(host_port: u16, ngram_dir: &str) -> OpHandle {
+    let dir = ngram_dir.to_string();
+    spawn_op(OpKind::EnableNgrams, move || {
+        let _ = run_command("docker", &["rm", "-f", CONTAINER]); // ignore "no such container"
+        run_install(host_port, Some(&dir))
     })
 }
 

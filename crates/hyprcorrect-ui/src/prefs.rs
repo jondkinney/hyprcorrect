@@ -150,6 +150,10 @@ struct PrefsApp {
     /// inspection. Updated by the background [`StatusHandle`] worker;
     /// the UI just reads this. `None` until the first probe lands.
     lt_status: Option<LanguageToolStatus>,
+    /// Whether the managed container has the n-gram dataset mounted —
+    /// tracked separately from its run state. `None` = no managed
+    /// container (or not probed yet).
+    lt_ngrams: Option<bool>,
     /// Last status refresh — re-probed every few seconds while the
     /// Providers panel is visible so a foreign container the user
     /// just started shows up.
@@ -196,6 +200,7 @@ impl PrefsApp {
             app_filter: String::new(),
             app_registry: AppRegistry::discover(),
             lt_status: None,
+            lt_ngrams: None,
             last_status_check: Instant::now() - Duration::from_secs(60),
             status_probe: None,
             docker_op: None,
@@ -208,9 +213,10 @@ impl PrefsApp {
     /// `docker` invocations) on a worker thread.
     fn refresh_lt_status(&mut self, ctx: &egui::Context) {
         if let Some(handle) = &self.status_probe
-            && let Some(status) = handle.poll()
+            && let Some(result) = handle.poll()
         {
-            self.lt_status = Some(status);
+            self.lt_status = Some(result.status);
+            self.lt_ngrams = result.ngrams;
             self.status_probe = None;
             ctx.request_repaint();
         }
@@ -257,6 +263,10 @@ impl PrefsApp {
                         OpKind::Start => "LanguageTool started.",
                         OpKind::Stop => "LanguageTool stopped.",
                         OpKind::Remove => "LanguageTool container removed.",
+                        OpKind::EnableNgrams => {
+                            self.config.providers.languagetool.enabled = true;
+                            "n-grams enabled — container recreated with the dataset."
+                        }
                     };
                     self.ok(msg);
                 }
@@ -266,6 +276,7 @@ impl PrefsApp {
                         OpKind::Start => "start",
                         OpKind::Stop => "stop",
                         OpKind::Remove => "remove",
+                        OpKind::EnableNgrams => "enable n-grams",
                     };
                     self.err(format!("Docker {verb} failed: {e}"));
                 }
@@ -789,7 +800,7 @@ impl PrefsApp {
             ui,
             "Unzipped n-gram data (the folder containing en/) — catches real-word \
              confusions like wear/where. Download separately (~8 GB) from \
-             languagetool.org; the Install button below mounts it.",
+             languagetool.org, then use \"Enable n-grams\" under Local server below.",
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
@@ -877,6 +888,73 @@ impl PrefsApp {
                 self.docker_unreachable_row(ui, &docker_state, &url, op_in_flight);
             }
         }
+
+        self.languagetool_ngram_row(ui, &url, op_in_flight);
+    }
+
+    /// n-gram status + controls — tracked independently of the container's
+    /// run state, since the dataset is a `docker run` mount that can only
+    /// be added by (re)creating the container.
+    fn languagetool_ngram_row(&mut self, ui: &mut egui::Ui, url: &str, op_in_flight: bool) {
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "n-grams (wear/where)");
+        ui.add_space(4.0);
+
+        let dir = self
+            .config
+            .providers
+            .languagetool
+            .ngram_dir
+            .clone()
+            .filter(|d| !d.trim().is_empty());
+        let port = docker::host_port_from_url(url);
+
+        // Loaded: green confirmation + a Reload to pick up a changed folder.
+        if self.lt_ngrams == Some(true) {
+            ui.colored_label(
+                egui::Color32::from_rgb(110, 200, 130),
+                "Loaded — real-word confusions are caught.",
+            );
+            if let (Some(dir), Some(port)) = (dir.as_deref(), port) {
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(
+                        !op_in_flight,
+                        egui::Button::new("Reload n-grams").frame(false),
+                    )
+                    .on_hover_text("Recreate the container with the current data folder.")
+                    .clicked()
+                {
+                    self.docker_op = Some(docker::enable_ngrams(port, dir));
+                    self.ok(OpKind::EnableNgrams.label());
+                }
+            }
+            return;
+        }
+
+        // Not loaded — offer to enable when we have a folder and a port.
+        match (dir.as_deref(), port) {
+            (None, _) => caption(ui, "Off. Set an n-gram data folder above to enable."),
+            (Some(_), None) => caption(
+                ui,
+                "Off. Give the URL an explicit port (e.g. http://localhost:8081) first.",
+            ),
+            (Some(dir), Some(port)) => {
+                if ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Enable n-grams"))
+                    .on_hover_text(
+                        "(Re)creates the hyprcorrect LanguageTool container with the \
+                         n-gram dataset mounted — separate from the basic install.",
+                    )
+                    .clicked()
+                {
+                    self.docker_op = Some(docker::enable_ngrams(port, dir));
+                    self.ok(OpKind::EnableNgrams.label());
+                }
+                ui.add_space(4.0);
+                caption(ui, "Off. Recreates the container with the data mounted.");
+            }
+        }
     }
 
     /// The "URL didn't answer" branch — drives the install / start UI.
@@ -953,30 +1031,15 @@ impl PrefsApp {
             DockerState::AbsentContainer | DockerState::ForeignContainer { .. } => {
                 let port = docker::host_port_from_url(url);
                 let enabled = !op_in_flight && port.is_some();
-                let ngram = self
-                    .config
-                    .providers
-                    .languagetool
-                    .ngram_dir
-                    .clone()
-                    .filter(|d| !d.trim().is_empty());
                 let hover = match port {
-                    Some(p) => {
-                        let ngram_line = match &ngram {
-                            Some(dir) => format!(
-                                " \\\n      -v {dir}:/ngrams -e langtool_languageModel=/ngrams"
-                            ),
-                            None => String::new(),
-                        };
-                        format!(
-                            "Runs:\n  docker run -d --name {} --restart=unless-stopped \\\
-                             \n      -p {}:8010{} {}\nFirst run downloads ~600 MB.",
-                            docker::CONTAINER,
-                            p,
-                            ngram_line,
-                            docker::IMAGE,
-                        )
-                    }
+                    Some(p) => format!(
+                        "Runs:\n  docker run -d --name {} --restart=unless-stopped \\\
+                         \n      -p {}:8010 {}\nFirst run downloads ~600 MB. Add n-grams \
+                         separately below.",
+                        docker::CONTAINER,
+                        p,
+                        docker::IMAGE,
+                    ),
                     None => "URL needs an explicit port (e.g. http://localhost:8081) before \
                              hyprcorrect can map it to the container."
                         .to_string(),
@@ -987,7 +1050,7 @@ impl PrefsApp {
                     .clicked()
                     && let Some(port) = port
                 {
-                    self.docker_op = Some(docker::install(port, ngram.as_deref()));
+                    self.docker_op = Some(docker::install(port, None));
                     self.ok(OpKind::Install.label());
                 }
             }
