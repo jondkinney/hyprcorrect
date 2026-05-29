@@ -724,9 +724,11 @@ impl eframe::App for PrefsApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Scrollbar sits flush at the edge; the form keeps a
-                        // 20px right gap (responsive — grows with the window).
-                        ui.set_max_width((ui.available_width() - 20.0).max(0.0));
+                        // Scrollbar sits flush at the edge. Reserve only 10px
+                        // here: the solid scrollbar already takes ~10px
+                        // (bar_inner_margin 4 + bar_width 6), so total right
+                        // padding (gap + scrollbar) ≈ 20px, matching the left.
+                        ui.set_max_width((ui.available_width() - 10.0).max(0.0));
                         match self.section {
                             Section::Hotkeys => self.hotkeys_panel(ui),
                             Section::Providers => self.providers_panel(ui),
@@ -2066,10 +2068,14 @@ fn editable_combo(
                 // the options rendered one character per line.
                 ui.set_min_width(field_w + TEXT_EDIT_MARGIN_X);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                for opt in options {
-                    if ui.selectable_label(text.as_str() == *opt, *opt).clicked() {
-                        *text = (*opt).to_string();
-                        changed = true;
+                if options.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("(none available)").frame(false));
+                } else {
+                    for opt in options {
+                        if ui.selectable_label(text.as_str() == *opt, *opt).clicked() {
+                            *text = (*opt).to_string();
+                            changed = true;
+                        }
                     }
                 }
             });
@@ -2175,7 +2181,7 @@ impl PrefsApp {
         }
         ui.add_space(SETTING_BLOCK_SPACING);
 
-        field_label(ui, "Backend");
+        field_label(ui, "Provider");
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(backend_display(backend))
@@ -2243,7 +2249,7 @@ impl PrefsApp {
         caption(ui, "Add a hosted LLM (up to 5 providers).");
         ui.add_space(SETTING_BLOCK_SPACING);
 
-        field_label(ui, "Backend");
+        field_label(ui, "Provider");
         ui.add_space(4.0);
         let before = self.llm_draft.backend.clone();
         if editable_combo(
@@ -2251,11 +2257,11 @@ impl PrefsApp {
             "add_backend",
             &mut self.llm_draft.backend,
             LLM_BACKENDS,
-            "Pick or type a backend",
+            "Pick or type a provider",
         ) {
             touched = true;
-            // When the backend changes, default the model to that
-            // backend's cheapest/fastest.
+            // When the provider changes, default the model to that
+            // provider's cheapest/fastest.
             if self.llm_draft.backend != before {
                 self.llm_draft.model = models_for_backend(&self.llm_draft.backend)
                     .first()
@@ -2276,19 +2282,8 @@ impl PrefsApp {
             "Pick or type a model",
         );
 
-        ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "API key");
-        ui.add_space(4.0);
-        touched |= padded_password_edit(ui, &mut self.llm_draft_key).changed();
-        ui.add_space(4.0);
-        caption(ui, "Stored in your OS keychain, not in config.toml.");
-
+        // Validate up front so the Save button on the API-key row can gate.
         let backend = self.llm_draft.backend.trim().to_string();
-        if !backend.is_empty() && !hyprcorrect_core::llm::is_backend_wired(&backend) {
-            ui.add_space(6.0);
-            not_wired_note(ui, &backend);
-        }
-
         let dup = self
             .config
             .providers
@@ -2299,12 +2294,39 @@ impl PrefsApp {
         let can_add = !backend.is_empty() && !dup && !full;
 
         ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "API key");
+        ui.add_space(4.0);
+        // Save sits on the API-key row (right), the key field fills the rest —
+        // mirroring how the chevron sits beside the combo field.
         let mut save_clicked = false;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             save_clicked = ui
                 .add_enabled(can_add, egui::Button::new("Save provider"))
                 .clicked();
+            touched |= padded_password_edit(ui, &mut self.llm_draft_key).changed();
         });
+        ui.add_space(4.0);
+        caption(ui, "Stored in your OS keychain, not in config.toml.");
+
+        if !backend.is_empty() && !hyprcorrect_core::llm::is_backend_wired(&backend) {
+            ui.add_space(6.0);
+            not_wired_note(ui, &backend);
+        }
+        if dup && !backend.is_empty() {
+            ui.add_space(4.0);
+            caption(
+                ui,
+                &format!("{} already has a tab.", backend_display(&backend)),
+            );
+        } else if full {
+            ui.add_space(4.0);
+            caption(
+                ui,
+                "Maximum of 5 providers reached — remove one to add another.",
+            );
+        }
+
         if save_clicked {
             let model = if self.llm_draft.model.trim().is_empty() {
                 models_for_backend(&backend)
@@ -2327,19 +2349,6 @@ impl PrefsApp {
             };
             self.llm_draft_key.clear();
             touched = true;
-        }
-        if dup && !backend.is_empty() {
-            ui.add_space(4.0);
-            caption(
-                ui,
-                &format!("{} already has a tab.", backend_display(&backend)),
-            );
-        } else if full {
-            ui.add_space(4.0);
-            caption(
-                ui,
-                "Maximum of 5 providers reached — remove one to add another.",
-            );
         }
         touched
     }
@@ -2400,7 +2409,11 @@ fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Respons
 /// gray/accent strokes.
 fn bordered_text_edit(ui: &mut egui::Ui, te: egui::TextEdit<'_>) -> egui::Response {
     let prev = ui.visuals().widgets.inactive.bg_stroke;
-    ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+    // Border in the field's own fill color, so it reads as the same height
+    // as the buttons beside it without a contrasting outline. Hover/focus
+    // keep egui's gray/accent strokes.
+    let fill = ui.visuals().text_edit_bg_color();
+    ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0, fill);
     let resp = ui.add(te);
     ui.visuals_mut().widgets.inactive.bg_stroke = prev;
     resp
@@ -2706,13 +2719,22 @@ fn apply_style(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 6.0);
         style.spacing.indent = 14.0;
-        style.spacing.interact_size = egui::vec2(40.0, 28.0);
+        // Keep the interaction-size floor BELOW a text field's natural
+        // height. egui floors a Button's height to interact_size.y but a
+        // TextEdit's it does not, so a too-high floor made buttons and the
+        // combo chevrons taller than the inputs beside them.
+        style.spacing.interact_size = egui::vec2(40.0, 22.0);
         style.spacing.icon_width = 18.0;
         style.spacing.icon_spacing = 6.0;
         // Solid (space-reserving) scrollbar instead of egui's default
         // floating one, which overlays content — full-width fields and the
         // combo-box drop buttons were being clipped under the float lane.
+        // Zero the track opacities so the bar area blends into the panel
+        // (only the handle shows).
         style.spacing.scroll = egui::style::ScrollStyle::solid();
+        style.spacing.scroll.dormant_background_opacity = 0.0;
+        style.spacing.scroll.active_background_opacity = 0.0;
+        style.spacing.scroll.interact_background_opacity = 0.0;
         style.visuals.widgets.inactive.expansion = 0.0;
         // 4px rounding on inputs, buttons, and other widgets.
         let r = egui::CornerRadius::same(4);
