@@ -135,6 +135,9 @@ struct ReviewApp {
     field_originals: Vec<String>,
     /// An open `z=` spell-suggest dropdown in vim mode, or `None`.
     vim_suggest: Option<VimSuggest>,
+    /// True between an "Ask LLM" escalation and its reloaded result, so a
+    /// no-change LLM pass doesn't trigger the initial close-on-no-op.
+    reprocessing: bool,
 }
 
 impl ReviewApp {
@@ -156,6 +159,7 @@ impl ReviewApp {
             ready: false,
             field_originals: Vec::new(),
             vim_suggest: None,
+            reprocessing: false,
         };
         if !app.request.pending {
             app.load_review();
@@ -280,6 +284,26 @@ impl ReviewApp {
     fn cancel(&mut self, ctx: &egui::Context) {
         self.decision = Some("cancel");
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// "Ask LLM": tell the daemon to re-process the original sentence with
+    /// the LLM (it reloads us via the request file). With an LLM
+    /// configured, flip our own request to `pending` so "Checking…" shows
+    /// at once; without one, the daemon opens Preferences → Providers so
+    /// the user can add a key — the button stays either way.
+    fn escalate_llm(&mut self) {
+        if self.request.llm_available {
+            let mut req = self.request.clone();
+            req.pending = true;
+            let _ = runtime::write_review_request(&req);
+            self.ready = false;
+            self.reprocessing = true;
+        }
+        if let Err(e) = std::fs::write(runtime::action_path(), "review-llm") {
+            eprintln!("hyprcorrect: could not write review-llm action: {e}");
+            return;
+        }
+        notify_daemon();
     }
 
     /// Switch into vim mode, seeding the buffer with the current
@@ -988,19 +1012,35 @@ impl ReviewApp {
 
 impl eframe::App for ReviewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A daemon-initiated re-process (the review-llm chord) flips the
+        // request file back to `pending`; notice it even while a finished
+        // review is on screen, and drop into the "Checking…" view. Poll on
+        // a timer so this is caught when the popup is otherwise idle.
+        if self.ready {
+            if let Ok(Some(req)) = runtime::read_review_request() {
+                if req.pending {
+                    self.ready = false;
+                    self.reprocessing = true;
+                }
+            }
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+
         // Still computing the correction: show "Checking…", poll for the
         // finished request, and bail out of the normal review UI.
         if !self.ready {
             if let Ok(Some(req)) = runtime::read_review_request() {
                 if !req.pending {
-                    if req.corrected == req.original {
-                        // Nothing to change — close without applying.
+                    // An LLM re-process that found nothing must NOT slam the
+                    // popup shut mid-review — only the initial no-op closes.
+                    if !self.reprocessing && req.corrected == req.original {
                         self.decision = Some("cancel");
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         return;
                     }
                     self.request = req;
                     self.load_review();
+                    self.reprocessing = false;
                 }
             }
             if !self.ready {
@@ -1028,6 +1068,7 @@ impl eframe::App for ReviewApp {
         // Action row, pinned to the bottom so it's always reachable.
         let mut do_apply = false;
         let mut do_cancel = false;
+        let mut do_llm = false;
         egui::TopBottomPanel::bottom("review_actions")
             .resizable(false)
             .show(ctx, |ui| {
@@ -1041,6 +1082,22 @@ impl eframe::App for ReviewApp {
                         .clicked()
                     {
                         do_cancel = true;
+                    }
+                    // Escalate to the LLM. Always offered (progressive
+                    // discovery); the trailing ellipsis hints it opens
+                    // setup first when no LLM key is configured yet.
+                    ui.add_space(8.0);
+                    let (llm_label, llm_hint) = if self.request.llm_available {
+                        ("Ask LLM", "Re-run this sentence through the LLM")
+                    } else {
+                        ("Ask LLM…", "Set up an LLM key in Preferences to escalate")
+                    };
+                    if ui
+                        .button(egui::RichText::new(llm_label).size(15.0))
+                        .on_hover_text(llm_hint)
+                        .clicked()
+                    {
+                        do_llm = true;
                     }
                     // Apply is the primary action — filled, pinned to the right.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1063,6 +1120,8 @@ impl eframe::App for ReviewApp {
             self.apply(ctx);
         } else if do_cancel {
             self.cancel(ctx);
+        } else if do_llm {
+            self.escalate_llm();
         }
 
         egui::CentralPanel::default()

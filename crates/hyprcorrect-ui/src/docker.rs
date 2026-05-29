@@ -289,21 +289,34 @@ fn find_container_by_image(image: &str) -> Option<ForeignContainer> {
 
 /// Spawn `docker run -d` on a background thread, returning a handle
 /// the caller can poll. Pulls the image implicitly the first time.
-pub fn install(host_port: u16) -> OpHandle {
+///
+/// When `ngram_dir` is set, the container mounts that host folder and
+/// points LanguageTool at it (`langtool_languageModel`), enabling the
+/// n-gram confusion rules (wear/where). The folder must be the unzipped
+/// n-gram data — the directory holding `en/`.
+pub fn install(host_port: u16, ngram_dir: Option<&str>) -> OpHandle {
+    let port_map = format!("{host_port}:{IMAGE_PORT}");
+    let ngram = ngram_dir.map(str::to_string);
     spawn_op(OpKind::Install, move || {
-        run_command(
-            "docker",
-            &[
-                "run",
-                "-d",
-                "--name",
-                CONTAINER,
-                "--restart=unless-stopped",
-                "-p",
-                &format!("{host_port}:{IMAGE_PORT}"),
-                IMAGE,
-            ],
-        )
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            CONTAINER.into(),
+            "--restart=unless-stopped".into(),
+            "-p".into(),
+            port_map,
+        ];
+        // Options must precede the image name in `docker run`.
+        if let Some(dir) = ngram.as_deref().filter(|d| !d.trim().is_empty()) {
+            args.push("-v".into());
+            args.push(format!("{dir}:/ngrams"));
+            args.push("-e".into());
+            args.push("langtool_languageModel=/ngrams".into());
+        }
+        args.push(IMAGE.into());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_command("docker", &refs)
     })
 }
 

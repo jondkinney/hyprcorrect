@@ -329,7 +329,7 @@ Shipped implementations:
 |---|---|---|---|
 | **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
 | **LLM** (Claude/OpenAI) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. |
-| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. |
+| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL with `level=picky`. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. Real-word confusions (`wear`/`where`) need the server's optional **n-gram** dataset — a Preferences field points at the unzipped data and the install mounts it (`langtool_languageModel`); without it those are missed by design. |
 
 **Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key
@@ -396,6 +396,19 @@ editable text and has two modes:
   in-window, dependency-free, and identical on macOS.
   **Out of scope (v1):** registers/yank/paste, visual mode, marks, search,
   ex ranges, and `.`/counts composition beyond a single recorded change.
+
+**Escalate to the LLM.** When the smart provider (LanguageTool/spellbook)
+gets it wrong, an *"Ask LLM"* button — and a configurable chord (default
+`Super+Ctrl+Alt+Shift+L`) — re-run the *original* sentence through the LLM
+and reload the popup with its correction + suggestions. The button is
+always shown (progressive discovery); with no LLM key configured it opens
+Preferences → Providers so the user can add one. The daemon builds the LLM
+provider whenever a key exists (not only when it's the smart/default
+provider), so on-demand escalation works while keeping routine fixes
+offline. Mechanically: the popup/chord writes a `review-llm` action and
+signals; the daemon re-corrects and rewrites the request file with
+`pending` toggled, which the popup notices (it polls the file while idle)
+and reloads.
 
 On apply the popup writes the (possibly edited) sentence back into the
 review-request file and signals the daemon, which performs the emit.

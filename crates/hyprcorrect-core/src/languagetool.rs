@@ -181,6 +181,7 @@ mod tests {
         let lt = LanguageToolConfig {
             enabled: false,
             url: "http://localhost:8081".into(),
+            ngram_dir: None,
         };
         assert!(matches!(
             LanguageToolProvider::from_config(&lt),
@@ -193,6 +194,7 @@ mod tests {
         let lt = LanguageToolConfig {
             enabled: true,
             url: "  ".into(),
+            ngram_dir: None,
         };
         assert!(matches!(
             LanguageToolProvider::from_config(&lt),

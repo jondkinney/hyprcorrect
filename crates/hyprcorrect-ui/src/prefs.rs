@@ -34,6 +34,7 @@ enum HotkeyTarget {
     FixWord,
     FixSentence,
     Review,
+    ReviewLlm,
 }
 
 /// Sections in the left sidebar.
@@ -65,6 +66,15 @@ impl Section {
             Self::Privacy,
             Self::About,
         ]
+    }
+
+    /// Map a `$HYPRCORRECT_PREFS_SECTION` value (case-insensitive) to a
+    /// section, so the daemon can open prefs straight to e.g. Providers.
+    fn from_name(name: &str) -> Option<Self> {
+        Self::all()
+            .iter()
+            .copied()
+            .find(|s| s.label().eq_ignore_ascii_case(name.trim()))
     }
 }
 
@@ -153,7 +163,12 @@ struct PrefsApp {
 }
 
 impl PrefsApp {
-    fn new(saved: Config, saved_api_key: String, shutdown_tx: Sender<()>) -> Self {
+    fn new(
+        saved: Config,
+        saved_api_key: String,
+        shutdown_tx: Sender<()>,
+        section: Section,
+    ) -> Self {
         #[cfg(target_os = "linux")]
         let autostart_enabled = autostart::is_enabled();
         Self {
@@ -165,7 +180,7 @@ impl PrefsApp {
             autostart_enabled,
             #[cfg(target_os = "linux")]
             saved_autostart_enabled: autostart_enabled,
-            section: Section::Hotkeys,
+            section,
             status: Status::default(),
             blocklist_entry: String::new(),
             shutdown_tx: Some(shutdown_tx),
@@ -417,6 +432,7 @@ impl eframe::App for PrefsApp {
                             HotkeyTarget::FixWord => self.config.hotkeys.fix_word = chord,
                             HotkeyTarget::FixSentence => self.config.hotkeys.fix_sentence = chord,
                             HotkeyTarget::Review => self.config.hotkeys.review = chord,
+                            HotkeyTarget::ReviewLlm => self.config.hotkeys.review_llm = chord,
                         }
                         self.capturing_chord = None;
                         self.chord_recorder = None;
@@ -670,6 +686,37 @@ impl PrefsApp {
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Escalate review to LLM");
+        ui.add_space(4.0);
+        let review_llm_value = self.config.hotkeys.review_llm.clone();
+        if hotkey_chord_row(
+            ui,
+            HotkeyTarget::ReviewLlm,
+            &review_llm_value,
+            self.capturing_chord,
+        ) {
+            self.capturing_chord = Some(HotkeyTarget::ReviewLlm);
+            self.clear_status();
+            notify_daemon_release();
+        }
+        if !self.config.hotkeys.review_llm.is_empty()
+            && ui
+                .add(egui::Button::new("Clear").frame(false))
+                .on_hover_text("Unbind this chord")
+                .clicked()
+        {
+            self.config.hotkeys.review_llm.clear();
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "While the review popup is open, re-runs the original sentence \
+             through the LLM and reloads with its suggestions — for when \
+             LanguageTool's fix is wrong. Also a button in the popup.",
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
         caption(
             ui,
             "$HYPRCORRECT_CHORD overrides Fix last word for one-off dev runs.",
@@ -720,6 +767,30 @@ impl PrefsApp {
         touched |= padded_text_edit(ui, &mut self.config.providers.languagetool.url).changed();
         ui.add_space(4.0);
         caption(ui, "POST endpoint of your self-hosted LanguageTool server.");
+
+        ui.add_space(8.0);
+        field_label(ui, "n-gram data folder (optional)");
+        ui.add_space(4.0);
+        let mut ngram = self
+            .config
+            .providers
+            .languagetool
+            .ngram_dir
+            .clone()
+            .unwrap_or_default();
+        let ngram_changed = padded_text_edit(ui, &mut ngram).changed();
+        if ngram_changed {
+            self.config.providers.languagetool.ngram_dir =
+                (!ngram.trim().is_empty()).then(|| ngram.trim().to_string());
+        }
+        touched |= ngram_changed;
+        ui.add_space(4.0);
+        caption(
+            ui,
+            "Unzipped n-gram data (the folder containing en/) — catches real-word \
+             confusions like wear/where. Download separately (~8 GB) from \
+             languagetool.org; the Install button below mounts it.",
+        );
 
         ui.add_space(SETTING_BLOCK_SPACING);
         self.languagetool_docker_row(ui);
@@ -882,14 +953,30 @@ impl PrefsApp {
             DockerState::AbsentContainer | DockerState::ForeignContainer { .. } => {
                 let port = docker::host_port_from_url(url);
                 let enabled = !op_in_flight && port.is_some();
+                let ngram = self
+                    .config
+                    .providers
+                    .languagetool
+                    .ngram_dir
+                    .clone()
+                    .filter(|d| !d.trim().is_empty());
                 let hover = match port {
-                    Some(p) => format!(
-                        "Runs:\n  docker run -d --name {} --restart=unless-stopped \\\
-                         \n      -p {}:8010 {}\nFirst run downloads ~600 MB.",
-                        docker::CONTAINER,
-                        p,
-                        docker::IMAGE,
-                    ),
+                    Some(p) => {
+                        let ngram_line = match &ngram {
+                            Some(dir) => format!(
+                                " \\\n      -v {dir}:/ngrams -e langtool_languageModel=/ngrams"
+                            ),
+                            None => String::new(),
+                        };
+                        format!(
+                            "Runs:\n  docker run -d --name {} --restart=unless-stopped \\\
+                             \n      -p {}:8010{} {}\nFirst run downloads ~600 MB.",
+                            docker::CONTAINER,
+                            p,
+                            ngram_line,
+                            docker::IMAGE,
+                        )
+                    }
                     None => "URL needs an explicit port (e.g. http://localhost:8081) before \
                              hyprcorrect can map it to the container."
                         .to_string(),
@@ -900,7 +987,7 @@ impl PrefsApp {
                     .clicked()
                     && let Some(port) = port
                 {
-                    self.docker_op = Some(docker::install(port));
+                    self.docker_op = Some(docker::install(port, ngram.as_deref()));
                     self.ok(OpKind::Install.label());
                 }
             }
@@ -1965,6 +2052,12 @@ pub(crate) fn run() {
         .ok()
         .flatten()
         .unwrap_or_default();
+    // The daemon can open us straight to a section (e.g. Providers when
+    // the user tries to escalate to the LLM without a key configured).
+    let initial_section = std::env::var("HYPRCORRECT_PREFS_SECTION")
+        .ok()
+        .and_then(|s| Section::from_name(&s))
+        .unwrap_or(Section::Hotkeys);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1980,7 +2073,12 @@ pub(crate) fn run() {
         options,
         Box::new(move |cc| {
             install_glyph_fonts(&cc.egui_ctx);
-            Ok(Box::new(PrefsApp::new(saved, saved_api_key, shutdown_tx)))
+            Ok(Box::new(PrefsApp::new(
+                saved,
+                saved_api_key,
+                shutdown_tx,
+                initial_section,
+            )))
         }),
     );
 

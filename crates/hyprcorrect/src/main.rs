@@ -162,6 +162,7 @@ fn run_daemon() {
     };
     let mut sentence_chord = parse_optional_chord(&initial_config.hotkeys.fix_sentence);
     let mut review_chord = parse_optional_chord(&initial_config.hotkeys.review);
+    let mut review_llm_chord = parse_optional_chord(&initial_config.hotkeys.review_llm);
     let mut blocklist = build_blocklist(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
 
@@ -203,7 +204,7 @@ fn run_daemon() {
         );
     }
     let key_rx = match capture::start(
-        &active_chords(&chord, &sentence_chord, &review_chord),
+        &active_chords(&chord, &sentence_chord, &review_chord, &review_llm_chord),
         chord_slot.clone(),
     ) {
         Ok(rx) => rx,
@@ -235,6 +236,12 @@ fn run_daemon() {
     {
         eprintln!("hyprcorrect: review bind failed: {e}");
         review_chord = None;
+    }
+    if let Some(ref lc) = review_llm_chord
+        && let Err(e) = hotkey::install_bind(lc, "review-llm")
+    {
+        eprintln!("hyprcorrect: review-llm bind failed: {e}");
+        review_llm_chord = None;
     }
     let (initial_window, focus_rx) = match focus::start() {
         Ok(pair) => pair,
@@ -352,6 +359,13 @@ fn run_daemon() {
                     "review-cancel" => {
                         hyprcorrect_core::runtime::clear_review();
                     }
+                    // Re-run the open review through the LLM (or, with no
+                    // LLM configured, open Preferences so the user can add
+                    // one). Operates on the review file, not the buffer —
+                    // the focused window is the popup, not the source.
+                    "review-llm" => {
+                        reprocess_review_with_llm(llm.as_ref(), languagetool.as_ref(), &provider)
+                    }
                     _ => {
                         if !paused.load(Ordering::Relaxed)
                             && !current_blocked
@@ -429,6 +443,20 @@ fn run_daemon() {
                             }
                             review_chord = new_review_chord;
 
+                            let new_review_llm_chord =
+                                parse_optional_chord(&new_config.hotkeys.review_llm);
+                            if let Some(ref old) = review_llm_chord
+                                && new_review_llm_chord.as_ref() != Some(old)
+                            {
+                                let _ = hotkey::uninstall_bind(old);
+                            }
+                            if let Some(ref lc) = new_review_llm_chord
+                                && let Err(e) = hotkey::install_bind(lc, "review-llm")
+                            {
+                                eprintln!("hyprcorrect: review-llm rebind failed: {e}");
+                            }
+                            review_llm_chord = new_review_llm_chord;
+
                             blocklist = build_blocklist(&new_config);
                             llm = build_llm(&new_config);
                             languagetool = build_languagetool(&new_config);
@@ -460,6 +488,9 @@ fn run_daemon() {
                 }
                 if let Some(ref rc) = review_chord {
                     let _ = hotkey::uninstall_bind(rc);
+                }
+                if let Some(ref lc) = review_llm_chord {
+                    let _ = hotkey::uninstall_bind(lc);
                 }
                 eprintln!("hyprcorrect: trigger released for capture");
             }
@@ -498,6 +529,9 @@ fn run_daemon() {
     }
     if let Some(ref rc) = review_chord {
         let _ = hotkey::uninstall_bind(rc);
+    }
+    if let Some(ref lc) = review_llm_chord {
+        let _ = hotkey::uninstall_bind(lc);
     }
     hyprcorrect_core::runtime::clear_pid();
     hyprcorrect_core::runtime::clear_review();
@@ -554,13 +588,25 @@ fn reset_key_config(
 /// entry handles the singleton lock).
 #[cfg(target_os = "linux")]
 fn spawn_prefs_window() {
+    spawn_prefs_window_section(None);
+}
+
+/// Launch the prefs window, optionally opening it straight to a named
+/// section (e.g. `"providers"` so the user can add an LLM key). The
+/// section is passed via `$HYPRCORRECT_PREFS_SECTION` rather than a CLI
+/// flag to keep the subcommand surface unchanged.
+fn spawn_prefs_window_section(section: Option<&str>) {
     use std::process::{Command, Stdio};
     let Ok(exe) = std::env::current_exe() else {
         eprintln!("hyprcorrect: cannot find own executable to launch prefs");
         return;
     };
-    let result = Command::new(&exe)
-        .arg("prefs")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("prefs");
+    if let Some(section) = section {
+        cmd.env("HYPRCORRECT_PREFS_SECTION", section);
+    }
+    let result = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -581,12 +627,10 @@ fn active_chords(
     word: &hyprcorrect_core::Chord,
     sentence: &Option<hyprcorrect_core::Chord>,
     review: &Option<hyprcorrect_core::Chord>,
+    review_llm: &Option<hyprcorrect_core::Chord>,
 ) -> Vec<hyprcorrect_core::Chord> {
     let mut out = vec![word.clone()];
-    if let Some(c) = sentence {
-        out.push(c.clone());
-    }
-    if let Some(c) = review {
+    for c in [sentence, review, review_llm].into_iter().flatten() {
         out.push(c.clone());
     }
     out
@@ -1330,6 +1374,7 @@ fn start_review(
     // an LLM round-trip especially — doesn't leave the chord feeling
     // dead. Then correct and write the finished request.
     let screen_width = focused_monitor_width();
+    let llm_available = llm.is_some();
     let pending = ReviewRequest {
         original: at.sentence.clone(),
         corrected: at.sentence.clone(),
@@ -1340,6 +1385,7 @@ fn start_review(
         suggestions: Vec::new(),
         pending: true,
         screen_width,
+        llm_available,
     };
     if let Err(e) = write_review_request(&pending) {
         eprintln!("hyprcorrect: could not write pending review request: {e}");
@@ -1371,9 +1417,65 @@ fn start_review(
         suggestions,
         pending: false,
         screen_width,
+        llm_available,
     };
     if let Err(e) = write_review_request(&request) {
         eprintln!("hyprcorrect: could not write finished review request: {e}");
+    }
+}
+
+/// Handle the `review-llm` action: re-run the *open* review's original
+/// sentence through the LLM and rewrite the request so the popup reloads
+/// with the LLM's correction + suggestions. With no LLM configured,
+/// open Preferences at the Providers section instead so the user can add
+/// one (the popup keeps its "Ask LLM" button — progressive setup).
+fn reprocess_review_with_llm(
+    llm: Option<&hyprcorrect_core::LlmProvider>,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
+    provider: &hyprcorrect_core::OfflineProvider,
+) {
+    use hyprcorrect_core::ProviderId;
+    use hyprcorrect_core::runtime::{read_review_request, write_review_request};
+
+    let Ok(Some(mut req)) = read_review_request() else {
+        return;
+    };
+    if llm.is_none() {
+        eprintln!("hyprcorrect: review-llm — no LLM configured; opening Preferences");
+        notify_warning(
+            "LLM not configured",
+            "Add an LLM key in Preferences → Providers to escalate corrections.",
+        );
+        spawn_prefs_window_section(Some("providers"));
+        return;
+    }
+
+    // Flip to pending so the popup shows "Checking…" while the LLM runs.
+    req.pending = true;
+    req.llm_available = true;
+    if let Err(e) = write_review_request(&req) {
+        eprintln!("hyprcorrect: review-llm — could not write pending request: {e}");
+        return;
+    }
+
+    let (corrected, _used, suggestions) = correct_sentence_with_suggestions(
+        &req.original,
+        ProviderId::Llm,
+        llm,
+        languagetool,
+        provider,
+    );
+    eprintln!(
+        "hyprcorrect: review-llm — LLM corrected ({} chars): {:?}, {} suggestion set(s)",
+        corrected.chars().count(),
+        corrected,
+        suggestions.len(),
+    );
+    req.corrected = corrected;
+    req.suggestions = suggestions;
+    req.pending = false;
+    if let Err(e) = write_review_request(&req) {
+        eprintln!("hyprcorrect: review-llm — could not write finished request: {e}");
     }
 }
 
@@ -1543,16 +1645,17 @@ fn apply_review(
 /// non-fatal: the daemon just falls back to the offline provider.
 #[cfg(target_os = "linux")]
 fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmProvider> {
-    use hyprcorrect_core::{LlmProvider, ProviderId};
-    // Build the provider if either path (default = word-fix, smart =
-    // sentence/review) routes through it. Gating on `smart` alone
-    // silently denies fix-word when the user picks LLM as default
-    // and something else as smart.
-    if config.providers.smart != ProviderId::Llm && config.providers.default != ProviderId::Llm {
-        return None;
-    }
+    use hyprcorrect_core::{LlmError, LlmProvider};
+    // Build the provider whenever an API key is configured — not only
+    // when the LLM is the smart/default provider. That keeps on-demand
+    // "Ask LLM" escalation working when the user runs LanguageTool by
+    // default but wants the LLM as a fallback. The auto-correct paths
+    // still only *call* it when their ProviderId selects it, so merely
+    // building it triggers no network use.
     match LlmProvider::from_config(&config.providers.llm) {
         Ok(p) => Some(p),
+        // No key set up yet — expected; not an error worth logging.
+        Err(LlmError::NoApiKey) => None,
         Err(e) => {
             eprintln!("hyprcorrect: LLM provider unavailable — {e}");
             None

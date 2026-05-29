@@ -108,6 +108,10 @@ pub struct ReviewRequest {
     /// Zero when unknown — the popup then falls back to a fixed cap.
     #[serde(default)]
     pub screen_width: f32,
+    /// Whether the daemon has an LLM provider configured. The popup shows
+    /// its "Ask LLM" escalation button only when this is true.
+    #[serde(default)]
+    pub llm_available: bool,
 }
 
 /// Write a fresh review request to disk. Overwrites any pending one.

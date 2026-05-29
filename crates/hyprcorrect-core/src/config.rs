@@ -59,6 +59,11 @@ pub struct Hotkeys {
     /// correction in a small egui window and waits for Apply / Cancel
     /// before emitting. Empty = unbound.
     pub review: String,
+    /// Accelerator that, while the review popup is open, re-processes the
+    /// original sentence through the LLM and reloads the popup with its
+    /// suggestions — for escalating past a weak LanguageTool/spellbook
+    /// correction without calling the LLM on every fix. Empty = unbound.
+    pub review_llm: String,
 }
 impl Default for Hotkeys {
     fn default() -> Self {
@@ -66,6 +71,7 @@ impl Default for Hotkeys {
             fix_word: "CTRL+SHIFT+ALT+SUPER+F".into(),
             fix_sentence: "CTRL+SHIFT+ALT+SUPER+S".into(),
             review: "CTRL+SHIFT+ALT+SUPER+R".into(),
+            review_llm: "CTRL+SHIFT+ALT+SUPER+L".into(),
         }
     }
 }
@@ -137,12 +143,19 @@ impl Default for LlmConfig {
 pub struct LanguageToolConfig {
     pub enabled: bool,
     pub url: String,
+    /// Host folder of LanguageTool's n-gram dataset (the unzipped
+    /// directory that contains an `en/` subfolder). When set, the
+    /// Install-with-Docker convenience mounts it and points the server at
+    /// it so real-word confusions (wear/where) get caught. `None` = the
+    /// server runs without n-grams.
+    pub ngram_dir: Option<String>,
 }
 impl Default for LanguageToolConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             url: "http://localhost:8081".into(),
+            ngram_dir: None,
         }
     }
 }
