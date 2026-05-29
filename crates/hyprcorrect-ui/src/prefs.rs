@@ -676,12 +676,19 @@ impl eframe::App for PrefsApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match self.section {
-                        Section::Hotkeys => self.hotkeys_panel(ui),
-                        Section::Providers => self.providers_panel(ui),
-                        Section::Behavior => self.behavior_panel(ui),
-                        Section::Privacy => self.privacy_panel(ui),
-                        Section::About => self.about_panel(ui),
+                    .show(ui, |ui| {
+                        // Cap the form column so inputs don't stretch the full
+                        // width of a wide window — on big monitors the
+                        // full-width fields reached the right edge and the
+                        // combo drop-buttons clipped. Left-aligned, capped.
+                        ui.set_max_width(CONTENT_MAX_WIDTH);
+                        match self.section {
+                            Section::Hotkeys => self.hotkeys_panel(ui),
+                            Section::Providers => self.providers_panel(ui),
+                            Section::Behavior => self.behavior_panel(ui),
+                            Section::Privacy => self.privacy_panel(ui),
+                            Section::About => self.about_panel(ui),
+                        }
                     });
             });
 
@@ -2266,6 +2273,11 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 }
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
+
+/// Max width of the settings form column. Inputs fill up to this and then
+/// stop, so on a wide window they don't stretch edge-to-edge (which
+/// clipped the combo drop-buttons against the right margin / scrollbar).
+const CONTENT_MAX_WIDTH: f32 = 640.0;
 
 /// The Hyprland/Omarchy logo glyph in the bundled `omarchy.ttf`.
 /// Renders as a blank tofu box if the font isn't installed — we
