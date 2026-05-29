@@ -692,18 +692,33 @@ impl eframe::App for ReviewApp {
         egui::TopBottomPanel::bottom("review_actions")
             .resizable(false)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel  (Esc)").clicked() {
+                    // Roomier hit targets.
+                    ui.spacing_mut().button_padding = egui::vec2(18.0, 9.0);
+                    ui.add_space(12.0); // inset from the left edge
+                    if ui
+                        .button(egui::RichText::new("Cancel  (Esc)").size(15.0))
+                        .clicked()
+                    {
                         do_cancel = true;
                     }
-                    let apply_label = egui::RichText::new("Apply  (Enter)")
-                        .color(egui::Color32::from_rgb(90, 200, 120));
-                    if ui.button(apply_label).clicked() {
-                        do_apply = true;
-                    }
+                    // Apply is the primary action — filled, pinned to the right.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0); // inset from the right edge
+                        let apply = egui::Button::new(
+                            egui::RichText::new("Apply  (Enter)")
+                                .size(15.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(228, 245, 233)),
+                        )
+                        .fill(egui::Color32::from_rgb(46, 102, 64));
+                        if ui.add(apply).clicked() {
+                            do_apply = true;
+                        }
+                    });
                 });
-                ui.add_space(8.0);
+                ui.add_space(16.0);
             });
         if do_apply {
             self.apply(ctx);
