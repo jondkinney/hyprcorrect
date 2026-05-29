@@ -433,21 +433,16 @@ upgrade. On macOS it is a borderless `NSPanel`.
 - egui preferences window (`hyprcorrect-ui`, pattern from
   `vernier-ui/prefs.rs`), panels: Hotkeys, Providers, Behavior
   (inter-key delay, reset sensitivity), Privacy (app blocklist, password
-  handling), About. It opens **tiled** (no float rule); when *floating* it
-  hard-caps its width at 900 logical px. The cap is non-obvious on Hyprland.
-  The Wayland `max_size` hint *is* what clamps a floating window (the
-  compositor enforces it as a true wall on resize) — but set via
-  `ViewportBuilder`, before the window maps, Hyprland reads it as a fixed
-  dialog and **force-floats** the window, defeating tiling. The fix is to
-  advertise `max_size` at **runtime** (`ViewportCommand::MaxInnerSize` from
-  `update`, one shot once the window is mapped): the window stays tiled, yet
-  the client `max_size` still hard-clamps the width whenever it's floating —
-  and a *tiled* window fills its tile regardless (it ignores `max_size`). So
-  tiling fills, floating walls at 900, no overshoot/snap-back. (For the
-  record, two other levers fail: a client self-resize
-  `ViewportCommand::InnerSize` is ignored for a mapped window, and the
-  `maxsize` *windowrule* is open-time only — it doesn't clamp a live drag.)
-  egui points == Hyprland's logical coords, so 1x and 2x both land at 900.
+  handling), About. It opens **tiled** (no float rule) and is freely
+  resizable — we deliberately do **not** cap its floating width. That was
+  tried and abandoned: no clean lever exists on Hyprland. A Wayland
+  `max_size` set via `ViewportBuilder` force-floats the window (breaks
+  tiling); a client self-resize (`ViewportCommand::InnerSize`) is ignored
+  for a mapped window; the `maxsize` *windowrule* is open-time only (doesn't
+  clamp a live drag); a `resizewindowpixel` snap overshoots then animates
+  back; and a *runtime* `MaxInnerSize` does hard-clamp the width but then
+  blocks un-floating and makes the window jump to its forced size on move.
+  Not worth the trade-offs — let it be whatever size.
 
 ```toml
 # config.toml sketch
