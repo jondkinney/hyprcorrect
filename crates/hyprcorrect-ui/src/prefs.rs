@@ -976,7 +976,8 @@ impl PrefsApp {
                     let browse_w = 88.0;
                     let field_w =
                         (ui.available_width() - browse_w - 6.0 - TEXT_EDIT_MARGIN_X).max(80.0);
-                    ui.add(
+                    bordered_text_edit(
+                        ui,
                         egui::TextEdit::singleline(&mut shown)
                             .margin(egui::Margin::symmetric(8, 6))
                             .desired_width(field_w),
@@ -1022,14 +1023,14 @@ impl PrefsApp {
             ui.spacing_mut().item_spacing.x = 6.0;
             let browse_w = 88.0;
             let field_w = (ui.available_width() - browse_w - 6.0 - TEXT_EDIT_MARGIN_X).max(80.0);
-            changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut ngram)
-                        .hint_text("/path/to/ngrams (the folder containing en/)")
-                        .margin(egui::Margin::symmetric(8, 6))
-                        .desired_width(field_w),
-                )
-                .changed();
+            changed |= bordered_text_edit(
+                ui,
+                egui::TextEdit::singleline(&mut ngram)
+                    .hint_text("/path/to/ngrams (the folder containing en/)")
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .desired_width(field_w),
+            )
+            .changed();
             if ui
                 .add_enabled(
                     self.folder_pick.is_none() && self.folder_picker_available,
@@ -2038,7 +2039,8 @@ fn editable_combo(
         // that 16px too — otherwise field + spacing + button overflow the
         // row and the chevron clips off the right edge.
         let field_w = (ui.available_width() - btn_w - 4.0 - TEXT_EDIT_MARGIN_X).max(80.0);
-        let edit = ui.add(
+        let edit = bordered_text_edit(
+            ui,
             egui::TextEdit::singleline(text)
                 .hint_text(hint)
                 .margin(egui::Margin::symmetric(8, 6))
@@ -2297,10 +2299,13 @@ impl PrefsApp {
         let can_add = !backend.is_empty() && !dup && !full;
 
         ui.add_space(SETTING_BLOCK_SPACING);
-        if ui
-            .add_enabled(can_add, egui::Button::new("Save provider"))
-            .clicked()
-        {
+        let mut save_clicked = false;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            save_clicked = ui
+                .add_enabled(can_add, egui::Button::new("Save provider"))
+                .clicked();
+        });
+        if save_clicked {
             let model = if self.llm_draft.model.trim().is_empty() {
                 models_for_backend(&backend)
                     .first()
@@ -2386,10 +2391,26 @@ fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Respons
     response
 }
 
+/// Add a [`egui::TextEdit`] with a visible border in its *non-focused*
+/// state, so a field reads as the same height as the buttons beside it
+/// instead of receding into the panel (egui draws no border by default —
+/// its own source notes the field "doesn't pop"). Scoped to the field:
+/// the inactive `bg_stroke` is restored afterward so sibling widgets
+/// (e.g. the combo chevron) are unaffected. Hover/focus keep egui's
+/// gray/accent strokes.
+fn bordered_text_edit(ui: &mut egui::Ui, te: egui::TextEdit<'_>) -> egui::Response {
+    let prev = ui.visuals().widgets.inactive.bg_stroke;
+    ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+    let resp = ui.add(te);
+    ui.visuals_mut().widgets.inactive.bg_stroke = prev;
+    resp
+}
+
 /// Single-line text input with consistent inner padding so fields
 /// don't collapse to ~16 px tall at the body font size.
 fn padded_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
-    ui.add(
+    bordered_text_edit(
+        ui,
         egui::TextEdit::singleline(text)
             .margin(egui::Margin::symmetric(8, 6))
             .desired_width(f32::INFINITY),
@@ -2399,7 +2420,8 @@ fn padded_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
 /// Single-line *password* input with the same padding as
 /// [`padded_text_edit`]. The contents render as bullets.
 fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
-    ui.add(
+    bordered_text_edit(
+        ui,
         egui::TextEdit::singleline(text)
             .password(true)
             .margin(egui::Margin::symmetric(8, 6))
