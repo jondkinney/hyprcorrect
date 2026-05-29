@@ -254,7 +254,16 @@ impl Config {
             .ok_or(ConfigError::NoConfigDir)?;
         Ok(dirs.config_dir().join("config.toml"))
     }
+}
 
+/// The OS-conventional data folder where prefs downloads the LanguageTool
+/// n-gram dataset (`<data_dir>/ngrams`). `None` when no data directory is
+/// available (e.g. a sandbox with no `$HOME`).
+pub fn ngram_data_dir() -> Option<PathBuf> {
+    ProjectDirs::from("io", "hyprcorrect", "hyprcorrect").map(|dirs| dirs.data_dir().join("ngrams"))
+}
+
+impl Config {
     /// Load from the OS-conventional path. A missing file yields a
     /// default [`Config`] (not an error).
     ///

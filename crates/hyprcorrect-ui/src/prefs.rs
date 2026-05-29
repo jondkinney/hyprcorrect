@@ -154,6 +154,8 @@ struct PrefsApp {
     /// tracked separately from its run state. `None` = no managed
     /// container (or not probed yet).
     lt_ngrams: Option<bool>,
+    /// In-flight n-gram archive download (~8.4 GB), or `None`.
+    ngram_download: Option<crate::ngrams::DownloadHandle>,
     /// Last status refresh — re-probed every few seconds while the
     /// Providers panel is visible so a foreign container the user
     /// just started shows up.
@@ -201,6 +203,7 @@ impl PrefsApp {
             app_registry: AppRegistry::discover(),
             lt_status: None,
             lt_ngrams: None,
+            ngram_download: None,
             last_status_check: Instant::now() - Duration::from_secs(60),
             status_probe: None,
             docker_op: None,
@@ -238,6 +241,44 @@ impl PrefsApp {
         let url = self.config.providers.languagetool.url.clone();
         self.status_probe = Some(docker::spawn_status_probe(url));
         ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
+    /// Advance an in-flight n-gram download: keep repainting for the
+    /// progress bar, and on completion point LanguageTool at the data and
+    /// recreate the container with it mounted.
+    fn poll_ngram_download(&mut self, ctx: &egui::Context) {
+        use crate::ngrams::DownloadPhase;
+        let phase = match &self.ngram_download {
+            Some(h) => h.phase(),
+            None => return,
+        };
+        match phase {
+            DownloadPhase::Downloading { .. } | DownloadPhase::Extracting => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            DownloadPhase::Done(dir) => {
+                self.ngram_download = None;
+                let dir_str = dir.to_string_lossy().to_string();
+                self.config.providers.languagetool.ngram_dir = Some(dir_str.clone());
+                let url = self.config.providers.languagetool.url.clone();
+                if let Some(port) = docker::host_port_from_url(&url) {
+                    self.docker_op = Some(docker::enable_ngrams(port, &dir_str));
+                    self.ok("n-grams downloaded — enabling (recreating container)…");
+                } else {
+                    self.ok("n-grams downloaded. Set a URL with a port, then Enable n-grams.");
+                }
+                // Re-probe so the n-gram status flips to Loaded once done.
+                self.last_status_check = Instant::now() - Duration::from_secs(60);
+            }
+            DownloadPhase::Failed(msg) => {
+                self.ngram_download = None;
+                self.err(format!("n-gram download failed: {msg}"));
+            }
+            DownloadPhase::Cancelled => {
+                self.ngram_download = None;
+                self.ok("n-gram download cancelled.");
+            }
+        }
     }
 
     fn poll_docker_op(&mut self, ctx: &egui::Context) {
@@ -399,6 +440,7 @@ impl eframe::App for PrefsApp {
         apply_style(ctx);
         self.refresh_stale_check();
         self.poll_docker_op(ctx);
+        self.poll_ngram_download(ctx);
         if self.section == Section::Providers {
             self.refresh_lt_status(ctx);
         }
@@ -798,9 +840,9 @@ impl PrefsApp {
         ui.add_space(4.0);
         caption(
             ui,
-            "Unzipped n-gram data (the folder containing en/) — catches real-word \
-             confusions like wear/where. Download separately (~8 GB) from \
-             languagetool.org, then use \"Enable n-grams\" under Local server below.",
+            "Optional — only if you already have the unzipped n-gram data (the folder \
+             containing en/); point here, then \"Enable n-grams\" below. Otherwise just \
+             use \"Download n-grams\" below to fetch it.",
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
@@ -900,6 +942,40 @@ impl PrefsApp {
         field_label(ui, "n-grams (wear/where)");
         ui.add_space(4.0);
 
+        // A download in flight owns the row: progress bar + Cancel.
+        if let Some(handle) = &self.ngram_download {
+            use crate::ngrams::DownloadPhase;
+            const GB: f64 = 1_000_000_000.0;
+            match handle.phase() {
+                DownloadPhase::Downloading { done, total } => {
+                    let frac = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    let text = if total > 0 {
+                        format!(
+                            "Downloading {:.1} / {:.1} GB",
+                            done as f64 / GB,
+                            total as f64 / GB
+                        )
+                    } else {
+                        format!("Downloading {:.1} GB…", done as f64 / GB)
+                    };
+                    ui.add(egui::ProgressBar::new(frac).text(text));
+                }
+                // Done/Failed/Cancelled are consumed by poll_ngram_download.
+                _ => {
+                    ui.add(egui::ProgressBar::new(1.0).text("Unzipping (~16 GB)…"));
+                }
+            }
+            ui.add_space(4.0);
+            if ui.button("Cancel").clicked() {
+                handle.cancel();
+            }
+            return;
+        }
+
         let dir = self
             .config
             .providers
@@ -932,29 +1008,44 @@ impl PrefsApp {
             return;
         }
 
-        // Not loaded — offer to enable when we have a folder and a port.
-        match (dir.as_deref(), port) {
-            (None, _) => caption(ui, "Off. Set an n-gram data folder above to enable."),
-            (Some(_), None) => caption(
-                ui,
-                "Off. Give the URL an explicit port (e.g. http://localhost:8081) first.",
-            ),
-            (Some(dir), Some(port)) => {
+        // Not loaded: offer the one-click download (primary), plus "Enable"
+        // for users who already have the data in the folder above.
+        let data_dir = hyprcorrect_core::config::ngram_data_dir();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !op_in_flight && data_dir.is_some(),
+                    egui::Button::new("Download n-grams (~8.4 GB)"),
+                )
+                .on_hover_text(
+                    "Downloads LanguageTool's English n-gram data to the app's data \
+                     folder and enables it. Needs ~24 GB free while unzipping.",
+                )
+                .clicked()
+                && let Some(d) = data_dir.clone()
+            {
+                self.ngram_download = Some(crate::ngrams::spawn_ngram_download(d));
+                self.ok("Downloading n-grams…");
+            }
+            if let (Some(dir), Some(port)) = (dir.as_deref(), port) {
                 if ui
-                    .add_enabled(!op_in_flight, egui::Button::new("Enable n-grams"))
-                    .on_hover_text(
-                        "(Re)creates the hyprcorrect LanguageTool container with the \
-                         n-gram dataset mounted — separate from the basic install.",
+                    .add_enabled(
+                        !op_in_flight,
+                        egui::Button::new("Enable n-grams").frame(false),
                     )
+                    .on_hover_text("Use n-gram data you already have at the folder above.")
                     .clicked()
                 {
                     self.docker_op = Some(docker::enable_ngrams(port, dir));
                     self.ok(OpKind::EnableNgrams.label());
                 }
-                ui.add_space(4.0);
-                caption(ui, "Off. Recreates the container with the data mounted.");
             }
-        }
+        });
+        ui.add_space(4.0);
+        caption(
+            ui,
+            "Off. Download the data, or point the folder above at a copy you have.",
+        );
     }
 
     /// The "URL didn't answer" branch — drives the install / start UI.

@@ -13,6 +13,7 @@ mod apps;
 pub mod autostart;
 mod docker;
 pub mod icon;
+mod ngrams;
 mod prefs;
 mod review;
 mod vimedit;
