@@ -151,6 +151,12 @@ pub fn align(original: &str, corrected: &str) -> Option<AlignLayout> {
     }
     let orig: Vec<&str> = orig_owned.iter().map(String::as_str).collect();
     let corr: Vec<&str> = corr_owned.iter().map(String::as_str).collect();
+    // Column widths use each word's *extent* — its char count plus any
+    // punctuation bound to it — so a trailing comma is folded into that
+    // word's column instead of shoving every later column sideways. The
+    // LCS still matches on the bare words.
+    let oe = word_extents(original);
+    let ce = word_extents(corrected);
 
     let mut layout = AlignLayout {
         col_widths: Vec::new(),
@@ -159,22 +165,20 @@ pub fn align(original: &str, corrected: &str) -> Option<AlignLayout> {
     };
     let (mut i, mut j) = (0usize, 0usize);
     for (mi, mj) in lcs_matched_pairs(&orig, &corr) {
-        emit_run(&mut layout, &orig, &corr, &mut i, &mut j, mi, mj);
+        emit_run(&mut layout, &oe, &ce, &mut i, &mut j, mi, mj);
         // The matched word: shared column, advance past it on both sides.
         let col = layout.col_widths.len();
         layout.orig_cols[i] = col;
         layout.corr_cols[j] = col;
-        layout
-            .col_widths
-            .push(orig[i].chars().count().max(corr[j].chars().count()));
+        layout.col_widths.push(oe[i].max(ce[j]));
         i += 1;
         j += 1;
     }
     // Trailing unmatched words after the last LCS anchor.
     emit_run(
         &mut layout,
-        &orig,
-        &corr,
+        &oe,
+        &ce,
         &mut i,
         &mut j,
         orig.len(),
@@ -183,14 +187,15 @@ pub fn align(original: &str, corrected: &str) -> Option<AlignLayout> {
     Some(layout)
 }
 
-/// Assign columns to the unmatched run `orig[i..ai]` / `corr[j..aj]`:
-/// pair words 1:1 as substitutions up to the shorter side, then give any
-/// leftover original (deletion) or corrected (insertion) word its own
-/// column. Advances `i`/`j` to `ai`/`aj`.
+/// Assign columns to the unmatched run `orig[i..ai]` / `corr[j..aj]`,
+/// pulling column widths from the per-word extents `oe`/`ce`: pair words
+/// 1:1 as substitutions up to the shorter side, then give any leftover
+/// original (deletion) or corrected (insertion) word its own column.
+/// Advances `i`/`j` to `ai`/`aj`.
 fn emit_run(
     layout: &mut AlignLayout,
-    orig: &[&str],
-    corr: &[&str],
+    oe: &[usize],
+    ce: &[usize],
     i: &mut usize,
     j: &mut usize,
     ai: usize,
@@ -202,25 +207,47 @@ fn emit_run(
         let col = layout.col_widths.len();
         layout.orig_cols[*i + k] = col;
         layout.corr_cols[*j + k] = col;
-        layout.col_widths.push(
-            orig[*i + k]
-                .chars()
-                .count()
-                .max(corr[*j + k].chars().count()),
-        );
+        layout.col_widths.push(oe[*i + k].max(ce[*j + k]));
     }
     for k in sub..da {
         let col = layout.col_widths.len();
         layout.orig_cols[*i + k] = col;
-        layout.col_widths.push(orig[*i + k].chars().count());
+        layout.col_widths.push(oe[*i + k]);
     }
     for k in sub..db {
         let col = layout.col_widths.len();
         layout.corr_cols[*j + k] = col;
-        layout.col_widths.push(corr[*j + k].chars().count());
+        layout.col_widths.push(ce[*j + k]);
     }
     *i = ai;
     *j = aj;
+}
+
+/// Split a separator run into the punctuation bound to the *preceding*
+/// word — its leading run of non-whitespace — and the whitespace gap that
+/// follows: `", "` → `(",", " ")`, `" "` → `("", " ")`, `"?"` → `("?", "")`.
+/// Lets the popup fold a word's trailing punctuation into its column.
+pub fn split_separator(sep: &str) -> (&str, &str) {
+    let end = sep.find(char::is_whitespace).unwrap_or(sep.len());
+    sep.split_at(end)
+}
+
+/// Each word's display extent (char count) in order: the word plus any
+/// punctuation bound to it via [`split_separator`].
+fn word_extents(s: &str) -> Vec<usize> {
+    let toks = split_tokens(s);
+    let mut out = Vec::new();
+    for (idx, (is_word, text)) in toks.iter().enumerate() {
+        if *is_word {
+            let punct = toks
+                .get(idx + 1)
+                .filter(|(next_is_word, _)| !next_is_word)
+                .map(|(_, sep)| split_separator(sep).0.chars().count())
+                .unwrap_or(0);
+            out.push(text.chars().count() + punct);
+        }
+    }
+    out
 }
 
 /// The whitespace/punctuation-delimited words of `s`, in order.
@@ -518,6 +545,26 @@ mod tests {
         assert_eq!(a.col_widths, vec![1, 3, 4, 3, 2, 4]);
         assert_eq!(a.orig_cols, vec![0, 1, 2, 4, 5]); // i,eat,alot,of,food
         assert_eq!(a.corr_cols, vec![0, 1, 2, 3, 4, 5]); // I,eat,a,lot,of,food
+    }
+
+    #[test]
+    fn align_folds_trailing_punctuation_into_the_column() {
+        // The only word change is i→I, but the correction adds a comma
+        // after "well". Folding it into column 0 (width = max("well"=4,
+        // "well,"=5) = 5) keeps the later columns aligned instead of
+        // shoving them right by the comma.
+        let a = align("well i think", "well, I think").unwrap();
+        assert_eq!(a.col_widths, vec![5, 1, 5]);
+        assert_eq!(a.orig_cols, vec![0, 1, 2]);
+        assert_eq!(a.corr_cols, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn split_separator_peels_leading_punctuation() {
+        assert_eq!(split_separator(", "), (",", " "));
+        assert_eq!(split_separator(" "), ("", " "));
+        assert_eq!(split_separator("?"), ("?", ""));
+        assert_eq!(split_separator(". "), (".", " "));
     }
 
     #[test]

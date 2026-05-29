@@ -504,25 +504,35 @@ impl ReviewApp {
                             continue;
                         };
                         let sep = corr_seps.get(k).cloned().unwrap_or_default();
+                        // Punctuation bound to the word is folded into the
+                        // column (so a trailing comma can't shove later
+                        // columns sideways); only the whitespace separates
+                        // columns.
+                        let (punct, ws) = worddiff::split_separator(&sep);
+                        let punct_chars = punct.chars().count();
                         match corr_field.get(k).copied().flatten() {
-                            // Unchanged word: padded static label.
+                            // Unchanged word: word + punctuation, padded to
+                            // the column.
                             None => {
-                                let padded = format!("{:<width$}", corr_words[k]);
+                                let cell = format!("{}{punct}", corr_words[k]);
+                                let padded = format!("{cell:<width$}");
                                 ui.label(
                                     egui::RichText::new(padded)
                                         .font(font.clone())
                                         .color(egui::Color32::from_gray(215)),
                                 );
                             }
-                            // Changed/inserted word: editable field, sized to
-                            // the column (growing only if typed past it).
+                            // Changed/inserted word: editable field filling the
+                            // column minus its punctuation (growing only if
+                            // typed past it), then the punctuation alongside.
                             Some(seg_idx) => {
                                 let this_ord = field_ord;
                                 field_ord += 1;
                                 if let Segment::Field(t) = &mut segments[seg_idx] {
                                     let id = egui::Id::new(("hc_review_field", seg_idx));
                                     let chars = t.chars().count();
-                                    let w = width.max(chars) as f32 * cw;
+                                    let w =
+                                        width.saturating_sub(punct_chars).max(chars) as f32 * cw;
                                     let out = egui::TextEdit::singleline(t)
                                         .id(id)
                                         .frame(false)
@@ -575,17 +585,20 @@ impl ReviewApp {
                                         new_caret = Some((caret, chars, sel));
                                     }
                                 }
+                                if punct_chars > 0 {
+                                    ui.label(
+                                        egui::RichText::new(punct.to_string())
+                                            .font(font.clone())
+                                            .color(egui::Color32::from_gray(215)),
+                                    );
+                                }
                             }
                         }
-                        // Separator after the cell (actual text, so punctuation
-                        // still shows); synthesize a space when another column
-                        // follows on this row but the word carried none.
-                        if !sep.is_empty() {
-                            ui.label(
-                                egui::RichText::new(sep)
-                                    .font(font.clone())
-                                    .color(egui::Color32::from_gray(215)),
-                            );
+                        // Whitespace gap to the next column (its own text, or a
+                        // synthesized space when more columns follow this row).
+                        let ws_chars = ws.chars().count();
+                        if ws_chars > 0 {
+                            ui.add_space(ws_chars as f32 * cw);
                         } else if c + 1 < c1 {
                             ui.add_space(cw);
                         }
@@ -1109,7 +1122,11 @@ fn paint_aligned_original(
                     Some(ck) => corr_words[ck] != *word,
                     None => true,
                 };
-                let padded = format!("{word:<width$}");
+                // Fold this word's punctuation into its column, matching the
+                // Proposed card; only whitespace separates columns.
+                let (punct, ws) = worddiff::split_separator(&orig_seps[k]);
+                let cell = format!("{word}{punct}");
+                let padded = format!("{cell:<width$}");
                 let resp = ui.label(egui::RichText::new(padded).font(font.clone()).color(fg));
                 if changed {
                     let r = resp.rect;
@@ -1121,13 +1138,9 @@ fn paint_aligned_original(
                         SQUIGGLE_RED,
                     );
                 }
-                let sep = &orig_seps[k];
-                if !sep.is_empty() {
-                    ui.label(
-                        egui::RichText::new(sep.clone())
-                            .font(font.clone())
-                            .color(fg),
-                    );
+                let ws_chars = ws.chars().count();
+                if ws_chars > 0 {
+                    ui.add_space(ws_chars as f32 * cw);
                 } else if c + 1 < c1 {
                     ui.add_space(cw);
                 }
