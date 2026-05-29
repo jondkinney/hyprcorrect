@@ -80,6 +80,16 @@ enum EditMode {
     Vim,
 }
 
+/// An open `z=` spell-suggest dropdown in vim mode: the word it's for, its
+/// byte range in the buffer, the ranked options, and the highlighted row.
+struct VimSuggest {
+    start: usize,
+    end: usize,
+    word: String,
+    options: Vec<String>,
+    highlight: Option<usize>,
+}
+
 struct ReviewApp {
     request: ReviewRequest,
     /// `"apply"` or `"cancel"` once the user decides. `None` until
@@ -123,6 +133,8 @@ struct ReviewApp {
     /// "revert to original" dropdown entry. Empty unless the change is a
     /// clean 1:1 substitution (changed-word counts match).
     field_originals: Vec<String>,
+    /// An open `z=` spell-suggest dropdown in vim mode, or `None`.
+    vim_suggest: Option<VimSuggest>,
 }
 
 impl ReviewApp {
@@ -143,6 +155,7 @@ impl ReviewApp {
             align: None,
             ready: false,
             field_originals: Vec::new(),
+            vim_suggest: None,
         };
         if !app.request.pending {
             app.load_review();
@@ -424,6 +437,32 @@ impl ReviewApp {
     }
 
     fn render_word(&mut self, ui: &mut egui::Ui) {
+        // Precompute a column view of the corrected sentence: each word's
+        // text + trailing separator, and which words are editable fields
+        // (by their segment index). The field text stays owned by
+        // `segments` so edits flow back through `reconstruct`.
+        let (corr_words, corr_seps) = words_and_seps(&self.request.corrected);
+        let corr_field = field_map(&self.segments);
+        // Widen each column to fit the field's *current* text, so a field
+        // the user has grown by typing re-wraps with everything else
+        // instead of pushing the rest of the line off-screen.
+        let layout = self.align.clone().map(|mut l| {
+            for (k, &c) in l.corr_cols.iter().enumerate() {
+                if c >= l.col_widths.len() {
+                    continue;
+                }
+                let word = match corr_field.get(k).copied().flatten() {
+                    Some(seg) => self.segments[seg].text().chars().count(),
+                    None => corr_words.get(k).map_or(0, |w| w.chars().count()),
+                };
+                let punct = corr_seps
+                    .get(k)
+                    .map_or(0, |s| worddiff::split_separator(s).0.chars().count());
+                l.col_widths[c] = l.col_widths[c].max(word + punct);
+            }
+            l
+        });
+
         ui.heading("Review correction");
         ui.add_space(16.0);
         section_label(ui, "Original");
@@ -431,7 +470,7 @@ impl ReviewApp {
             ui,
             &self.request.original,
             &self.request.corrected,
-            self.align.as_ref(),
+            layout.as_ref(),
         );
 
         ui.add_space(18.0);
@@ -456,14 +495,6 @@ impl ReviewApp {
         let mut new_focused: Option<usize> = None;
         let mut new_caret: Option<(usize, usize, bool)> = None;
         let mut consumed_pending = false;
-
-        // Precompute a column view of the corrected sentence: each word's
-        // text + trailing separator, and which words are editable fields
-        // (by their segment index). The field text stays owned by
-        // `segments` so edits flow back through `reconstruct`.
-        let layout = self.align.clone();
-        let (corr_words, corr_seps) = words_and_seps(&self.request.corrected);
-        let corr_field = field_map(&self.segments);
         let segments = &mut self.segments;
 
         card(ui, |ui| {
@@ -641,6 +672,12 @@ impl ReviewApp {
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
         });
 
+        // While the z= dropdown is open, keys drive it, not the editor.
+        if self.vim_suggest.is_some() {
+            self.input_vim_dropdown(ctx);
+            return;
+        }
+
         let keys = collect_vim_keys(ctx);
         let before = self.vim.as_ref().map(|v| v.text().to_string());
         let mut outcome = VimOutcome::None;
@@ -663,8 +700,139 @@ impl ReviewApp {
         match outcome {
             VimOutcome::Submit => self.apply(ctx),
             VimOutcome::Cancel => self.cancel(ctx),
+            VimOutcome::SpellSuggest => self.open_vim_suggest(),
             VimOutcome::None => {}
         }
+    }
+
+    /// `z=` over a word: open the spell-suggest dropdown for the word the
+    /// vim cursor is on, if the provider offered alternatives for it.
+    fn open_vim_suggest(&mut self) {
+        let Some(vim) = self.vim.as_ref() else { return };
+        let text = vim.text();
+        let Some((start, end)) = worddiff::word_at(text, vim.cursor()) else {
+            return;
+        };
+        let word = text[start..end].to_string();
+        let options = self.suggest_options(&word);
+        if !options.is_empty() {
+            self.vim_suggest = Some(VimSuggest {
+                start,
+                end,
+                word,
+                options,
+                highlight: None,
+            });
+        }
+    }
+
+    /// Ranked alternatives the provider offered for `word` (best first),
+    /// minus the word itself, capped at 5. Matched by word text since the
+    /// vim cursor can be on any word.
+    fn suggest_options(&self, word: &str) -> Vec<String> {
+        self.request
+            .suggestions
+            .iter()
+            .find(|ws| ws.word == word)
+            .map(|ws| {
+                ws.options
+                    .iter()
+                    .filter(|o| o.as_str() != word)
+                    .take(5)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Handle keys while the vim z= dropdown is open: 1–5 / Enter pick,
+    /// Up/Down and j/k move the highlight, Esc closes it.
+    fn input_vim_dropdown(&mut self, ctx: &egui::Context) {
+        let (options, highlight) = match self.vim_suggest.as_ref() {
+            Some(s) => (s.options.clone(), s.highlight),
+            None => return,
+        };
+        let n = options.len();
+        for d in 1..=n.min(5) {
+            if take_digit(ctx, d) {
+                self.pick_vim_suggest(ctx, options[d - 1].as_str());
+                return;
+            }
+        }
+        let down = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::J)
+        });
+        if down {
+            if let Some(s) = self.vim_suggest.as_mut() {
+                s.highlight = Some(highlight.map_or(0, |h| (h + 1).min(n - 1)));
+            }
+            return;
+        }
+        let up = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::K)
+        });
+        if up {
+            if let Some(s) = self.vim_suggest.as_mut() {
+                s.highlight = match highlight {
+                    Some(0) | None => None,
+                    Some(h) => Some(h - 1),
+                };
+            }
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+            self.pick_vim_suggest(ctx, options[highlight.unwrap_or(0)].as_str());
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.vim_suggest = None;
+        }
+    }
+
+    /// Apply `option` to the dropdown's word in the vim buffer, then
+    /// advance to the next word with suggestions (opening its dropdown) —
+    /// or apply the whole correction when there is no next one.
+    fn pick_vim_suggest(&mut self, ctx: &egui::Context, option: &str) {
+        let Some(sug) = self.vim_suggest.take() else {
+            return;
+        };
+        let next_from = sug.start + option.len();
+        let before = self.vim.as_ref().map(|v| v.text().to_string());
+        if let Some(vim) = self.vim.as_mut() {
+            vim.replace_range(sug.start, sug.end, option);
+        }
+        let Some(text) = self.vim.as_ref().map(|v| v.text().to_string()) else {
+            return;
+        };
+        // Drop the squiggle on the word we just swapped, then look for the
+        // next word the provider has alternatives for.
+        if let Some(before) = before {
+            update_marks(&mut self.vim_marks, &before, &text);
+        }
+        for (start, end) in worddiff::word_byte_ranges(&text) {
+            if start < next_from {
+                continue;
+            }
+            let word = text[start..end].to_string();
+            let options = self.suggest_options(&word);
+            if !options.is_empty() {
+                if let Some(vim) = self.vim.as_mut() {
+                    vim.set_cursor(start);
+                }
+                self.vim_suggest = Some(VimSuggest {
+                    start,
+                    end,
+                    word,
+                    options,
+                    highlight: None,
+                });
+                return;
+            }
+        }
+        // No further suggestible word — that was the last one: submit.
+        self.apply(ctx);
     }
 
     fn render_vim(&mut self, ui: &mut egui::Ui) {
@@ -791,12 +959,26 @@ impl ReviewApp {
                 }
             });
 
+        // z= spell-suggest dropdown, inline below the editor.
+        let dropdown = self
+            .vim_suggest
+            .as_ref()
+            .map(|s| (s.word.clone(), s.options.clone(), s.highlight));
+        if let Some((word, options, highlight)) = dropdown {
+            let opts: Vec<&str> = options.iter().map(String::as_str).collect();
+            if let Some(pick) = render_suggestion_dropdown(ui, &word, &opts, highlight) {
+                let opt = options[pick].clone();
+                let ctx = ui.ctx().clone();
+                self.pick_vim_suggest(&ctx, &opt);
+            }
+        }
+
         ui.add_space(8.0);
         ui.label(egui::RichText::new(status).monospace().color(accent));
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
-                "ciw dw cw x r · u Ctrl+R . · w b 0 $ · i a o · :wq/Enter apply · :q cancel",
+                "ciw dw cw x r · z= suggest · u Ctrl+R . · w b 0 $ · i a o · :wq/Enter apply · Esc/:q cancel",
             )
             .size(11.0)
             .color(egui::Color32::from_gray(130)),
@@ -1271,7 +1453,9 @@ fn aligned_display(
         }
         for (ci, ch) in ws.chars().enumerate() {
             map[sep_start + punct_len + ci] = di;
-            push(&mut disp, &mut di, if ch == '\n' { ' ' } else { ch });
+            // Keep real newlines (INSERT-Enter line breaks) — collapsing
+            // them would lose multi-line editing.
+            push(&mut disp, &mut di, ch);
         }
     }
     map[raw_len] = di;

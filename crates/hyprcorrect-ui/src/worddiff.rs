@@ -250,6 +250,25 @@ fn word_extents(s: &str) -> Vec<usize> {
     out
 }
 
+/// Byte range of the word containing byte offset `byte`
+/// (`start <= byte < end`), or `None` when `byte` is on a separator. Lets
+/// the popup find the word under the vim cursor for `z=`.
+pub fn word_at(s: &str, byte: usize) -> Option<(usize, usize)> {
+    word_spans(s)
+        .into_iter()
+        .find(|&(_, st, e)| byte >= st && byte < e)
+        .map(|(_, st, e)| (st, e))
+}
+
+/// Byte ranges of every word in `s`, in order — used to walk to the next
+/// word with spelling suggestions.
+pub fn word_byte_ranges(s: &str) -> Vec<(usize, usize)> {
+    word_spans(s)
+        .into_iter()
+        .map(|(_, st, e)| (st, e))
+        .collect()
+}
+
 /// The whitespace/punctuation-delimited words of `s`, in order.
 pub fn word_list(s: &str) -> Vec<String> {
     word_spans(s)

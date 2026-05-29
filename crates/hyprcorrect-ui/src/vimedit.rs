@@ -57,8 +57,11 @@ pub enum VimOutcome {
     /// Apply the (possibly edited) text and close — `:w`/`:wq`/`:x` or
     /// normal-mode `Enter`.
     Submit,
-    /// Discard and close — `:q`/`:q!`.
+    /// Discard and close — `:q`/`:q!`, or `Esc` in NORMAL mode.
     Cancel,
+    /// `z=` — the popup should show spelling suggestions for the word
+    /// under the cursor.
+    SpellSuggest,
 }
 
 /// The current editing mode, for the status line / cursor shape.
@@ -98,6 +101,8 @@ pub struct VimEdit {
     await_r: bool,
     /// `g` was pressed; expecting a second `g`.
     await_g: bool,
+    /// `z` was pressed; expecting `=` (spell-suggest).
+    await_z: bool,
     /// After an operator, `i`/`a` was pressed; expecting `w`.
     await_textobj: Option<char>,
 
@@ -135,6 +140,7 @@ impl VimEdit {
             op: None,
             await_r: false,
             await_g: false,
+            await_z: false,
             await_textobj: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -163,6 +169,30 @@ impl VimEdit {
         self.mode
     }
 
+    /// Replace the byte range `start..end` with `repl` as one undo step,
+    /// leaving the NORMAL-mode cursor at the start of the replacement.
+    /// Used by the popup's `z=` spell-suggest dropdown.
+    pub fn replace_range(&mut self, start: usize, end: usize, repl: &str) {
+        if start > end || end > self.text.len() || !self.text.is_char_boundary(start) {
+            return;
+        }
+        self.undo.push((self.text.clone(), self.cursor));
+        self.redo.clear();
+        self.change_open = false;
+        self.text.replace_range(start..end, repl);
+        self.cursor = start;
+        self.clamp_normal();
+        self.vcol = self.col(self.cursor);
+    }
+
+    /// Move the NORMAL-mode cursor to byte offset `pos` (clamped to a
+    /// char boundary within the text).
+    pub fn set_cursor(&mut self, pos: usize) {
+        self.cursor = pos.min(self.text.len());
+        self.clamp_normal();
+        self.vcol = self.col(self.cursor);
+    }
+
     /// The text for the bottom status line: `-- NORMAL --`,
     /// `-- INSERT --`, the `:`-command being typed, or a transient
     /// message.
@@ -187,6 +217,7 @@ impl VimEdit {
                 && self.op.is_none()
                 && !self.await_r
                 && !self.await_g
+                && !self.await_z
                 && self.await_textobj.is_none();
             if clean {
                 self.change_open = false;
@@ -288,6 +319,15 @@ impl VimEdit {
             self.reset_pending();
             return VimOutcome::None;
         }
+        // Pending `z`: `z=` asks the popup for spelling suggestions.
+        if self.await_z {
+            self.await_z = false;
+            self.reset_pending();
+            if matches!(key, VimKey::Char('=')) {
+                return VimOutcome::SpellSuggest;
+            }
+            return VimOutcome::None;
+        }
         // Pending text object after an operator: expecting `w`.
         if let Some(ia) = self.await_textobj.take() {
             if matches!(key, VimKey::Char('w')) {
@@ -315,8 +355,14 @@ impl VimEdit {
 
         match key {
             VimKey::Esc => {
-                self.reset_pending();
-                VimOutcome::None
+                // Mid-command (operator/count pending): abort just that.
+                // Otherwise Esc in NORMAL closes the popup.
+                if self.op.is_some() || self.count.is_some() {
+                    self.reset_pending();
+                    VimOutcome::None
+                } else {
+                    VimOutcome::Cancel
+                }
             }
             VimKey::Enter => VimOutcome::Submit,
             VimKey::Backspace => {
@@ -438,6 +484,7 @@ impl VimEdit {
             }
             'r' => self.await_r = true,
             'g' => self.await_g = true,
+            'z' => self.await_z = true,
             'u' => self.undo(),
             '.' => self.repeat(),
             ':' => {
@@ -455,6 +502,7 @@ impl VimEdit {
         self.op = None;
         self.await_r = false;
         self.await_g = false;
+        self.await_z = false;
         self.await_textobj = None;
     }
 
@@ -1300,6 +1348,47 @@ mod tests {
         feed(&mut v, "the");
         v.handle(VimKey::Esc);
         assert_eq!(v.text(), "the quick");
+        feed(&mut v, "u");
+        assert_eq!(v.text(), "teh quick");
+    }
+
+    #[test]
+    fn esc_in_normal_cancels() {
+        let mut v = VimEdit::new("hello".into(), 0);
+        assert_eq!(v.handle(VimKey::Esc), VimOutcome::Cancel);
+    }
+
+    #[test]
+    fn esc_aborts_a_pending_operator_without_cancelling() {
+        let mut v = VimEdit::new("hello world".into(), 0);
+        feed(&mut v, "d"); // operator pending
+        assert_eq!(v.handle(VimKey::Esc), VimOutcome::None);
+        // a following motion is now just a motion, not part of a delete.
+        feed(&mut v, "w");
+        assert_eq!(v.text(), "hello world");
+    }
+
+    #[test]
+    fn z_equals_requests_spell_suggestions() {
+        let mut v = VimEdit::new("teh quick".into(), 0);
+        assert_eq!(v.handle(VimKey::Char('z')), VimOutcome::None);
+        assert_eq!(v.handle(VimKey::Char('=')), VimOutcome::SpellSuggest);
+    }
+
+    #[test]
+    fn z_then_other_key_is_a_noop() {
+        let mut v = VimEdit::new("teh quick".into(), 0);
+        feed(&mut v, "z");
+        assert_eq!(v.handle(VimKey::Char('x')), VimOutcome::None);
+        assert_eq!(v.text(), "teh quick"); // 'x' didn't delete
+    }
+
+    #[test]
+    fn replace_range_swaps_a_word_and_is_undoable() {
+        let mut v = VimEdit::new("teh quick".into(), 0);
+        v.replace_range(0, 3, "the");
+        assert_eq!(v.text(), "the quick");
+        assert_eq!(v.cursor(), 0);
         feed(&mut v, "u");
         assert_eq!(v.text(), "teh quick");
     }

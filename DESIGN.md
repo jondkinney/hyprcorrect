@@ -372,7 +372,9 @@ editable text and has two modes:
   The popup grows with the sentence up to **half the monitor width**
   (the daemon passes the focused monitor's logical width); longer
   sentences wrap, with both rows broken at identical columns and ~1.5
-  line-height between wrapped lines.
+  line-height between wrapped lines. Column widths track each field's
+  *current* length, so a field grown by typing re-wraps with the rest of
+  the line instead of running off the edge.
 - **Vim mode** (`Ctrl+E`): the whole sentence becomes a small modal
   editor — a deliberate *subset* of vim, for when the correction is
   wrong and needs free-form fixing. NORMAL/INSERT/COMMAND; motions
@@ -380,9 +382,13 @@ editable text and has two modes:
   column-keeping `j`/`k` and end-of-line access); edits
   `x r s S D C dd cc`; operators `d`/`c` over those motions and the
   `iw`/`aw` text objects (so `ciw`, `dw`, `daw`, with vim's `cw`==`ce`);
-  leading counts; undo `u`, redo `Ctrl+R`, and repeat `.`. `:w`/`:wq`/`:x`
-  and normal-mode `Enter` apply; `:q`/`:q!` cancel; INSERT `Enter` inserts
-  a newline. The Original is shown column-aligned above the editor on the
+  leading counts; undo `u`, redo `Ctrl+R`, and repeat `.`. `z=` over a
+  word opens the same ranked spell-suggest dropdown as word-edit mode
+  (`1`–`5` / `j`/`k` / arrows + `Enter` choose; picking advances to the
+  next word with suggestions, or applies on the last). `:w`/`:wq`/`:x`
+  and normal-mode `Enter` apply; `:q`/`:q!` *and `Esc` in NORMAL* cancel;
+  `Esc` in INSERT returns to NORMAL; INSERT `Enter` inserts a newline. The
+  Original is shown column-aligned above the editor on the
   same grid as word-edit mode (the buffer's *display* is space-padded to
   the columns while the vim cursor/motions keep working on the raw text,
   via a raw→display index map). It is a self-contained Rust state machine
