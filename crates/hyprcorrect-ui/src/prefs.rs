@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
@@ -174,6 +174,13 @@ struct PrefsApp {
     lt_ngrams: Option<bool>,
     /// In-flight n-gram archive download (~8.4 GB), or `None`.
     ngram_download: Option<crate::ngrams::DownloadHandle>,
+    /// In-flight native folder-picker for the n-gram folder field. The
+    /// picker runs on a worker thread so the dialog doesn't freeze the UI;
+    /// the chosen path (or `None` if cancelled) arrives on this channel.
+    folder_pick: Option<Receiver<Option<String>>>,
+    /// Whether a folder-picker tool (zenity/kdialog) is on PATH — gates the
+    /// Browse button.
+    folder_picker_available: bool,
     /// Last status refresh — re-probed every few seconds while the
     /// Providers panel is visible so a foreign container the user
     /// just started shows up.
@@ -236,6 +243,8 @@ impl PrefsApp {
             lt_status: None,
             lt_ngrams: None,
             ngram_download: None,
+            folder_pick: None,
+            folder_picker_available: tool_in_path("zenity") || tool_in_path("kdialog"),
             last_status_check: Instant::now() - Duration::from_secs(60),
             status_probe: None,
             docker_op: None,
@@ -309,6 +318,30 @@ impl PrefsApp {
             DownloadPhase::Cancelled => {
                 self.ngram_download = None;
                 self.ok("n-gram download cancelled.");
+            }
+        }
+    }
+
+    /// Pick up the result of a background folder-picker (Browse button): on
+    /// a chosen path, drop it into the n-gram folder field.
+    fn poll_folder_pick(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.folder_pick else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.folder_pick = None;
+                if let Some(path) = result {
+                    self.config.providers.languagetool.ngram_dir = Some(path);
+                    self.clear_status();
+                }
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.folder_pick = None;
             }
         }
     }
@@ -505,6 +538,7 @@ impl eframe::App for PrefsApp {
         self.refresh_stale_check();
         self.poll_docker_op(ctx);
         self.poll_ngram_download(ctx);
+        self.poll_folder_pick(ctx);
         if self.section == Section::Providers {
             self.refresh_lt_status(ctx);
         }
@@ -676,19 +710,12 @@ impl eframe::App for PrefsApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Cap the form column so inputs don't stretch the full
-                        // width of a wide window — on big monitors the
-                        // full-width fields reached the right edge and the
-                        // combo drop-buttons clipped. Left-aligned, capped.
-                        ui.set_max_width(CONTENT_MAX_WIDTH);
-                        match self.section {
-                            Section::Hotkeys => self.hotkeys_panel(ui),
-                            Section::Providers => self.providers_panel(ui),
-                            Section::Behavior => self.behavior_panel(ui),
-                            Section::Privacy => self.privacy_panel(ui),
-                            Section::About => self.about_panel(ui),
-                        }
+                    .show(ui, |ui| match self.section {
+                        Section::Hotkeys => self.hotkeys_panel(ui),
+                        Section::Providers => self.providers_panel(ui),
+                        Section::Behavior => self.behavior_panel(ui),
+                        Section::Privacy => self.privacy_panel(ui),
+                        Section::About => self.about_panel(ui),
                     });
             });
 
@@ -910,11 +937,13 @@ impl PrefsApp {
         ui.add_space(SETTING_BLOCK_SPACING);
 
         // App-downloaded data takes over the row: show where it lives
-        // (grayed) + a Remove option.
+        // (grayed, read-only) with the Browse button disabled, plus a
+        // Remove option — the user doesn't pick a folder in this case.
         let base = hyprcorrect_core::config::ngram_data_dir();
-        if let Some(base) = base
+        if let Some(managed) = base
             .as_deref()
             .filter(|b| crate::ngrams::data_root(b).is_some())
+            .map(std::path::Path::to_path_buf)
         {
             field_label_with_info(
                 ui,
@@ -922,9 +951,22 @@ impl PrefsApp {
                 "Downloaded and installed by hyprcorrect — you don't need to set your own.",
             );
             ui.add_space(4.0);
-            let mut shown = base.to_string_lossy().to_string();
+            let mut shown = managed.to_string_lossy().to_string();
             ui.add_enabled_ui(false, |ui| {
-                padded_text_edit(ui, &mut shown);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let browse_w = 88.0;
+                    let field_w =
+                        (ui.available_width() - browse_w - 6.0 - TEXT_EDIT_MARGIN_X).max(80.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut shown)
+                            .margin(egui::Margin::symmetric(8, 6))
+                            .desired_width(field_w),
+                    );
+                    ui.add(egui::Button::new("Browse…")).on_disabled_hover_text(
+                        "hyprcorrect manages this folder — use Remove downloaded data to change it.",
+                    );
+                });
             });
             ui.add_space(8.0);
             let port = docker::host_port_from_url(&self.config.providers.languagetool.url);
@@ -940,13 +982,14 @@ impl PrefsApp {
                 .clicked()
                 && let Some(port) = port
             {
-                self.docker_op = Some(docker::remove_ngrams(port, base.to_path_buf()));
+                self.docker_op = Some(docker::remove_ngrams(port, managed));
                 self.ok(OpKind::RemoveNgrams.label());
             }
             return false;
         }
 
-        // No app download — editable field for data the user already has.
+        // No app download — editable field + enabled Browse for data the
+        // user already has.
         field_label(ui, "n-gram data folder (optional)");
         ui.add_space(4.0);
         let mut ngram = self
@@ -956,7 +999,33 @@ impl PrefsApp {
             .ngram_dir
             .clone()
             .unwrap_or_default();
-        let changed = padded_text_edit(ui, &mut ngram).changed();
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let browse_w = 88.0;
+            let field_w = (ui.available_width() - browse_w - 6.0 - TEXT_EDIT_MARGIN_X).max(80.0);
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut ngram)
+                        .hint_text("/path/to/ngrams (the folder containing en/)")
+                        .margin(egui::Margin::symmetric(8, 6))
+                        .desired_width(field_w),
+                )
+                .changed();
+            if ui
+                .add_enabled(
+                    self.folder_pick.is_none() && self.folder_picker_available,
+                    egui::Button::new("Browse…"),
+                )
+                .on_disabled_hover_text("Install zenity or kdialog to browse for a folder.")
+                .on_hover_text("Pick the folder in a file dialog.")
+                .clicked()
+            {
+                self.folder_pick = Some(spawn_folder_pick(
+                    self.config.providers.languagetool.ngram_dir.clone(),
+                ));
+            }
+        });
         if changed {
             self.config.providers.languagetool.ngram_dir =
                 (!ngram.trim().is_empty()).then(|| ngram.trim().to_string());
@@ -964,9 +1033,9 @@ impl PrefsApp {
         ui.add_space(4.0);
         caption(
             ui,
-            "Only if you already have the unzipped n-gram data (the folder containing \
-             en/) — point here, then \"Enable n-grams\" above. Otherwise use \
-             \"Download n-grams\" above.",
+            "Only if you already have the unzipped n-gram data — the folder that contains \
+             an en/ subfolder (e.g. …/ngrams/, with en/2grams, en/3grams inside). Point \
+             here, then \"Enable n-grams\" above. Otherwise use \"Download n-grams\".",
         );
         changed
     }
@@ -1068,7 +1137,15 @@ impl PrefsApp {
     /// be added by (re)creating the container.
     fn languagetool_ngram_row(&mut self, ui: &mut egui::Ui, url: &str, op_in_flight: bool) {
         ui.add_space(SETTING_BLOCK_SPACING);
-        field_label(ui, "n-grams (wear/where)");
+        field_label_with_info(
+            ui,
+            "n-grams (wear/where)",
+            "LanguageTool's statistical n-gram model catches real-word errors — words \
+             spelled correctly but wrong for the context, which a plain spell-checker \
+             can't flag. Examples: their/there/they're, its/it's, then/than, to/too, \
+             your/you're, of/off, lose/loose. The dataset is LanguageTool's English \
+             n-gram corpus (~8.4 GB download, ~16 GB unzipped to a folder containing en/).",
+        );
         ui.add_space(4.0);
 
         // A download in flight owns the row: progress bar + Cancel.
@@ -1124,7 +1201,7 @@ impl PrefsApp {
         if self.lt_ngrams == Some(true) {
             ui.colored_label(
                 egui::Color32::from_rgb(110, 200, 130),
-                "Loaded — real-word confusions are caught.",
+                "Loaded — real-word confusions are caught (their/there, its/it's, then/than).",
             );
             if downloaded.is_none()
                 && let (Some(dir), Some(port)) = (user_dir.as_deref(), port)
@@ -1203,7 +1280,8 @@ impl PrefsApp {
         ui.add_space(4.0);
         caption(
             ui,
-            "Off. Download the data, or point the folder below at a copy you have.",
+            "Off — real-word errors slip through (their/there, its/it's). Download the \
+             data, or point the folder below at a copy you have.",
         );
     }
 
@@ -1815,6 +1893,65 @@ fn not_wired_note(ui: &mut egui::Ui, backend: &str) {
     );
 }
 
+/// Whether `name` resolves to an executable on `$PATH`.
+fn tool_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+/// Spawn a native folder picker on a worker thread (so the dialog doesn't
+/// freeze the egui loop) and return the channel its result lands on:
+/// `Some(path)` when the user picks one, `None` if they cancel.
+fn spawn_folder_pick(initial: Option<String>) -> Receiver<Option<String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("hyprcorrect-folder-pick".into())
+        .spawn(move || {
+            let _ = tx.send(pick_folder(initial.as_deref()));
+        })
+        .ok();
+    rx
+}
+
+/// Open a directory chooser via zenity (then kdialog), starting at
+/// `initial` if given. Blocks the worker thread until the user responds.
+fn pick_folder(initial: Option<&str>) -> Option<String> {
+    let initial = initial.map(str::trim).filter(|d| !d.is_empty());
+    if tool_in_path("zenity") {
+        let mut cmd = std::process::Command::new("zenity");
+        cmd.args([
+            "--file-selection",
+            "--directory",
+            "--title=Select n-gram data folder",
+        ]);
+        if let Some(dir) = initial {
+            cmd.arg(format!("--filename={}/", dir.trim_end_matches('/')));
+        }
+        if let Ok(out) = cmd.output() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return out
+                .status
+                .success()
+                .then_some(path)
+                .filter(|p| !p.is_empty());
+        }
+    }
+    if tool_in_path("kdialog") {
+        let mut cmd = std::process::Command::new("kdialog");
+        cmd.arg("--getexistingdirectory");
+        cmd.arg(initial.unwrap_or("."));
+        if let Ok(out) = cmd.output() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return out
+                .status
+                .success()
+                .then_some(path)
+                .filter(|p| !p.is_empty());
+        }
+    }
+    None
+}
+
 /// Paint a small filled dot — the "active provider" marker in the LLM
 /// tab bar. Drawn, not a glyph, so it can't fall back to a tofu box (the
 /// bundled fonts lack the Geometric-Shapes block, e.g. ●).
@@ -1864,7 +2001,11 @@ fn editable_combo(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let btn_w = 30.0;
-        let field_w = (ui.available_width() - btn_w - 4.0).max(120.0);
+        // egui renders a TextEdit `desired_width + margin.sum().x` wide (the
+        // 8px-each-side margin is added ON TOP of desired_width), so reserve
+        // that 16px too — otherwise field + spacing + button overflow the
+        // row and the chevron clips off the right edge.
+        let field_w = (ui.available_width() - btn_w - 4.0 - TEXT_EDIT_MARGIN_X).max(80.0);
         let edit = ui.add(
             egui::TextEdit::singleline(text)
                 .hint_text(hint)
@@ -1875,7 +2016,7 @@ fn editable_combo(
         let btn = combo_arrow_button(ui, edit.rect.height());
         egui::Popup::menu(&btn)
             .id(ui.make_persistent_id((id_salt, "popup")))
-            .width(field_w)
+            .width(field_w + TEXT_EDIT_MARGIN_X)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
                 for opt in options {
@@ -2052,11 +2193,7 @@ impl PrefsApp {
     /// Save button that appends the provider (vendor-unique, capped at 5).
     fn llm_add_tab(&mut self, ui: &mut egui::Ui) -> bool {
         let mut touched = false;
-        caption(
-            ui,
-            "Add a hosted LLM. Pick (or type) a backend and model, paste a key, then \
-             Save. Add up to 5 providers.",
-        );
+        caption(ui, "Add a hosted LLM (up to 5 providers).");
         ui.add_space(SETTING_BLOCK_SPACING);
 
         field_label(ui, "Backend");
@@ -2274,10 +2411,11 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
 
-/// Max width of the settings form column. Inputs fill up to this and then
-/// stop, so on a wide window they don't stretch edge-to-edge (which
-/// clipped the combo drop-buttons against the right margin / scrollbar).
-const CONTENT_MAX_WIDTH: f32 = 640.0;
+/// Horizontal margin egui's `TextEdit` adds on top of `desired_width`
+/// (our `Margin::symmetric(8, …)` → 8px each side = 16px). Must be
+/// reserved when a field shares a row with another widget, or the field's
+/// true outer width overflows the row.
+const TEXT_EDIT_MARGIN_X: f32 = 16.0;
 
 /// The Hyprland/Omarchy logo glyph in the bundled `omarchy.ttf`.
 /// Renders as a blank tofu box if the font isn't installed — we
