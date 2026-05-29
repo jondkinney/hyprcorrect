@@ -76,6 +76,12 @@ impl Default for Hotkeys {
     }
 }
 
+/// Most LLM provider tabs the prefs UI lets you configure. Each is a
+/// distinct hosted backend (Anthropic, OpenAI, …) with its own model and
+/// keychain entry. The prefs UI enforces this cap and one-tab-per-backend
+/// uniqueness when adding providers.
+pub const MAX_LLM_PROVIDERS: usize = 5;
+
 /// Provider routing settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -84,7 +90,13 @@ pub struct Providers {
     pub default: ProviderId,
     /// Provider used for `fix-last-sentence` and the review popup.
     pub smart: ProviderId,
-    pub llm: LlmConfig,
+    /// Configured LLM providers, one per hosted backend (max
+    /// [`MAX_LLM_PROVIDERS`]). When [`ProviderId::Llm`] is selected the
+    /// daemon uses the first entry whose backend is wired and keyed. The
+    /// field-level `#[serde(default)]` makes an absent `llms` deserialize
+    /// to an empty list, so the prefs UI can persist "no providers".
+    #[serde(default)]
+    pub llms: Vec<LlmConfig>,
     pub languagetool: LanguageToolConfig,
 }
 impl Default for Providers {
@@ -92,7 +104,7 @@ impl Default for Providers {
         Self {
             default: ProviderId::Spellbook,
             smart: ProviderId::Llm,
-            llm: LlmConfig::default(),
+            llms: vec![LlmConfig::default()],
             languagetool: LanguageToolConfig::default(),
         }
     }
@@ -362,6 +374,32 @@ fix_word = "CTRL+J"
         let path = unique_tempdir().join("does-not-exist.toml");
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn llms_list_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        // Active provider is first in the list (index 0).
+        cfg.providers.llms = vec![
+            LlmConfig {
+                backend: "anthropic".into(),
+                model: "claude-haiku-4-5".into(),
+            },
+            LlmConfig {
+                backend: "openai".into(),
+                model: "gpt-4o-mini".into(),
+            },
+        ];
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.providers.llms, cfg.providers.llms);
+
+        // Deleting every provider persists as an empty list (doesn't
+        // silently resurrect the default).
+        cfg.providers.llms.clear();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(back.providers.llms.is_empty());
     }
 
     fn unique_tempdir() -> PathBuf {

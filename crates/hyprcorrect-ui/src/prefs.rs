@@ -6,6 +6,7 @@
 //! on other OSes) so it picks up the change without restart. Secrets
 //! (LLM API keys) live in the OS keychain — never in config.toml.
 
+use std::collections::BTreeMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -26,7 +27,6 @@ use crate::icon;
 type ChordRecorder = ChordRecording;
 
 const APP_ID: &str = "hyprcorrect-prefs";
-const LLM_ANTHROPIC_KEY: &str = "llm.anthropic";
 
 /// Which hotkey row's chord is being recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,15 @@ enum HotkeyTarget {
     FixSentence,
     Review,
     ReviewLlm,
+}
+
+/// Which LLM-provider tab is selected in the Providers panel. Existing
+/// providers are keyed by their backend (the unique tab identity, stable
+/// across reorders); `Add` is the "+ Add Provider" tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LlmTab {
+    Provider(String),
+    Add,
 }
 
 /// Sections in the left sidebar.
@@ -93,10 +102,19 @@ struct PrefsApp {
     /// Snapshot of the config as it sits on disk — used to gate the
     /// Save button (no-op saves are blocked).
     saved: Config,
-    /// LLM API key in the keyring at startup, used to detect changes.
-    saved_api_key: String,
-    /// Current LLM API key field.
-    api_key_field: String,
+    /// Per-backend LLM API keys being edited (backend → key field). One
+    /// entry per configured provider; the daemon reads each from the OS
+    /// keychain at `llm.<backend>`.
+    llm_keys: BTreeMap<String, String>,
+    /// Snapshot of `llm_keys` as it sits in the keychain — gates Save and
+    /// drives which entries get written on Save.
+    saved_llm_keys: BTreeMap<String, String>,
+    /// Which provider tab is selected in the Providers panel.
+    llm_tab: LlmTab,
+    /// Draft provider being filled in on the "+ Add Provider" tab.
+    llm_draft: LlmConfig,
+    /// Draft API key for the provider being added.
+    llm_draft_key: String,
     /// "Start at login" — true when a `~/.config/autostart/
     /// hyprcorrect.desktop` exists. Linux-only; on macOS the same
     /// box will eventually map to a LaunchAgent.
@@ -171,17 +189,31 @@ struct PrefsApp {
 impl PrefsApp {
     fn new(
         saved: Config,
-        saved_api_key: String,
+        saved_llm_keys: BTreeMap<String, String>,
         shutdown_tx: Sender<()>,
         section: Section,
     ) -> Self {
         #[cfg(target_os = "linux")]
         let autostart_enabled = autostart::is_enabled();
+        // Open on the active (first) provider's tab, or the Add tab when
+        // none are configured.
+        let llm_tab = saved
+            .providers
+            .llms
+            .first()
+            .map(|c| LlmTab::Provider(c.backend.clone()))
+            .unwrap_or(LlmTab::Add);
         Self {
             config: saved.clone(),
             saved,
-            api_key_field: saved_api_key.clone(),
-            saved_api_key,
+            llm_keys: saved_llm_keys.clone(),
+            saved_llm_keys,
+            llm_tab,
+            llm_draft: LlmConfig {
+                backend: String::new(),
+                model: String::new(),
+            },
+            llm_draft_key: String::new(),
             #[cfg(target_os = "linux")]
             autostart_enabled,
             #[cfg(target_os = "linux")]
@@ -367,7 +399,7 @@ impl PrefsApp {
         let autostart_changed = self.autostart_enabled != self.saved_autostart_enabled;
         #[cfg(not(target_os = "linux"))]
         let autostart_changed = false;
-        self.config != self.saved || self.api_key_field != self.saved_api_key || autostart_changed
+        self.config != self.saved || self.llm_keys != self.saved_llm_keys || autostart_changed
     }
 
     fn ok(&mut self, text: impl Into<String>) {
@@ -397,18 +429,33 @@ impl PrefsApp {
             self.err(format!("save failed: {e}"));
             return;
         }
-        if self.api_key_field != self.saved_api_key {
-            let result = if self.api_key_field.is_empty() {
-                secrets::delete(LLM_ANTHROPIC_KEY)
+        // Write any per-backend keys that changed. Collect first so the
+        // error path can borrow `self` mutably without aliasing the maps.
+        let key_writes: Vec<(String, String)> = self
+            .llm_keys
+            .iter()
+            .filter(|(backend, key)| {
+                self.saved_llm_keys
+                    .get(*backend)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    != key.as_str()
+            })
+            .map(|(b, k)| (b.clone(), k.clone()))
+            .collect();
+        for (backend, key) in key_writes {
+            let name = hyprcorrect_core::llm::key_name(&backend);
+            let result = if key.is_empty() {
+                secrets::delete(&name)
             } else {
-                secrets::set(LLM_ANTHROPIC_KEY, &self.api_key_field)
+                secrets::set(&name, &key)
             };
             if let Err(e) = result {
                 self.err(format!("keychain write failed: {e}"));
                 return;
             }
-            self.saved_api_key = self.api_key_field.clone();
         }
+        self.saved_llm_keys = self.llm_keys.clone();
         #[cfg(target_os = "linux")]
         if self.autostart_enabled != self.saved_autostart_enabled {
             let result = if self.autostart_enabled {
@@ -431,7 +478,19 @@ impl PrefsApp {
 
     fn cancel(&mut self) {
         self.config = self.saved.clone();
-        self.api_key_field = self.saved_api_key.clone();
+        self.llm_keys = self.saved_llm_keys.clone();
+        self.llm_draft = LlmConfig {
+            backend: String::new(),
+            model: String::new(),
+        };
+        self.llm_draft_key.clear();
+        self.llm_tab = self
+            .config
+            .providers
+            .llms
+            .first()
+            .map(|c| LlmTab::Provider(c.backend.clone()))
+            .unwrap_or(LlmTab::Add);
         #[cfg(target_os = "linux")]
         {
             self.autostart_enabled = self.saved_autostart_enabled;
@@ -808,7 +867,7 @@ impl PrefsApp {
 
         ui.label(egui::RichText::new("LLM").size(16.0).strong());
         ui.add_space(8.0);
-        touched |= llm_section(ui, &mut self.config.providers.llm, &mut self.api_key_field);
+        touched |= self.llm_providers_section(ui);
 
         ui.add_space(SETTING_BLOCK_SPACING);
         ui.separator();
@@ -1688,27 +1747,425 @@ fn info_icon(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
-/// Render LLM-specific fields. Returns `true` if anything changed.
-fn llm_section(ui: &mut egui::Ui, llm: &mut LlmConfig, api_key: &mut String) -> bool {
+/// Hosted LLM backends offered in the Add-provider dropdown. The combo is
+/// editable, so this is a convenience list, not a hard constraint.
+/// Anthropic is first — it's the only backend wired today (see
+/// [`hyprcorrect_core::llm::is_backend_wired`]).
+const LLM_BACKENDS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "gemini",
+    "openrouter",
+    "mistral",
+    "groq",
+    "deepseek",
+];
+
+/// Suggested models for a backend, cheapest/fastest first → most
+/// capable/expensive last. The model combo is editable, so these are
+/// starting points. Anthropic IDs are current; the rest are best-effort
+/// (and unwired today).
+fn models_for_backend(backend: &str) -> &'static [&'static str] {
+    match backend.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"],
+        "openai" => &["gpt-4o-mini", "gpt-4o", "o4-mini", "o3", "gpt-4.1"],
+        "gemini" => &["gemini-2.5-flash", "gemini-2.5-pro"],
+        "groq" => &["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
+        "mistral" => &["mistral-small-latest", "mistral-large-latest"],
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        _ => &[],
+    }
+}
+
+/// Vendor-cased display name for a backend id; custom values show as
+/// typed.
+fn backend_display(backend: &str) -> String {
+    let t = backend.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "anthropic" => "Anthropic".into(),
+        "openai" => "OpenAI".into(),
+        "gemini" => "Gemini".into(),
+        "openrouter" => "OpenRouter".into(),
+        "mistral" => "Mistral".into(),
+        "groq" => "Groq".into(),
+        "deepseek" => "DeepSeek".into(),
+        _ => t.to_string(),
+    }
+}
+
+/// Amber caption: `backend` is configurable but not yet functional —
+/// selecting LLM falls back to the offline provider until it's wired.
+fn not_wired_note(ui: &mut egui::Ui, backend: &str) {
+    ui.label(
+        egui::RichText::new(format!(
+            "{} isn't wired up yet — until it's supported, selecting LLM falls back \
+             to the offline Spellbook.",
+            backend_display(backend)
+        ))
+        .size(CAPTION_SIZE)
+        .line_height(Some(CAPTION_LINE_HEIGHT))
+        .color(egui::Color32::from_rgb(220, 160, 50)),
+    );
+}
+
+/// Paint a small filled dot — the "active provider" marker in the LLM
+/// tab bar. Drawn, not a glyph, so it can't fall back to a tofu box (the
+/// bundled fonts lack the Geometric-Shapes block, e.g. ●).
+fn active_dot(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), 4.0, egui::Color32::from_rgb(110, 200, 130));
+}
+
+/// A combo-box drop button rendered as a painted chevron (not a glyph, so
+/// it never tofus). Returns the click response that drives the popup.
+fn combo_arrow_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, height), egui::Sense::click());
+    let bg = if resp.hovered() {
+        egui::Color32::from_gray(74)
+    } else {
+        egui::Color32::from_gray(60)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(4), bg);
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.6, egui::Color32::from_gray(210));
+    // Downward chevron.
+    ui.painter().line_segment(
+        [c + egui::vec2(-4.0, -2.0), c + egui::vec2(0.0, 2.5)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 2.5)],
+        stroke,
+    );
+    resp
+}
+
+/// An editable combo box: a typeable single-line field plus a chevron
+/// button that drops a menu of `options`. Picking an option overwrites
+/// the field. Returns whether `text` changed this frame (typed or
+/// picked). Mirrors egui's own `ComboBox` popup wiring.
+fn editable_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    text: &mut String,
+    options: &[&str],
+    hint: &str,
+) -> bool {
     let mut changed = false;
-
-    field_label(ui, "Backend");
-    ui.add_space(4.0);
-    changed |= padded_text_edit(ui, &mut llm.backend).changed();
-
-    ui.add_space(SETTING_BLOCK_SPACING);
-    field_label(ui, "Model");
-    ui.add_space(4.0);
-    changed |= padded_text_edit(ui, &mut llm.model).changed();
-
-    ui.add_space(SETTING_BLOCK_SPACING);
-    field_label(ui, "API key");
-    ui.add_space(4.0);
-    changed |= padded_password_edit(ui, api_key).changed();
-    ui.add_space(4.0);
-    caption(ui, "Stored in your OS keychain, not in config.toml.");
-
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let btn_w = 30.0;
+        let field_w = (ui.available_width() - btn_w - 4.0).max(120.0);
+        let edit = ui.add(
+            egui::TextEdit::singleline(text)
+                .hint_text(hint)
+                .margin(egui::Margin::symmetric(8, 6))
+                .desired_width(field_w),
+        );
+        changed |= edit.changed();
+        let btn = combo_arrow_button(ui, edit.rect.height());
+        egui::Popup::menu(&btn)
+            .id(ui.make_persistent_id((id_salt, "popup")))
+            .width(field_w)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                for opt in options {
+                    if ui.selectable_label(text.as_str() == *opt, *opt).clicked() {
+                        *text = (*opt).to_string();
+                        changed = true;
+                    }
+                }
+            });
+    });
     changed
+}
+
+impl PrefsApp {
+    /// The tabbed multi-provider LLM editor under the Providers panel's
+    /// "LLM" heading. The active provider (list index 0) is the leftmost
+    /// tab, marked with a dot. Returns whether anything changed.
+    fn llm_providers_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut touched = false;
+        let backends: Vec<String> = self
+            .config
+            .providers
+            .llms
+            .iter()
+            .map(|c| c.backend.clone())
+            .collect();
+        let can_add = backends.len() < hyprcorrect_core::config::MAX_LLM_PROVIDERS;
+
+        // Keep the selected tab valid after reorders / removals.
+        let valid = match &self.llm_tab {
+            LlmTab::Provider(b) => backends.iter().any(|x| x == b),
+            LlmTab::Add => can_add,
+        };
+        if !valid {
+            self.llm_tab = backends
+                .first()
+                .map(|b| LlmTab::Provider(b.clone()))
+                .unwrap_or(LlmTab::Add);
+        }
+
+        // --- Tab bar --- only once at least one provider is saved; with
+        // none, the add form shows directly (no lone "+ Add Provider" chip).
+        if !backends.is_empty() {
+            let mut new_tab: Option<LlmTab> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (i, backend) in backends.iter().enumerate() {
+                    let selected = matches!(&self.llm_tab, LlmTab::Provider(b) if b == backend);
+                    // A green dot marks the active provider (always index 0).
+                    if i == 0 {
+                        active_dot(ui);
+                    }
+                    if ui
+                        .selectable_label(selected, backend_display(backend))
+                        .clicked()
+                    {
+                        new_tab = Some(LlmTab::Provider(backend.clone()));
+                    }
+                }
+                if can_add
+                    && ui
+                        .selectable_label(matches!(self.llm_tab, LlmTab::Add), "+ Add Provider")
+                        .clicked()
+                {
+                    new_tab = Some(LlmTab::Add);
+                }
+            });
+            if let Some(t) = new_tab {
+                self.llm_tab = t;
+            }
+            ui.add_space(12.0);
+        }
+
+        // --- Body ---
+        match self.llm_tab.clone() {
+            LlmTab::Provider(backend) => touched |= self.llm_provider_tab(ui, &backend),
+            LlmTab::Add => touched |= self.llm_add_tab(ui),
+        }
+        touched
+    }
+
+    /// One configured provider's tab: Active toggle, (read-only) backend,
+    /// editable model, per-backend API key, and Remove.
+    fn llm_provider_tab(&mut self, ui: &mut egui::Ui, backend: &str) -> bool {
+        let mut touched = false;
+        let Some(idx) = self
+            .config
+            .providers
+            .llms
+            .iter()
+            .position(|c| c.backend == backend)
+        else {
+            return false;
+        };
+        let is_active = idx == 0;
+        let mut promote = false;
+        let mut remove = false;
+
+        let mut active = is_active;
+        let resp = ui
+            .add_enabled(!is_active, egui::Checkbox::new(&mut active, "Active"))
+            .on_hover_text(if is_active {
+                "This is the active provider — used whenever a provider is set to LLM."
+            } else {
+                "Make this the active provider (moves it to the front of the list)."
+            });
+        if resp.changed() && active && !is_active {
+            promote = true;
+        }
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        field_label(ui, "Backend");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(backend_display(backend))
+                .size(14.0)
+                .color(egui::Color32::from_gray(200)),
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Model");
+        ui.add_space(4.0);
+        touched |= editable_combo(
+            ui,
+            &format!("model_{backend}"),
+            &mut self.config.providers.llms[idx].model,
+            models_for_backend(backend),
+            "Pick or type a model",
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "API key");
+        ui.add_space(4.0);
+        let key = self.llm_keys.entry(backend.to_string()).or_default();
+        touched |= padded_password_edit(ui, key).changed();
+        ui.add_space(4.0);
+        caption(ui, "Stored in your OS keychain, not in config.toml.");
+
+        if !hyprcorrect_core::llm::is_backend_wired(backend) {
+            ui.add_space(6.0);
+            not_wired_note(ui, backend);
+        }
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        if ui
+            .add(egui::Button::new("Remove provider"))
+            .on_hover_text("Delete this provider tab. Its saved API key is left in the keychain.")
+            .clicked()
+        {
+            remove = true;
+        }
+
+        if promote {
+            self.promote_llm(backend);
+            self.llm_tab = LlmTab::Provider(backend.to_string());
+            touched = true;
+        }
+        if remove {
+            self.config.providers.llms.retain(|c| c.backend != backend);
+            self.llm_keys.remove(backend);
+            self.llm_tab = self
+                .config
+                .providers
+                .llms
+                .first()
+                .map(|c| LlmTab::Provider(c.backend.clone()))
+                .unwrap_or(LlmTab::Add);
+            touched = true;
+        }
+        touched
+    }
+
+    /// The "+ Add Provider" tab: editable backend + model + key, and a
+    /// Save button that appends the provider (vendor-unique, capped at 5).
+    fn llm_add_tab(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut touched = false;
+        caption(
+            ui,
+            "Add a hosted LLM. Pick (or type) a backend and model, paste a key, then \
+             Save. Add up to 5 providers.",
+        );
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        field_label(ui, "Backend");
+        ui.add_space(4.0);
+        let before = self.llm_draft.backend.clone();
+        if editable_combo(
+            ui,
+            "add_backend",
+            &mut self.llm_draft.backend,
+            LLM_BACKENDS,
+            "Pick or type a backend",
+        ) {
+            touched = true;
+            // When the backend changes, default the model to that
+            // backend's cheapest/fastest.
+            if self.llm_draft.backend != before {
+                self.llm_draft.model = models_for_backend(&self.llm_draft.backend)
+                    .first()
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_default();
+            }
+        }
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "Model");
+        ui.add_space(4.0);
+        let models = models_for_backend(&self.llm_draft.backend);
+        touched |= editable_combo(
+            ui,
+            "add_model",
+            &mut self.llm_draft.model,
+            models,
+            "Pick or type a model",
+        );
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        field_label(ui, "API key");
+        ui.add_space(4.0);
+        touched |= padded_password_edit(ui, &mut self.llm_draft_key).changed();
+        ui.add_space(4.0);
+        caption(ui, "Stored in your OS keychain, not in config.toml.");
+
+        let backend = self.llm_draft.backend.trim().to_string();
+        if !backend.is_empty() && !hyprcorrect_core::llm::is_backend_wired(&backend) {
+            ui.add_space(6.0);
+            not_wired_note(ui, &backend);
+        }
+
+        let dup = self
+            .config
+            .providers
+            .llms
+            .iter()
+            .any(|c| c.backend.eq_ignore_ascii_case(&backend));
+        let full = self.config.providers.llms.len() >= hyprcorrect_core::config::MAX_LLM_PROVIDERS;
+        let can_add = !backend.is_empty() && !dup && !full;
+
+        ui.add_space(SETTING_BLOCK_SPACING);
+        if ui
+            .add_enabled(can_add, egui::Button::new("Save provider"))
+            .clicked()
+        {
+            let model = if self.llm_draft.model.trim().is_empty() {
+                models_for_backend(&backend)
+                    .first()
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_default()
+            } else {
+                self.llm_draft.model.trim().to_string()
+            };
+            self.config.providers.llms.push(LlmConfig {
+                backend: backend.clone(),
+                model,
+            });
+            self.llm_keys
+                .insert(backend.clone(), self.llm_draft_key.clone());
+            self.llm_tab = LlmTab::Provider(backend.clone());
+            self.llm_draft = LlmConfig {
+                backend: String::new(),
+                model: String::new(),
+            };
+            self.llm_draft_key.clear();
+            touched = true;
+        }
+        if dup && !backend.is_empty() {
+            ui.add_space(4.0);
+            caption(
+                ui,
+                &format!("{} already has a tab.", backend_display(&backend)),
+            );
+        } else if full {
+            ui.add_space(4.0);
+            caption(
+                ui,
+                "Maximum of 5 providers reached — remove one to add another.",
+            );
+        }
+        touched
+    }
+
+    /// Move the provider with `backend` to the front of the list (index
+    /// 0 = active). MRU order: the previously-active provider slides to
+    /// second.
+    fn promote_llm(&mut self, backend: &str) {
+        if let Some(i) = self
+            .config
+            .providers
+            .llms
+            .iter()
+            .position(|c| c.backend == backend)
+            && i > 0
+        {
+            let c = self.config.providers.llms.remove(i);
+            self.config.providers.llms.insert(0, c);
+        }
+    }
 }
 
 /// Sidebar row — vernier-style. Egui's default `selectable_label`
@@ -2035,6 +2492,10 @@ fn apply_style(ctx: &egui::Context) {
         style.spacing.interact_size = egui::vec2(40.0, 28.0);
         style.spacing.icon_width = 18.0;
         style.spacing.icon_spacing = 6.0;
+        // Solid (space-reserving) scrollbar instead of egui's default
+        // floating one, which overlays content — full-width fields and the
+        // combo-box drop buttons were being clipped under the float lane.
+        style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.visuals.widgets.inactive.expansion = 0.0;
     });
 }
@@ -2321,10 +2782,16 @@ pub(crate) fn run() {
         eprintln!("hyprcorrect: could not load config ({e}) — using defaults");
         Config::default()
     });
-    let saved_api_key = secrets::get(LLM_ANTHROPIC_KEY)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    // Load each configured provider's API key from the keychain
+    // (`llm.<backend>`) so the per-tab key fields start populated.
+    let mut saved_llm_keys: BTreeMap<String, String> = BTreeMap::new();
+    for llm in &saved.providers.llms {
+        let key = secrets::get(&hyprcorrect_core::llm::key_name(&llm.backend))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        saved_llm_keys.insert(llm.backend.clone(), key);
+    }
     // The daemon can open us straight to a section (e.g. Providers when
     // the user tries to escalate to the LLM without a key configured).
     let initial_section = std::env::var("HYPRCORRECT_PREFS_SECTION")
@@ -2348,7 +2815,7 @@ pub(crate) fn run() {
             install_glyph_fonts(&cc.egui_ctx);
             Ok(Box::new(PrefsApp::new(
                 saved,
-                saved_api_key,
+                saved_llm_keys,
                 shutdown_tx,
                 initial_section,
             )))

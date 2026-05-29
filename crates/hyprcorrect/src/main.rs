@@ -1652,12 +1652,23 @@ fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmP
     // default but wants the LLM as a fallback. The auto-correct paths
     // still only *call* it when their ProviderId selects it, so merely
     // building it triggers no network use.
-    match LlmProvider::from_config(&config.providers.llm) {
+    //
+    // The *active* provider is the first in the list (the prefs UI keeps
+    // it there via the Active checkbox / MRU reorder). We honor that
+    // choice strictly: if the active backend isn't wired yet or has no
+    // key, we fall back to the offline provider rather than silently
+    // using a different tab the user didn't pick.
+    let active = config.providers.llms.first()?;
+    match LlmProvider::from_config(active) {
         Ok(p) => Some(p),
-        // No key set up yet — expected; not an error worth logging.
-        Err(LlmError::NoApiKey) => None,
+        // No key set up yet, or the chosen backend isn't wired —
+        // expected; the daemon falls back to the offline provider.
+        Err(LlmError::NoApiKey) | Err(LlmError::UnsupportedBackend(_)) => None,
         Err(e) => {
-            eprintln!("hyprcorrect: LLM provider unavailable — {e}");
+            eprintln!(
+                "hyprcorrect: active LLM provider '{}' unavailable — {e}",
+                active.backend
+            );
             None
         }
     }
@@ -1777,6 +1788,62 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// The LLM smart path is unavailable (call failed, no key, or an unwired
+/// backend). Prefer LanguageTool when it's configured; only drop to the
+/// offline spellbook when LanguageTool isn't configured (or also fails).
+/// Keeps the smart path useful for users who run a local LanguageTool but
+/// haven't readied an LLM provider.
+#[cfg(target_os = "linux")]
+fn llm_unavailable_fallback(
+    text: &str,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
+    spell: &hyprcorrect_core::OfflineProvider,
+) -> (String, hyprcorrect_core::ProviderId) {
+    use hyprcorrect_core::ProviderId;
+    if let Some(lt) = languagetool {
+        match lt.check_text(text) {
+            Ok(corrections) => {
+                return (
+                    apply_correction_list(text, corrections),
+                    ProviderId::LanguageTool,
+                );
+            }
+            Err(e) => {
+                eprintln!("hyprcorrect: LanguageTool fallback also failed: {e} — using spellbook");
+            }
+        }
+    }
+    (apply_corrections(text, spell), ProviderId::Spellbook)
+}
+
+/// [`llm_unavailable_fallback`] for the review path: also returns ranked
+/// per-word suggestions for the dropdown.
+#[cfg(target_os = "linux")]
+fn llm_unavailable_fallback_with_suggestions(
+    text: &str,
+    languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
+    spell: &hyprcorrect_core::OfflineProvider,
+) -> (
+    String,
+    hyprcorrect_core::ProviderId,
+    Vec<hyprcorrect_core::runtime::WordSuggestions>,
+) {
+    use hyprcorrect_core::ProviderId;
+    if let Some(lt) = languagetool {
+        match lt.check_text(text) {
+            Ok(corrections) => {
+                let (corrected, suggestions) = apply_with_suggestions(text, corrections);
+                return (corrected, ProviderId::LanguageTool, suggestions);
+            }
+            Err(e) => {
+                eprintln!("hyprcorrect: LanguageTool fallback also failed: {e} — using spellbook");
+            }
+        }
+    }
+    let (corrected, suggestions) = apply_with_suggestions(text, spell.check_text(text));
+    (corrected, ProviderId::Spellbook, suggestions)
+}
+
 /// Route the sentence to whichever provider the user configured for
 /// the "smart" path. On any provider failure we drop back to the
 /// offline spellbook path so the chord never silently no-ops, and
@@ -1802,17 +1869,18 @@ fn correct_sentence(
                 Ok(corrected) => (corrected, ProviderId::Llm),
                 Err(e) => {
                     let msg = format!("LLM call failed: {e}");
-                    eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                    eprintln!("hyprcorrect: {msg} — falling back");
                     notify_warning("LLM unavailable", &msg);
-                    (apply_corrections(text, spell), ProviderId::Spellbook)
+                    llm_unavailable_fallback(text, languagetool, spell)
                 }
             },
             None => {
-                let msg = "Smart provider is set to LLM, but no API key is configured. \
-                           Open Preferences → Providers → LLM and paste your Anthropic key.";
-                eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                let msg = "Smart provider is set to LLM, but the active provider has no API \
+                           key (or its backend isn't supported yet). Open Preferences → \
+                           Providers → LLM.";
+                eprintln!("hyprcorrect: {msg} — falling back");
                 notify_warning("LLM key not set", msg);
-                (apply_corrections(text, spell), ProviderId::Spellbook)
+                llm_unavailable_fallback(text, languagetool, spell)
             }
         },
         ProviderId::LanguageTool => match languagetool {
@@ -1874,17 +1942,18 @@ fn correct_sentence_with_suggestions(
                 }
                 Err(e) => {
                     let msg = format!("LLM call failed: {e}");
-                    eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                    eprintln!("hyprcorrect: {msg} — falling back");
                     notify_warning("LLM unavailable", &msg);
-                    spellbook_fallback()
+                    llm_unavailable_fallback_with_suggestions(text, languagetool, spell)
                 }
             },
             None => {
-                let msg = "Smart provider is set to LLM, but no API key is configured. \
-                           Open Preferences → Providers → LLM and paste your Anthropic key.";
-                eprintln!("hyprcorrect: {msg} — falling back to spellbook");
+                let msg = "Smart provider is set to LLM, but the active provider has no API \
+                           key (or its backend isn't supported yet). Open Preferences → \
+                           Providers → LLM.";
+                eprintln!("hyprcorrect: {msg} — falling back");
                 notify_warning("LLM key not set", msg);
-                spellbook_fallback()
+                llm_unavailable_fallback_with_suggestions(text, languagetool, spell)
             }
         },
         ProviderId::LanguageTool => match languagetool {

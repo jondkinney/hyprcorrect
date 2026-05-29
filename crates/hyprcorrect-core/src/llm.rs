@@ -16,9 +16,21 @@ use std::time::Duration;
 use crate::runtime::WordSuggestions;
 use crate::secrets;
 
-/// The keyring entry name the prefs UI writes to and the daemon
-/// reads from. Kept in lock-step with the prefs constant.
-const ANTHROPIC_KEY_NAME: &str = "llm.anthropic";
+/// Whether `backend` has a working integration. Only Anthropic is wired
+/// today; other backends are accepted by the config and prefs UI (so a
+/// user can pre-stage a key and model) but fail to build a provider —
+/// the daemon then falls back to the offline Spellbook.
+pub fn is_backend_wired(backend: &str) -> bool {
+    backend == "anthropic"
+}
+
+/// OS-keychain entry name for a backend's API key: `llm.<backend>`. The
+/// prefs UI writes here and the daemon reads here — kept in lock-step.
+/// Anthropic's historical key lived at `llm.anthropic`, which is exactly
+/// `key_name("anthropic")`, so existing keys keep working unchanged.
+pub fn key_name(backend: &str) -> String {
+    format!("llm.{backend}")
+}
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -90,10 +102,10 @@ impl LlmProvider {
     ///
     /// See [`LlmError`].
     pub fn from_config(llm: &crate::LlmConfig) -> Result<Self, LlmError> {
-        if llm.backend != "anthropic" {
+        if !is_backend_wired(&llm.backend) {
             return Err(LlmError::UnsupportedBackend(llm.backend.clone()));
         }
-        let api_key = secrets::get(ANTHROPIC_KEY_NAME)
+        let api_key = secrets::get(&key_name(&llm.backend))
             .map_err(|e| LlmError::Keychain(e.to_string()))?
             .ok_or(LlmError::NoApiKey)?;
         Ok(Self {
@@ -287,5 +299,15 @@ mod tests {
             Err(LlmError::UnsupportedBackend(name)) => assert_eq!(name, "openai"),
             other => panic!("expected UnsupportedBackend, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn key_name_and_wiring_are_stable() {
+        // Anthropic's key keeps its historical entry name, so existing
+        // keys survive the move to per-backend keys.
+        assert_eq!(key_name("anthropic"), "llm.anthropic");
+        assert_eq!(key_name("openai"), "llm.openai");
+        assert!(is_backend_wired("anthropic"));
+        assert!(!is_backend_wired("openai"));
     }
 }
