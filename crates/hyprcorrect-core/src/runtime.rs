@@ -96,6 +96,13 @@ pub struct ReviewRequest {
     /// editable fields. Empty when no provider offered alternatives.
     #[serde(default)]
     pub suggestions: Vec<WordSuggestions>,
+    /// `true` while the daemon is still computing the correction (e.g.
+    /// an in-flight LLM call). The popup is spawned immediately in this
+    /// state — showing the original text and a "Checking…" line — and
+    /// re-reads the request until the daemon writes the finished one
+    /// with `pending: false`.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// Write a fresh review request to disk. Overwrites any pending one.

@@ -1319,23 +1319,46 @@ fn start_review(
     let Some(at) = buffer.sentence_at_caret() else {
         return;
     };
-    let (corrected, _used_provider, suggestions) =
-        correct_sentence_with_suggestions(&at.sentence, smart, llm, languagetool, provider);
     eprintln!(
         "hyprcorrect: review-build — original ({} chars): {:?}",
         at.sentence.chars().count(),
         at.sentence
     );
-    if corrected == at.sentence {
-        eprintln!("hyprcorrect: review-build — provider returned the same text, nothing to review");
+
+    // Show the popup immediately in a "Checking…" state (it displays the
+    // original and polls for the finished request) so a slow provider —
+    // an LLM round-trip especially — doesn't leave the chord feeling
+    // dead. Then correct and write the finished request.
+    let pending = ReviewRequest {
+        original: at.sentence.clone(),
+        corrected: at.sentence.clone(),
+        trailing: at.trailing.clone(),
+        chars_before_caret: at.chars_before_caret,
+        chars_after_caret: at.chars_after_caret,
+        window_address: address.to_string(),
+        suggestions: Vec::new(),
+        pending: true,
+    };
+    if let Err(e) = write_review_request(&pending) {
+        eprintln!("hyprcorrect: could not write pending review request: {e}");
         return;
     }
-    eprintln!(
-        "hyprcorrect: review-build — corrected ({} chars): {:?}, {} suggestion set(s)",
-        corrected.chars().count(),
-        corrected,
-        suggestions.len(),
-    );
+    spawn_review_window();
+
+    let (corrected, _used_provider, suggestions) =
+        correct_sentence_with_suggestions(&at.sentence, smart, llm, languagetool, provider);
+    if corrected == at.sentence {
+        eprintln!("hyprcorrect: review-build — no changes; popup will close");
+    } else {
+        eprintln!(
+            "hyprcorrect: review-build — corrected ({} chars): {:?}, {} suggestion set(s)",
+            corrected.chars().count(),
+            corrected,
+            suggestions.len(),
+        );
+    }
+    // Always write the finished request (pending: false) — even on a
+    // no-op, so the popup stops "Checking…" and closes itself.
     let request = ReviewRequest {
         original: at.sentence,
         corrected,
@@ -1344,12 +1367,11 @@ fn start_review(
         chars_after_caret: at.chars_after_caret,
         window_address: address.to_string(),
         suggestions,
+        pending: false,
     };
     if let Err(e) = write_review_request(&request) {
-        eprintln!("hyprcorrect: could not write review request: {e}");
-        return;
+        eprintln!("hyprcorrect: could not write finished review request: {e}");
     }
-    spawn_review_window();
 }
 
 /// Install per-class Hyprland windowrules so the review popup

@@ -45,7 +45,11 @@ pub(crate) fn run() {
         }
     };
 
-    let estimated_height = estimate_window_height(&request);
+    // Size generously up front — the popup is spawned in the short
+    // "Checking…" state before the correction (and its inline suggestion
+    // list) is known, and resizing a floating window afterward isn't
+    // honored reliably.
+    let estimated_height = (estimate_window_height(&request) + 210.0).min(MAX_WINDOW_HEIGHT);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
@@ -108,23 +112,24 @@ struct ReviewApp {
     /// both in monospace with each correction directly under the word
     /// it replaces. `None` falls back to proportional, unaligned text.
     align: Option<Vec<usize>>,
+    /// `false` while the daemon is still computing (the popup shows
+    /// "Checking…" and polls); flips `true` once the finished request
+    /// is loaded and the review state below is built.
+    ready: bool,
+    /// The original word each field replaced, by field ordinal — for the
+    /// "revert to original" dropdown entry. Empty unless the change is a
+    /// clean 1:1 substitution (changed-word counts match).
+    field_originals: Vec<String>,
 }
 
 impl ReviewApp {
     fn new(request: ReviewRequest) -> Self {
-        let segments = worddiff::diff(&request.original, &request.corrected);
-        let align = worddiff::align_widths(&request.original, &request.corrected);
-        let field_segments: Vec<usize> = segments
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| matches!(s, Segment::Field(_)).then_some(i))
-            .collect();
-        Self {
+        let mut app = Self {
             request,
             decision: None,
             mode: EditMode::Word,
-            segments,
-            field_segments,
+            segments: Vec::new(),
+            field_segments: Vec::new(),
             focused_field: None,
             pending_focus: None,
             focus_caret: None,
@@ -132,8 +137,57 @@ impl ReviewApp {
             vim: None,
             vim_marks: Vec::new(),
             dropdown_highlight: None,
-            align,
+            align: None,
+            ready: false,
+            field_originals: Vec::new(),
+        };
+        if !app.request.pending {
+            app.load_review();
         }
+        app
+    }
+
+    /// Build the word-edit state from the (finished) request. Called
+    /// once the daemon has written the correction.
+    fn load_review(&mut self) {
+        self.segments = worddiff::diff(&self.request.original, &self.request.corrected);
+        self.align = worddiff::align_widths(&self.request.original, &self.request.corrected);
+        self.field_segments = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| matches!(s, Segment::Field(_)).then_some(i))
+            .collect();
+        // The original word behind each field, for "revert to original" —
+        // only when it's a clean 1:1 substitution (counts line up).
+        let ranges = worddiff::changed_word_ranges(&self.request.original, &self.request.corrected);
+        self.field_originals = if ranges.len() == self.field_segments.len() {
+            ranges
+                .iter()
+                .map(|&(s, e)| self.request.original[s..e].to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.initialized = false; // re-run focus init on the next frame
+        self.ready = true;
+    }
+
+    /// Dropdown entries for the focused field: the ranked alternatives,
+    /// plus a "revert to original" entry when one is available. Each is
+    /// `(label, value)` — the value is inserted, the label is shown.
+    fn field_entries(&self, ordinal: usize, current: &str) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .options_for_field(ordinal, current)
+            .into_iter()
+            .map(|o| (o.clone(), o))
+            .collect();
+        if let Some(orig) = self.field_originals.get(ordinal) {
+            if orig != current && !entries.iter().any(|(_, v)| v == orig) {
+                entries.push((format!("↩  {orig}   (original)"), orig.clone()));
+            }
+        }
+        entries
     }
 
     /// Ranked backup options to show for the focused field `ordinal`,
@@ -251,12 +305,12 @@ impl ReviewApp {
         // Esc closes the dropdown.
         if let Some(ord) = self.focused_field {
             let current = self.field_word(ord);
-            let opts = self.options_for_field(ord, &current);
-            if !opts.is_empty() {
+            let entries = self.field_entries(ord, &current);
+            if !entries.is_empty() {
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
                     let next = self
                         .dropdown_highlight
-                        .map_or(0, |h| (h + 1).min(opts.len() - 1));
+                        .map_or(0, |h| (h + 1).min(entries.len() - 1));
                     self.dropdown_highlight = Some(next);
                     return;
                 }
@@ -269,17 +323,18 @@ impl ReviewApp {
                 }
                 let pristine = self.focus_caret.map(|(_, _, sel)| sel).unwrap_or(false);
                 if pristine {
-                    for d in 1..=opts.len().min(5) {
+                    for d in 1..=entries.len().min(5) {
                         if take_digit(ctx, d) {
-                            self.insert_suggestion(ord, &opts[d - 1]);
+                            let value = entries[d - 1].1.clone();
+                            self.insert_suggestion(ord, &value);
                             return;
                         }
                     }
                 }
                 if let Some(h) = self.dropdown_highlight {
                     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-                        let opt = opts[h].clone();
-                        self.insert_suggestion(ord, &opt);
+                        let value = entries[h].1.clone();
+                        self.insert_suggestion(ord, &value);
                         return;
                     }
                     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -332,6 +387,32 @@ impl ReviewApp {
         }
     }
 
+    /// The "Checking…" state shown while the daemon computes the
+    /// correction — the original text plus a spinner.
+    fn render_checking(&self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(26, 22)),
+            )
+            .show(ctx, |ui| {
+                ui.heading("Review correction");
+                ui.add_space(16.0);
+                section_label(ui, "Original");
+                original_card(ui, &self.request.original, &self.request.original, None);
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(16.0));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Checking…  (Esc to cancel)")
+                            .size(15.0)
+                            .color(egui::Color32::from_gray(170)),
+                    );
+                });
+            });
+    }
+
     fn render_word(&mut self, ui: &mut egui::Ui) {
         ui.heading("Review correction");
         ui.add_space(16.0);
@@ -364,7 +445,6 @@ impl ReviewApp {
         let pending = self.pending_focus;
         let mut new_focused: Option<usize> = None;
         let mut new_caret: Option<(usize, usize, bool)> = None;
-        let mut focused_rect: Option<egui::Rect> = None;
         let mut consumed_pending = false;
         let segments = &mut self.segments;
         // When aligned, render in monospace and size each word to its
@@ -449,9 +529,6 @@ impl ReviewApp {
                             // span the word, not the padded column.
                             let rect = out.response.rect;
                             let focused = out.response.has_focus() || pending == Some(this_ord);
-                            if focused {
-                                focused_rect = Some(rect);
-                            }
                             let sq_color = if focused {
                                 SQUIGGLE_BLUE
                             } else {
@@ -497,15 +574,18 @@ impl ReviewApp {
         self.focused_field = new_focused;
         self.focus_caret = new_caret;
 
-        // Auto-expanded backup-suggestion dropdown under the focused field.
-        if let (Some(ord), Some(rect)) = (self.focused_field, focused_rect) {
+        // Suggestion list, inline below the Proposed card so it never
+        // covers the corrected sentence above it.
+        if let Some(ord) = self.focused_field {
             let current = self.field_word(ord);
-            let opts = self.options_for_field(ord, &current);
-            if !opts.is_empty() {
+            let entries = self.field_entries(ord, &current);
+            if !entries.is_empty() {
+                let labels: Vec<&str> = entries.iter().map(|(l, _)| l.as_str()).collect();
                 if let Some(pick) =
-                    render_suggestion_dropdown(ui, rect, &opts, self.dropdown_highlight)
+                    render_suggestion_dropdown(ui, &current, &labels, self.dropdown_highlight)
                 {
-                    self.insert_suggestion(ord, &opts[pick]);
+                    let value = entries[pick].1.clone();
+                    self.insert_suggestion(ord, &value);
                 }
             }
         }
@@ -665,7 +745,7 @@ impl ReviewApp {
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
-                "ciw · dw · cw · x · r  ·  w b 0 $  ·  i a o  ·  :wq / Enter apply  ·  :q cancel",
+                "ciw dw cw x r · u Ctrl+R . · w b 0 $ · i a o · :wq/Enter apply · :q cancel",
             )
             .size(11.0)
             .color(egui::Color32::from_gray(130)),
@@ -675,6 +755,32 @@ impl ReviewApp {
 
 impl eframe::App for ReviewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Still computing the correction: show "Checking…", poll for the
+        // finished request, and bail out of the normal review UI.
+        if !self.ready {
+            if let Ok(Some(req)) = runtime::read_review_request() {
+                if !req.pending {
+                    if req.corrected == req.original {
+                        // Nothing to change — close without applying.
+                        self.decision = Some("cancel");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    self.request = req;
+                    self.load_review();
+                }
+            }
+            if !self.ready {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.cancel(ctx);
+                    return;
+                }
+                self.render_checking(ctx);
+                ctx.request_repaint_after(Duration::from_millis(120));
+                return;
+            }
+        }
+
         if !self.initialized {
             self.initialized = true;
             self.pending_focus = (!self.field_segments.is_empty()).then_some(0);
@@ -782,19 +888,26 @@ fn collect_vim_keys(ctx: &egui::Context) -> Vec<VimKey> {
         for ev in &i.events {
             match ev {
                 egui::Event::Key {
-                    key, pressed: true, ..
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
                 } => {
-                    let vk = match key {
-                        egui::Key::Escape => Some(VimKey::Esc),
-                        egui::Key::Enter => Some(VimKey::Enter),
-                        egui::Key::Backspace => Some(VimKey::Backspace),
-                        egui::Key::ArrowLeft => Some(VimKey::Left),
-                        egui::Key::ArrowRight => Some(VimKey::Right),
-                        egui::Key::ArrowUp => Some(VimKey::Up),
-                        egui::Key::ArrowDown => Some(VimKey::Down),
-                        egui::Key::Home => Some(VimKey::Home),
-                        egui::Key::End => Some(VimKey::End),
-                        _ => None,
+                    let vk = if *key == egui::Key::R && modifiers.ctrl {
+                        Some(VimKey::Redo) // Ctrl+R
+                    } else {
+                        match key {
+                            egui::Key::Escape => Some(VimKey::Esc),
+                            egui::Key::Enter => Some(VimKey::Enter),
+                            egui::Key::Backspace => Some(VimKey::Backspace),
+                            egui::Key::ArrowLeft => Some(VimKey::Left),
+                            egui::Key::ArrowRight => Some(VimKey::Right),
+                            egui::Key::ArrowUp => Some(VimKey::Up),
+                            egui::Key::ArrowDown => Some(VimKey::Down),
+                            egui::Key::Home => Some(VimKey::Home),
+                            egui::Key::End => Some(VimKey::End),
+                            _ => None,
+                        }
                     };
                     if let Some(vk) = vk {
                         out.push(vk);
@@ -1009,34 +1122,47 @@ fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: egui::Colo
     painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4, color)));
 }
 
-/// Render the auto-expanded suggestion list as a floating panel just
-/// below `anchor` (the focused field). Returns the clicked option index.
+/// Render the suggestion list inline, *below* the Proposed card, so the
+/// corrected sentence (the word you're choosing for) stays fully
+/// visible. Shows which word it's for, the numbered `options`, and a key
+/// hint. Returns the clicked option index.
 fn render_suggestion_dropdown(
-    ui: &egui::Ui,
-    anchor: egui::Rect,
-    options: &[String],
+    ui: &mut egui::Ui,
+    current: &str,
+    options: &[&str],
     highlight: Option<usize>,
 ) -> Option<usize> {
     let mut clicked = None;
-    egui::Area::new(egui::Id::new("hc_suggestion_dropdown"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(anchor.left_bottom() + egui::vec2(0.0, 6.0))
-        .show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style())
-                .fill(CARD_BG)
-                .corner_radius(egui::CornerRadius::same(6))
-                .show(ui, |ui| {
-                    ui.set_min_width(170.0);
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for (i, opt) in options.iter().enumerate() {
-                        let label = egui::RichText::new(format!("{}   {opt}", i + 1))
-                            .font(prose_font())
-                            .color(TEXT_FG);
-                        if ui.selectable_label(highlight == Some(i), label).clicked() {
-                            clicked = Some(i);
-                        }
-                    }
-                });
+    ui.add_space(10.0);
+    egui::Frame::new()
+        .fill(egui::Color32::from_gray(30))
+        .corner_radius(egui::CornerRadius::same(6))
+        .stroke(egui::Stroke::new(1.0, SQUIGGLE_BLUE.gamma_multiply(0.5)))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                egui::RichText::new(format!("Other options for  {current}"))
+                    .size(12.0)
+                    .strong()
+                    .color(egui::Color32::from_gray(150)),
+            );
+            ui.add_space(4.0);
+            for (i, opt) in options.iter().enumerate() {
+                let label = egui::RichText::new(format!("{}   {opt}", i + 1))
+                    .font(prose_font())
+                    .color(TEXT_FG);
+                if ui.selectable_label(highlight == Some(i), label).clicked() {
+                    clicked = Some(i);
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Up/Down choose · 1-5 pick · Enter use")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(120)),
+            );
         });
     clicked
 }
