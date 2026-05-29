@@ -226,16 +226,23 @@ impl ReviewApp {
             .unwrap_or_default()
     }
 
-    /// Replace field `ordinal`'s text with `option`, re-focus it (so the
-    /// new word is selected and typing replaces), and close the dropdown.
-    fn insert_suggestion(&mut self, ordinal: usize, option: &str) {
+    /// Replace field `ordinal`'s text with `option`, then advance to the
+    /// next correction (focusing + selecting it) — or apply the dialog
+    /// when this was the last one. Closes the dropdown.
+    fn insert_suggestion(&mut self, ctx: &egui::Context, ordinal: usize, option: &str) {
         if let Some(&seg) = self.field_segments.get(ordinal) {
             if let Some(Segment::Field(t)) = self.segments.get_mut(seg) {
                 *t = option.to_string();
             }
         }
-        self.pending_focus = Some(ordinal);
         self.dropdown_highlight = None;
+        if ordinal + 1 >= self.field_segments.len() {
+            // Picked the last correction — apply.
+            self.apply(ctx);
+        } else {
+            // Move on to the next correction.
+            self.pending_focus = Some(ordinal + 1);
+        }
     }
 
     /// Commit the (possibly edited) sentence and close. The actual
@@ -326,7 +333,7 @@ impl ReviewApp {
                     for d in 1..=entries.len().min(5) {
                         if take_digit(ctx, d) {
                             let value = entries[d - 1].1.clone();
-                            self.insert_suggestion(ord, &value);
+                            self.insert_suggestion(ctx, ord, &value);
                             return;
                         }
                     }
@@ -334,7 +341,7 @@ impl ReviewApp {
                 if let Some(h) = self.dropdown_highlight {
                     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
                         let value = entries[h].1.clone();
-                        self.insert_suggestion(ord, &value);
+                        self.insert_suggestion(ctx, ord, &value);
                         return;
                     }
                     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -585,7 +592,8 @@ impl ReviewApp {
                     render_suggestion_dropdown(ui, &current, &labels, self.dropdown_highlight)
                 {
                     let value = entries[pick].1.clone();
-                    self.insert_suggestion(ord, &value);
+                    let ctx = ui.ctx().clone();
+                    self.insert_suggestion(&ctx, ord, &value);
                 }
             }
         }
