@@ -1278,10 +1278,7 @@ impl PrefsApp {
             {
                 ui.add_space(4.0);
                 if ui
-                    .add_enabled(
-                        !op_in_flight,
-                        egui::Button::new("Reload n-grams").frame(false),
-                    )
+                    .add_enabled(!op_in_flight, egui::Button::new("Reload n-grams"))
                     .on_hover_text(
                         "Optional — n-grams already work. Only needed if you swap the data \
                          at the folder below (LanguageTool reads n-grams only at startup). \
