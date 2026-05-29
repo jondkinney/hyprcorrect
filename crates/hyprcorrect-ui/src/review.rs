@@ -103,11 +103,17 @@ struct ReviewApp {
     /// Index into the focused field's suggestion dropdown that is
     /// highlighted via Up/Down, or `None` when nothing is highlighted.
     dropdown_highlight: Option<usize>,
+    /// Per-word column widths (char counts) when the original and
+    /// corrected sentences have the same word count — used to render
+    /// both in monospace with each correction directly under the word
+    /// it replaces. `None` falls back to proportional, unaligned text.
+    align: Option<Vec<usize>>,
 }
 
 impl ReviewApp {
     fn new(request: ReviewRequest) -> Self {
         let segments = worddiff::diff(&request.original, &request.corrected);
+        let align = worddiff::align_widths(&request.original, &request.corrected);
         let field_segments: Vec<usize> = segments
             .iter()
             .enumerate()
@@ -126,6 +132,7 @@ impl ReviewApp {
             vim: None,
             vim_marks: Vec::new(),
             dropdown_highlight: None,
+            align,
         }
     }
 
@@ -329,7 +336,12 @@ impl ReviewApp {
         ui.heading("Review correction");
         ui.add_space(16.0);
         section_label(ui, "Original");
-        original_card(ui, &self.request.original, &self.request.corrected);
+        original_card(
+            ui,
+            &self.request.original,
+            &self.request.corrected,
+            self.align.as_deref(),
+        );
 
         ui.add_space(18.0);
         if self.field_segments.is_empty() {
@@ -355,30 +367,75 @@ impl ReviewApp {
         let mut focused_rect: Option<egui::Rect> = None;
         let mut consumed_pending = false;
         let segments = &mut self.segments;
-        let font = prose_font();
+        // When aligned, render in monospace and size each word to its
+        // column so corrections sit directly under the originals.
+        let widths = self.align.clone();
+        let font = if widths.is_some() {
+            mono_font()
+        } else {
+            prose_font()
+        };
 
         card(ui, |ui| {
+            let cw = char_width(ui, &font);
+            // Column width in points for word column `col` given the
+            // current text's char count (grows if the user types past it).
+            let col_width = |col: usize, chars: usize| -> f32 {
+                match &widths {
+                    Some(w) => w.get(col).copied().unwrap_or(chars).max(chars) as f32 * cw,
+                    None => 0.0,
+                }
+            };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
-                let mut ordinal = 0usize;
+                let mut ordinal = 0usize; // editable-field ordinal
+                let mut col = 0usize; // word-column index (aligned mode)
                 for (seg_idx, seg) in segments.iter_mut().enumerate() {
                     match seg {
                         Segment::Static(t) => {
-                            ui.label(
-                                egui::RichText::new(t.as_str())
-                                    .font(font.clone())
-                                    .color(egui::Color32::from_gray(215)),
-                            );
+                            if widths.is_some() {
+                                // Split so each unchanged word can be padded
+                                // to its column; separators render as-is.
+                                for (is_word, tok) in worddiff::split_tokens(t) {
+                                    let text = if is_word {
+                                        let wlen = tok.chars().count();
+                                        let pad = col_width(col, wlen) / cw;
+                                        col += 1;
+                                        format!("{tok:<width$}", width = pad.round() as usize)
+                                    } else {
+                                        tok
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .font(font.clone())
+                                            .color(egui::Color32::from_gray(215)),
+                                    );
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(t.as_str())
+                                        .font(font.clone())
+                                        .color(egui::Color32::from_gray(215)),
+                                );
+                            }
                         }
                         Segment::Field(t) => {
                             let this_ord = ordinal;
                             ordinal += 1;
+                            let this_col = col;
+                            col += 1;
                             let id = egui::Id::new(("hc_review_field", seg_idx));
                             let chars = t.chars().count();
-                            // Size the borderless field to its exact text
-                            // width (+ a hair for the caret) so it grows and
-                            // shrinks as the user types.
-                            let w = measure_width(ui, t, &font).max(7.0) + 3.0;
+                            // Width: the column (aligned) or the exact text
+                            // (unaligned), so the field grows/shrinks as the
+                            // user types.
+                            let w = if widths.is_some() {
+                                // Exact column width — no caret padding, or
+                                // the columns after this field would drift.
+                                col_width(this_col, chars)
+                            } else {
+                                measure_width(ui, t, &font).max(7.0) + 3.0
+                            };
                             let out = egui::TextEdit::singleline(t)
                                 .id(id)
                                 .frame(false)
@@ -388,18 +445,24 @@ impl ReviewApp {
                                 .text_color(egui::Color32::from_gray(238))
                                 .show(ui);
 
-                            // Blue squiggle marks the correction / tab target.
+                            // Blue squiggle marks the correction / tab target;
+                            // span the word, not the padded column.
                             let rect = out.response.rect;
                             let focused = out.response.has_focus() || pending == Some(this_ord);
                             if focused {
                                 focused_rect = Some(rect);
                             }
-                            let col = if focused {
+                            let sq_color = if focused {
                                 SQUIGGLE_BLUE
                             } else {
                                 SQUIGGLE_BLUE.gamma_multiply(0.65)
                             };
-                            squiggle(ui.painter(), rect.left(), rect.right(), rect.bottom(), col);
+                            let sq_right = if widths.is_some() {
+                                rect.left() + chars as f32 * cw
+                            } else {
+                                rect.right()
+                            };
+                            squiggle(ui.painter(), rect.left(), sq_right, rect.bottom(), sq_color);
 
                             if pending == Some(this_ord) {
                                 out.response.request_focus();
@@ -488,7 +551,9 @@ impl ReviewApp {
         ui.heading("Edit sentence  ·  vim");
         ui.add_space(10.0);
         section_label(ui, "Original");
-        original_card(ui, &self.request.original, &self.request.corrected);
+        // No column alignment in vim mode — the editor buffer below isn't
+        // column-padded, so there's nothing to line up against.
+        original_card(ui, &self.request.original, &self.request.corrected, None);
         ui.add_space(16.0);
 
         let (text, cursor, mode, status) = match self.vim.as_ref() {
@@ -712,6 +777,8 @@ fn collect_vim_keys(ctx: &egui::Context) -> Vec<VimKey> {
                         egui::Key::ArrowRight => Some(VimKey::Right),
                         egui::Key::ArrowUp => Some(VimKey::Up),
                         egui::Key::ArrowDown => Some(VimKey::Down),
+                        egui::Key::Home => Some(VimKey::Home),
+                        egui::Key::End => Some(VimKey::End),
                         _ => None,
                     };
                     if let Some(vk) = vk {
@@ -785,18 +852,75 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 /// The "Original" card: the user's text with a red squiggle under each
-/// word the corrector changed.
-fn original_card(ui: &mut egui::Ui, original: &str, corrected: &str) {
-    let ranges = worddiff::changed_word_ranges(original, corrected);
+/// word the corrector changed. With `align` widths it renders monospace
+/// and pads each word to its column so the words above line up with the
+/// corrections below.
+fn original_card(ui: &mut egui::Ui, original: &str, corrected: &str, align: Option<&[usize]>) {
     card(ui, |ui| {
-        paint_text_with_squiggles(
-            ui,
-            original,
-            &ranges,
-            egui::Color32::from_gray(170),
-            SQUIGGLE_RED,
-        );
+        if let Some(widths) = align {
+            paint_aligned_original(ui, original, corrected, widths);
+        } else {
+            let ranges = worddiff::changed_word_ranges(original, corrected);
+            paint_text_with_squiggles(
+                ui,
+                original,
+                &ranges,
+                egui::Color32::from_gray(170),
+                SQUIGGLE_RED,
+            );
+        }
     });
+}
+
+/// Render `original` in monospace with each word padded to its column
+/// width, and a red squiggle under each word that differs from the
+/// matching corrected word — so the originals line up directly above
+/// the corrections.
+fn paint_aligned_original(ui: &mut egui::Ui, original: &str, corrected: &str, widths: &[usize]) {
+    let font = mono_font();
+    let fg = egui::Color32::from_gray(170);
+    let cw = char_width(ui, &font);
+    let corr_words = worddiff::word_list(corrected);
+
+    // Render exactly like the Proposed card — a row of monospace labels,
+    // each word padded to its column width — so the two cards share the
+    // same per-widget layout and the columns line up pixel-for-pixel.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+        let mut col = 0usize;
+        for (is_word, tok) in worddiff::split_tokens(original) {
+            if is_word {
+                let wlen = tok.chars().count();
+                let width = widths.get(col).copied().unwrap_or(wlen).max(wlen);
+                let changed = corr_words.get(col).is_some_and(|c| *c != tok);
+                col += 1;
+                let padded = format!("{tok:<width$}");
+                let resp = ui.label(egui::RichText::new(padded).font(font.clone()).color(fg));
+                if changed {
+                    let r = resp.rect;
+                    squiggle(
+                        ui.painter(),
+                        r.left(),
+                        r.left() + wlen as f32 * cw,
+                        r.bottom(),
+                        SQUIGGLE_RED,
+                    );
+                }
+            } else {
+                ui.label(egui::RichText::new(tok).font(font.clone()).color(fg));
+            }
+        }
+    });
+}
+
+/// The monospace font for column-aligned review text.
+fn mono_font() -> egui::FontId {
+    egui::FontId::monospace(16.0)
+}
+
+/// Width of one monospace character (every glyph is the same width).
+fn char_width(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.fonts(|f| f.glyph_width(font, ' '))
 }
 
 /// Paint wrapped `text` and draw a squiggle under each `[start, end)`

@@ -124,6 +124,45 @@ pub fn changed_word_ranges(text: &str, other: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Per-column display width (char count) so each corrected word can sit
+/// directly under the original word it replaces: `max(original_word,
+/// corrected_word)` for each column. `None` when the two sentences don't
+/// have the same number of words (then the popup renders without column
+/// alignment).
+pub fn align_widths(original: &str, corrected: &str) -> Option<Vec<usize>> {
+    let o = word_list(original);
+    let c = word_list(corrected);
+    if o.is_empty() || o.len() != c.len() {
+        return None;
+    }
+    Some(
+        o.iter()
+            .zip(&c)
+            .map(|(a, b)| a.chars().count().max(b.chars().count()))
+            .collect(),
+    )
+}
+
+/// The whitespace/punctuation-delimited words of `s`, in order.
+pub fn word_list(s: &str) -> Vec<String> {
+    word_spans(s)
+        .into_iter()
+        .map(|(w, _, _)| w.to_string())
+        .collect()
+}
+
+/// Split `s` into ordered `(is_word, text)` tokens — words vs separator
+/// runs — for column-aligned rendering of a static run.
+pub fn split_tokens(s: &str) -> Vec<(bool, String)> {
+    tokenize(s)
+        .into_iter()
+        .map(|t| match t {
+            Tok::Word(w) => (true, w),
+            Tok::Sep(s) => (false, s),
+        })
+        .collect()
+}
+
 /// Each word in `s` paired with its `[start, end)` byte range.
 fn word_spans(s: &str) -> Vec<(&str, usize, usize)> {
     let mut out = Vec::new();
@@ -350,6 +389,16 @@ mod tests {
         assert_eq!(fields(&segs), vec!["café"]);
         assert_eq!(reconstruct(&segs), "café au lait");
         assert_eq!(field_start_offset(&segs, 0), Some(0));
+    }
+
+    #[test]
+    fn align_widths_pairs_columns_when_word_counts_match() {
+        assert_eq!(
+            align_widths("teh quick browne fox jumpd", "the quick brown fox jumped"),
+            Some(vec![3, 5, 6, 3, 6]),
+        );
+        // Different word counts → no column alignment.
+        assert_eq!(align_widths("the fox", "the quick fox"), None);
     }
 
     #[test]
