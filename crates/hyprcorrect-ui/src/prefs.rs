@@ -1855,7 +1855,7 @@ impl PrefsApp {
             }
         });
         ui.add_space(4.0);
-        caption(
+        caption_with_code(
             ui,
             "Useful for apps that aren't open yet. The class is whatever \
              `hyprctl activewindow` shows for that app.",

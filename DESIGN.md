@@ -433,12 +433,14 @@ upgrade. On macOS it is a borderless `NSPanel`.
 - egui preferences window (`hyprcorrect-ui`, pattern from
   `vernier-ui/prefs.rs`), panels: Hotkeys, Providers, Behavior
   (inter-key delay, reset sensitivity), Privacy (app blocklist, password
-  handling), About. It opens **tiled** (no float rule). Width is *not*
-  capped with a Wayland max-size hint — Hyprland reads a toplevel that
-  advertises a max size as a fixed dialog and force-floats it, which would
-  defeat tiling. Instead the daemon ships a Hyprland `maxsize 900` rule that
-  Hyprland applies only to floating windows, so a floating prefs is capped
-  while a tiled one fills its tile.
+  handling), About. It opens **tiled** (no float rule). Note: a floating
+  prefs window's width can't be hard-capped from the app on Hyprland — a
+  Wayland max-size hint makes Hyprland treat the toplevel as a fixed dialog
+  and force-float it (defeating tiling), a client self-resize
+  (`ViewportCommand::InnerSize`) is ignored for a mapped window, and the
+  `maxsize` windowrule is open-time only (it doesn't clamp a live
+  drag-resize). So width restraint, if any, is applied to the form *content*
+  inside egui rather than to the window frame.
 
 ```toml
 # config.toml sketch
