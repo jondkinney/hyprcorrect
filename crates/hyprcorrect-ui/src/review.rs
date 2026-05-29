@@ -1164,13 +1164,18 @@ fn collect_vim_keys(ctx: &egui::Context) -> Vec<VimKey> {
 /// from the longer of original/corrected since the popup opens before the
 /// correction is known.
 fn estimate_window_width(request: &ReviewRequest) -> f32 {
-    // ~monospace 16pt glyph width; horizontal panel + card margins.
-    const CW: f32 = 9.6;
-    const CHROME: f32 = 80.0;
-    let chars = request
-        .original
-        .chars()
-        .count()
+    // Generous monospace glyph estimate (≥ the real width, so we never
+    // size too narrow); panel + card margins + the vertical scrollbar that
+    // appears once the suggestion list makes the content tall.
+    const CW: f32 = 10.0;
+    const CHROME: f32 = 96.0;
+    // The aligned grid can be wider than either raw sentence when the two
+    // take their widest words in different columns, so size from it.
+    let aligned = worddiff::align(&request.original, &request.corrected)
+        .map(|l| l.col_widths.iter().sum::<usize>() + l.col_widths.len().saturating_sub(1))
+        .unwrap_or(0);
+    let chars = aligned
+        .max(request.original.chars().count())
         .max(request.corrected.chars().count());
     let content = chars as f32 * CW + CHROME;
     let cap = if request.screen_width > 1.0 {
@@ -1349,15 +1354,19 @@ fn paint_aligned_original(
 fn wrap_columns(col_widths: &[usize], avail: f32, cw: f32) -> Vec<(usize, usize)> {
     let mut rows = Vec::new();
     let mut start = 0usize;
-    let mut x = 0.0f32;
+    let mut width = 0.0f32; // px of the current row's content (no trailing sep)
     for (c, &w) in col_widths.iter().enumerate() {
-        let slot = (w + 1) as f32 * cw;
-        if c > start && x + slot > avail {
+        // A column adds its width, plus one separator *before* it unless
+        // it's first on the row — the last column has no trailing sep, so
+        // don't count one (that would wrap a line that actually fits).
+        let add = (if c == start { w } else { w + 1 }) as f32 * cw;
+        if c > start && width + add > avail {
             rows.push((start, c));
             start = c;
-            x = 0.0;
+            width = w as f32 * cw;
+        } else {
+            width += add;
         }
-        x += slot;
     }
     rows.push((start, col_widths.len()));
     rows
