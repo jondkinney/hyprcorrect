@@ -852,18 +852,22 @@ impl PrefsApp {
             .as_deref()
             .filter(|b| crate::ngrams::data_root(b).is_some())
         {
-            field_label(ui, "n-gram data folder");
+            field_label_with_info(
+                ui,
+                "n-gram data folder",
+                "Downloaded and installed by hyprcorrect — you don't need to set your own.",
+            );
             ui.add_space(4.0);
             let mut shown = base.to_string_lossy().to_string();
             ui.add_enabled_ui(false, |ui| {
                 padded_text_edit(ui, &mut shown);
             });
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             let port = docker::host_port_from_url(&self.config.providers.languagetool.url);
             if ui
                 .add_enabled(
                     self.docker_op.is_none() && port.is_some(),
-                    egui::Button::new("Remove downloaded data").frame(false),
+                    egui::Button::new("Remove downloaded data"),
                 )
                 .on_hover_text(
                     "Recreates the container without n-grams and deletes the downloaded \
@@ -875,11 +879,6 @@ impl PrefsApp {
                 self.docker_op = Some(docker::remove_ngrams(port, base.to_path_buf()));
                 self.ok(OpKind::RemoveNgrams.label());
             }
-            ui.add_space(4.0);
-            caption(
-                ui,
-                "Downloaded and installed by hyprcorrect — you don't need to set your own.",
-            );
             return false;
         }
 
@@ -913,14 +912,31 @@ impl PrefsApp {
     /// integration is still URL-based, this is a UX convenience for
     /// users who'd otherwise have to memorize a `docker run` invocation.
     fn languagetool_docker_row(&mut self, ui: &mut egui::Ui) {
-        field_label(ui, "Local server (Docker)");
-        ui.add_space(4.0);
-
         let url = self.config.providers.languagetool.url.clone();
         let op_in_flight = self.docker_op.is_some();
         let probe_in_flight = self.status_probe.is_some() && self.lt_status.is_none();
+        let status = self.lt_status.clone();
 
-        let Some(status) = self.lt_status.clone() else {
+        // When our managed container is up there's genuinely nothing to
+        // do, so the heading carries that reassurance in an (i) rather
+        // than a caption stacked under the Stop / Remove buttons.
+        if matches!(
+            status,
+            Some(LanguageToolStatus::Reachable {
+                managed_container_running: true,
+            })
+        ) {
+            field_label_with_info(
+                ui,
+                "Local server (Docker)",
+                "Running in the hyprcorrect-managed container. Nothing else to do.",
+            );
+        } else {
+            field_label(ui, "Local server (Docker)");
+        }
+        ui.add_space(4.0);
+
+        let Some(status) = status else {
             // First-ever probe still in flight — show a neutral
             // "checking…" message instead of flashing a wrong state.
             if probe_in_flight {
@@ -966,12 +982,6 @@ impl PrefsApp {
                             self.ok(OpKind::Remove.label());
                         }
                     });
-                    ui.add_space(4.0);
-                    caption(
-                        ui,
-                        "Running in the hyprcorrect-managed container. Nothing else \
-                         to do.",
-                    );
                 } else {
                     ui.add_space(4.0);
                     caption(
@@ -1757,6 +1767,17 @@ fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response 
 /// caption text below the input.
 fn field_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).strong().size(15.0));
+}
+
+/// A [`field_label`] with a trailing `(i)` info icon whose tooltip
+/// carries the detail that would otherwise sit in a caption line —
+/// keeps the row compact while leaving the explanation one hover away.
+/// Mirrors the LLM info icon in [`provider_radio`].
+fn field_label_with_info(ui: &mut egui::Ui, label: &str, tip: &str) {
+    ui.horizontal(|ui| {
+        field_label(ui, label);
+        info_icon(ui).on_hover_text(tip);
+    });
 }
 
 /// Muted explainer text under inputs or checkboxes. Sized for
