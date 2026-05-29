@@ -196,12 +196,10 @@ struct PrefsApp {
     /// max-size hint force-floats the toplevel (breaking tiling), the
     /// `maxsize` windowrule is open-time only, and a client self-resize
     /// (`ViewportCommand::InnerSize`) is ignored for a mapped window. So
-    /// when a *floating* prefs grows past the cap we snap it back with
-    /// `hyprctl dispatch resizewindowpixel` (a no-op on tiled windows, which
-    /// the compositor owns). These fields track the resize settle so we snap
-    /// once it stops rather than fighting an in-progress drag.
-    #[cfg(target_os = "linux")]
-    cap_last_w: f32,
+    /// when *floating* we advertise a Wayland `max_size` at runtime (see
+    /// [`Self::enforce_floating_width_cap`]). `cap_settle_at` defers that one
+    /// shot until the window is mapped (set too early it force-floats);
+    /// `cap_done` marks it applied.
     #[cfg(target_os = "linux")]
     cap_settle_at: Instant,
     #[cfg(target_os = "linux")]
@@ -264,8 +262,6 @@ impl PrefsApp {
             status_probe: None,
             docker_op: None,
             #[cfg(target_os = "linux")]
-            cap_last_w: 0.0,
-            #[cfg(target_os = "linux")]
             cap_settle_at: Instant::now(),
             #[cfg(target_os = "linux")]
             cap_done: false,
@@ -282,34 +278,31 @@ impl PrefsApp {
     /// size), so tiling is left intact. We wait for the resize to settle
     /// before snapping so we don't fight an in-progress drag. Logical units
     /// (egui points == Hyprland's coords) keep it correct on 1x and 2x.
+    /// Cap the prefs window's width at 900 logical px when *floating*, while
+    /// leaving it free to tile. The trick is *when* we advertise the Wayland
+    /// `max_size`: set via `ViewportBuilder` (before the window maps),
+    /// Hyprland reads it as a fixed dialog and force-floats the window,
+    /// breaking tiling; set at runtime once the window is already mapped
+    /// tiled, the window stays tiled — yet the client `max_size` still hard-
+    /// clamps the width whenever it's floating (a tiled window fills its tile
+    /// regardless). One shot, after a short delay so the window is mapped
+    /// first. egui points == Hyprland's logical coords, so 1x and 2x both
+    /// land at 900.
     #[cfg(target_os = "linux")]
     fn enforce_floating_width_cap(&mut self, ctx: &egui::Context) {
-        const MAX_W: f32 = 900.0;
-        const SETTLE: Duration = Duration::from_millis(180);
-        let rect = ctx.screen_rect();
-        let w = rect.width();
-        if (w - self.cap_last_w).abs() > 1.0 {
-            self.cap_last_w = w;
-            self.cap_settle_at = Instant::now();
-            self.cap_done = false;
-        }
-        if self.cap_done || w <= MAX_W + 1.0 {
+        if self.cap_done {
             return;
         }
-        if self.cap_settle_at.elapsed() < SETTLE {
-            // Still resizing — re-check shortly so we snap once it settles.
-            ctx.request_repaint_after(Duration::from_millis(60));
+        // Defer until the window is mapped and Hyprland's tile/float decision
+        // is made — advertising a max size mid-map can still force-float it.
+        if self.cap_settle_at.elapsed() < Duration::from_millis(120) {
+            ctx.request_repaint_after(Duration::from_millis(40));
             return;
         }
         self.cap_done = true;
-        let h = rect.height().round().max(1.0) as i64;
-        let _ = std::process::Command::new("hyprctl")
-            .args([
-                "dispatch",
-                "resizewindowpixel",
-                &format!("exact {} {h},class:{APP_ID}", MAX_W as i64),
-            ])
-            .output();
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+            900.0, 10_000.0,
+        )));
     }
 
     /// Kick off a background URL+docker probe if one isn't already
