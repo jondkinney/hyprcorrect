@@ -658,7 +658,7 @@ impl eframe::App for PrefsApp {
             // content column above it.
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(20, 10)),
+                    .inner_margin(egui::Margin::symmetric(20, 20)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -710,18 +710,30 @@ impl eframe::App for PrefsApp {
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::central_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(20, 18)),
+                // No right inner margin so the scroll area — and its
+                // scrollbar — reach the window's right edge. The content
+                // inside keeps its 20px right gap via `set_max_width` below.
+                egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin {
+                    left: 20,
+                    right: 0,
+                    top: 18,
+                    bottom: 18,
+                }),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match self.section {
-                        Section::Hotkeys => self.hotkeys_panel(ui),
-                        Section::Providers => self.providers_panel(ui),
-                        Section::Behavior => self.behavior_panel(ui),
-                        Section::Privacy => self.privacy_panel(ui),
-                        Section::About => self.about_panel(ui),
+                    .show(ui, |ui| {
+                        // Scrollbar sits flush at the edge; the form keeps a
+                        // 20px right gap (responsive — grows with the window).
+                        ui.set_max_width((ui.available_width() - 20.0).max(0.0));
+                        match self.section {
+                            Section::Hotkeys => self.hotkeys_panel(ui),
+                            Section::Providers => self.providers_panel(ui),
+                            Section::Behavior => self.behavior_panel(ui),
+                            Section::Privacy => self.privacy_panel(ui),
+                            Section::About => self.about_panel(ui),
+                        }
                     });
             });
 
@@ -1983,20 +1995,18 @@ fn active_dot(ui: &mut egui::Ui) {
         .circle_filled(rect.center(), 4.0, egui::Color32::from_rgb(110, 200, 130));
 }
 
-/// A combo-box drop button rendered as a painted chevron (not a glyph, so
-/// it never tofus). Returns the click response that drives the popup.
+/// A combo-box drop button: a real egui button frame (so its height,
+/// rounding, and hover match the text field next to it and the other
+/// buttons) with a downward chevron painted on top — the bundled fonts
+/// lack the Geometric-Shapes glyphs, which tofu'd. `height` matches the
+/// adjacent field's height.
 fn combo_arrow_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, height), egui::Sense::click());
-    let bg = if resp.hovered() {
-        egui::Color32::from_gray(74)
-    } else {
-        egui::Color32::from_gray(60)
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(4), bg);
-    let c = rect.center();
-    let stroke = egui::Stroke::new(1.6, egui::Color32::from_gray(210));
-    // Downward chevron.
+    // `min_size` (not `add_sized`) so the button fills the full 30px cell —
+    // add_sized centers the empty button and left ~4px of dead space on the
+    // right, pushing the visible edge in past the 20px content margin.
+    let resp = ui.add(egui::Button::new("").min_size(egui::vec2(30.0, height)));
+    let c = resp.rect.center();
+    let stroke = egui::Stroke::new(1.6, egui::Color32::from_gray(200));
     ui.painter().line_segment(
         [c + egui::vec2(-4.0, -2.0), c + egui::vec2(0.0, 2.5)],
         stroke,
@@ -2048,6 +2058,12 @@ fn editable_combo(
             .width(field_w + TEXT_EDIT_MARGIN_X)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
+                // Force the menu to the field width every frame and stop
+                // labels wrapping — `.width()` only seeds Area::default_width,
+                // and egui then remembers the (previously tiny) area size, so
+                // the options rendered one character per line.
+                ui.set_min_width(field_w + TEXT_EDIT_MARGIN_X);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 for opt in options {
                     if ui.selectable_label(text.as_str() == *opt, *opt).clicked() {
                         *text = (*opt).to_string();
