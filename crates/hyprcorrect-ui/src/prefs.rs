@@ -261,6 +261,26 @@ impl PrefsApp {
         {
             self.lt_status = Some(result.status);
             self.lt_ngrams = result.ngrams;
+            // Heal a forgotten n-gram folder: the container is serving
+            // n-grams but the config never recorded the path (enabled before
+            // we persisted it, or by an older build). Recover it from the
+            // mount so the field shows it again and it sticks on disk.
+            let unrecorded = self
+                .config
+                .providers
+                .languagetool
+                .ngram_dir
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty();
+            if result.ngrams == Some(true)
+                && unrecorded
+                && let Some(mount) = result.ngram_mount.filter(|m| !m.trim().is_empty())
+            {
+                self.config.providers.languagetool.ngram_dir = Some(mount);
+                let _ = self.persist_languagetool();
+            }
             self.status_probe = None;
             ctx.request_repaint();
         }
@@ -346,6 +366,21 @@ impl PrefsApp {
         }
     }
 
+    /// Mirror the LanguageTool config to disk after a Docker op that
+    /// changed persistent container state. The container survives a restart,
+    /// so its config must too — otherwise a reopened prefs (and any later
+    /// "Save") forgets the n-gram folder the user just enabled, even while
+    /// the container keeps serving from it. Read-modify-write only the
+    /// LanguageTool section so unsaved edits in other panels stay pending.
+    fn persist_languagetool(&mut self) -> Result<(), String> {
+        let mut on_disk = hyprcorrect_core::Config::load().map_err(|e| e.to_string())?;
+        on_disk.providers.languagetool = self.config.providers.languagetool.clone();
+        on_disk.save().map_err(|e| e.to_string())?;
+        // Keep dirty-tracking honest: these fields now match disk.
+        self.saved.providers.languagetool = self.config.providers.languagetool.clone();
+        Ok(())
+    }
+
     fn poll_docker_op(&mut self, ctx: &egui::Context) {
         let Some(handle) = &self.docker_op else {
             return;
@@ -378,6 +413,19 @@ impl PrefsApp {
                             "n-grams removed — container recreated and data deleted."
                         }
                     };
+                    // These ops change persistent container state (the
+                    // container survives a restart), so mirror the resulting
+                    // LanguageTool config to disk. Without this, enabling
+                    // n-grams recreates the container but never records the
+                    // folder — so the reopened prefs forgets it.
+                    if matches!(
+                        kind,
+                        OpKind::Install | OpKind::EnableNgrams | OpKind::RemoveNgrams
+                    ) && let Err(e) = self.persist_languagetool()
+                    {
+                        self.err(format!("{msg} (but saving config to disk failed: {e})"));
+                        return;
+                    }
                     self.ok(msg);
                 }
                 Err(e) => {
@@ -3265,10 +3313,7 @@ pub(crate) fn run() {
             .with_app_id(APP_ID)
             .with_title("hyprcorrect — Preferences")
             .with_inner_size([640.0, 480.0])
-            .with_min_inner_size([520.0, 360.0])
-            // Cap the width so a floating window doesn't stretch the form
-            // across a huge monitor (the compositor clamps to this hint).
-            .with_max_inner_size([900.0, 4000.0]),
+            .with_min_inner_size([520.0, 360.0]),
         vsync: false, // matches vernier — better Wayland responsiveness
         ..Default::default()
     };

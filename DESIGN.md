@@ -329,7 +329,7 @@ Shipped implementations:
 |---|---|---|---|
 | **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
 | **LLM** (Claude/OpenAI/…) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. Preferences stores **up to 5 hosted providers** as tabs (one per backend), each with its own model and OS-keychain key (`llm.<backend>`); the **active** provider is the first in the list (an *Active* checkbox move-to-front reorders, MRU-style) and is the one `ProviderId::Llm` uses. The Backend/Model fields are editable combo boxes (pick a suggestion or type your own). Only the Anthropic backend is wired today; other backends can be configured (keys pre-staged) but fall back to the offline provider until their integration lands — the UI flags this inline. |
-| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL with `level=picky`. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. Real-word confusions (`wear`/`where`) need the server's optional **n-gram** dataset (~8.4 GB), tracked separately from the container: a Preferences *Download n-grams* button streams + unzips it to the app data dir (progress + cancel) and recreates the container with it mounted (`langtool_languageModel`), or a folder field accepts data you already have. Without n-grams those confusions are missed by design (the LLM-escalation button is the alternative). |
+| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL with `level=picky`. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. Real-word confusions (`wear`/`where`) need the server's optional **n-gram** dataset (~8.4 GB), tracked separately from the container: a Preferences *Download n-grams* button streams + unzips it to the app data dir (progress + cancel) and recreates the container with it mounted (`langtool_languageModel`), or a folder field accepts data you already have. The chosen folder is persisted to `config.toml` (`ngram_dir`) when enabled, and — since the recreated container outlives the prefs — recovered from the container's `/ngrams` mount if the config ever loses it, so the UI doesn't forget a path the server is still serving. Without n-grams those confusions are missed by design (the LLM-escalation button is the alternative). |
 
 **Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key
@@ -433,7 +433,12 @@ upgrade. On macOS it is a borderless `NSPanel`.
 - egui preferences window (`hyprcorrect-ui`, pattern from
   `vernier-ui/prefs.rs`), panels: Hotkeys, Providers, Behavior
   (inter-key delay, reset sensitivity), Privacy (app blocklist, password
-  handling), About.
+  handling), About. It opens **tiled** (no float rule). Width is *not*
+  capped with a Wayland max-size hint — Hyprland reads a toplevel that
+  advertises a max size as a fixed dialog and force-floats it, which would
+  defeat tiling. Instead the daemon ships a Hyprland `maxsize 900` rule that
+  Hyprland applies only to floating windows, so a floating prefs is capped
+  while a tiled one fills its tile.
 
 ```toml
 # config.toml sketch
@@ -457,8 +462,10 @@ backend = "openai"            # configurable but not wired yet → offline fallb
 model   = "gpt-4o-mini"
 
 [providers.languagetool]
-enabled = false
-url     = "http://localhost:8081"
+enabled  = false
+url      = "http://localhost:8081"
+# ngram_dir = "/path/to/ngrams"  # set once n-grams are enabled; recovered
+                                 # from the running container if ever lost
 
 [behavior]
 inter_key_delay_ms = 2

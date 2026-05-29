@@ -1521,18 +1521,22 @@ fn focused_monitor_width() -> f32 {
 fn install_window_rules() {
     use std::process::Command;
     // Only the transient review popup is floated/centered by us. The
-    // prefs window is deliberately left alone — no float rule — so it
-    // obeys Hyprland's normal tiling (and any rule the user sets). Its
-    // width is constrained from the app instead (ViewportBuilder
-    // `with_max_inner_size`), per request, rather than a Hyprland rule.
-    // (A stale `float on, hyprcorrect-prefs` rule injected by an older
-    // daemon clears on `hyprctl reload`.)
+    // prefs window opens *tiled* — we install no float rule for it, so it
+    // obeys Hyprland's normal tiling (and any rule the user sets).
     const REVIEW_CLASS: &str = "hyprcorrect-review";
     // The prefs "Browse…" file picker is a GTK portal dialog; without a
     // rule Hyprland tiles it and it opens *behind* the prefs window. Float
     // + center it so it pops over the top. (Generic portal class, but
     // floating file-choosers is the conventional behavior anyway.)
     const PORTAL_CLASS: &str = "xdg-desktop-portal-gtk";
+    // The prefs window must *tile* by default, yet not sprawl when the user
+    // floats it. A Wayland `set_max_size` hint (ViewportBuilder
+    // `with_max_inner_size`) would do the latter — but Hyprland reads a
+    // toplevel that advertises a max size as a fixed dialog and force-floats
+    // it, which breaks tiling. So we cap width with a Hyprland `maxsize` rule
+    // instead: tiled windows ignore it (they fill their tile), and only
+    // floating windows are clamped — exactly "max 900px when floating".
+    const PREFS_CLASS: &str = "hyprcorrect-prefs";
     // Hyprland's current syntax (post-deprecation of windowrulev2):
     // `windowrule = <rule>, match:class <CLASS>`. State-bearing rules
     // require the `on` suffix (`float on`, not bare `float`).
@@ -1541,6 +1545,7 @@ fn install_window_rules() {
         format!("center on, match:class {REVIEW_CLASS}"),
         format!("float on, match:class {PORTAL_CLASS}"),
         format!("center on, match:class {PORTAL_CLASS}"),
+        format!("maxsize 900 4000, match:class {PREFS_CLASS}"),
     ] {
         let result = Command::new("hyprctl")
             .args(["keyword", "windowrule", &rule])

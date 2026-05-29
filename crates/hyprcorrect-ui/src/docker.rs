@@ -116,6 +116,11 @@ impl OpKind {
 pub struct ProbeResult {
     pub status: LanguageToolStatus,
     pub ngrams: Option<bool>,
+    /// Host path mounted at `/ngrams` in the running container, recovered
+    /// via `docker inspect`. The container is the source of truth (it
+    /// survives restarts), so this lets the UI re-display — and re-persist
+    /// — an n-gram folder the config forgot. `None` unless n-grams are on.
+    pub ngram_mount: Option<String>,
 }
 
 /// Result reported by the background worker — `Ok(())` on success,
@@ -181,9 +186,13 @@ fn probe_status_blocking(url: &str) -> ProbeResult {
     } else {
         LanguageToolStatus::Unreachable(check_docker_state())
     };
+    let ngrams = managed_ngrams();
     ProbeResult {
         status,
-        ngrams: managed_ngrams(),
+        ngrams,
+        // Only inspect mounts when n-grams are actually on — that's the
+        // only time the path is worth recovering.
+        ngram_mount: (ngrams == Some(true)).then(managed_ngram_mount).flatten(),
     }
 }
 
@@ -201,6 +210,28 @@ fn managed_ngrams() -> Option<bool> {
     }
     let env = String::from_utf8_lossy(&output.stdout);
     Some(env.contains("langtool_languageModel"))
+}
+
+/// Host path bind-mounted at `/ngrams` in our container, via `docker
+/// inspect`. Used to recover an n-gram folder the config forgot — the
+/// container records it and survives restarts. `None` when the container
+/// or the mount is absent.
+fn managed_ngram_mount() -> Option<String> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            r#"{{range .Mounts}}{{if eq .Destination "/ngrams"}}{{.Source}}{{end}}{{end}}"#,
+            CONTAINER,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let src = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!src.is_empty()).then_some(src)
 }
 
 /// Hit `<url>/v2/languages` — LanguageTool's no-parameter GET endpoint
