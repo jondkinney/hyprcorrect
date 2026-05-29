@@ -820,11 +820,9 @@ impl PrefsApp {
             .checkbox(&mut self.config.providers.languagetool.enabled, "Enabled")
             .changed();
         ui.add_space(8.0);
-        field_label(ui, "URL");
+        field_label_with_note(ui, "URL", "base URL — hyprcorrect appends /v2/check");
         ui.add_space(4.0);
         touched |= padded_text_edit(ui, &mut self.config.providers.languagetool.url).changed();
-        ui.add_space(4.0);
-        caption(ui, "POST endpoint of your self-hosted LanguageTool server.");
 
         ui.add_space(SETTING_BLOCK_SPACING);
         self.languagetool_docker_row(ui);
@@ -1777,6 +1775,21 @@ fn field_label_with_info(ui: &mut egui::Ui, label: &str, tip: &str) {
     ui.horizontal(|ui| {
         field_label(ui, label);
         info_icon(ui).on_hover_text(tip);
+    });
+}
+
+/// A [`field_label`] followed by a muted parenthetical on the same line —
+/// for a short clarifier that reads better beside the label than in a
+/// caption below the control.
+fn field_label_with_note(ui: &mut egui::Ui, label: &str, note: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        field_label(ui, label);
+        ui.label(
+            egui::RichText::new(format!("({note})"))
+                .size(CAPTION_SIZE)
+                .color(egui::Color32::from_gray(170)),
+        );
     });
 }
 
