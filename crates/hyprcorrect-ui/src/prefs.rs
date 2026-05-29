@@ -1592,7 +1592,7 @@ impl PrefsApp {
                     if let Some(handle) = &meta.icon {
                         ui.add(egui::Image::new(handle).fit_to_exact_size(egui::vec2(20.0, 20.0)));
                     } else {
-                        ui.add_space(20.0);
+                        placeholder_app_icon(ui);
                     }
                     ui.add_space(6.0);
                     ui.label(&meta.display_name);
@@ -1661,10 +1661,14 @@ impl PrefsApp {
                 });
             let selected_ref = &mut self.selected_app;
             let filter = &mut self.app_filter;
+            let combo_w = (ui.available_width() - 80.0).max(120.0);
             egui::ComboBox::from_id_salt("blocklist_app_picker")
                 .selected_text(selected_display)
-                .width(ui.available_width() - 80.0)
+                .width(combo_w)
                 .show_ui(ui, |ui| {
+                    // Open the dropdown as wide as the combo (it otherwise
+                    // shrinks to the narrowest entry).
+                    ui.set_min_width(combo_w);
                     ui.add(
                         egui::TextEdit::singleline(filter)
                             .hint_text("Search")
@@ -1693,7 +1697,7 @@ impl PrefsApp {
                                                     .fit_to_exact_size(egui::vec2(20.0, 20.0)),
                                             );
                                         } else {
-                                            ui.add_space(20.0);
+                                            placeholder_app_icon(ui);
                                         }
                                         ui.add_space(6.0);
                                         ui.selectable_label(is_selected, &c.display_name)
@@ -1989,6 +1993,18 @@ fn pick_folder(initial: Option<&str>) -> Option<String> {
     None
 }
 
+/// A neutral 20×20 placeholder where an app icon would go, for apps with
+/// no discoverable `.desktop` icon — so the row still aligns and reads as
+/// "an app" rather than a blank gap.
+fn placeholder_app_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect.shrink(1.0),
+        egui::CornerRadius::same(4),
+        egui::Color32::from_gray(58),
+    );
+}
+
 /// Paint a small filled dot — the "active provider" marker in the LLM
 /// tab bar. Drawn, not a glyph, so it can't fall back to a tofu box (the
 /// bundled fonts lack the Geometric-Shapes block, e.g. ●).
@@ -2052,21 +2068,24 @@ fn editable_combo(
         let btn = combo_arrow_button(ui, edit.rect.height());
         // The whole field is the dropdown trigger: clicking the field OR the
         // chevron toggles the menu (you can still type to enter a custom
-        // value). Position it below the wide field — anchoring to the narrow
-        // chevron made egui clamp the menu to a sliver against the screen.
+        // value). Anchor it to the field (not the narrow chevron, which made
+        // egui clamp the menu to a sliver), exactly the field's width, and a
+        // few px below so it clears the field's focus border.
+        let popup_w = edit.rect.width();
         let toggled = edit.clicked() || btn.clicked();
         egui::Popup::menu(&btn)
             .anchor(&edit)
+            .gap(4.0)
             .open_memory(toggled.then_some(egui::SetOpenCommand::Toggle))
             .id(ui.make_persistent_id((id_salt, "popup")))
-            .width(field_w + TEXT_EDIT_MARGIN_X)
+            .width(popup_w)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
-                // Force the menu to the field width every frame and stop
-                // labels wrapping — `.width()` only seeds Area::default_width,
-                // and egui then remembers the (previously tiny) area size, so
-                // the options rendered one character per line.
-                ui.set_min_width(field_w + TEXT_EDIT_MARGIN_X);
+                // Pin to exactly the field width every frame (`.width()` only
+                // seeds Area::default_width, and egui then remembers a stale
+                // size) and stop labels wrapping.
+                ui.set_min_width(popup_w);
+                ui.set_max_width(popup_w);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 if options.is_empty() {
                     ui.add_enabled(false, egui::Button::new("(none available)").frame(false));
@@ -2297,14 +2316,25 @@ impl PrefsApp {
         field_label(ui, "API key");
         ui.add_space(4.0);
         // Save sits on the API-key row (right), the key field fills the rest —
-        // mirroring how the chevron sits beside the combo field.
+        // mirroring how the chevron sits beside the combo field. (A plain
+        // horizontal, not with_layout, which grabs the full remaining height
+        // and floated this row to the bottom.)
         let mut save_clicked = false;
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            let save_w = 118.0;
+            let field_w = (ui.available_width() - save_w - 6.0 - TEXT_EDIT_MARGIN_X).max(80.0);
+            touched |= bordered_text_edit(
+                ui,
+                egui::TextEdit::singleline(&mut self.llm_draft_key)
+                    .password(true)
+                    .margin(egui::Margin::symmetric(8, 6))
+                    .desired_width(field_w),
+            )
+            .changed();
             save_clicked = ui
                 .add_enabled(can_add, egui::Button::new("Save provider"))
                 .clicked();
-            touched |= padded_password_edit(ui, &mut self.llm_draft_key).changed();
         });
         ui.add_space(4.0);
         caption(ui, "Stored in your OS keychain, not in config.toml.");
@@ -2408,15 +2438,10 @@ fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Respons
 /// (e.g. the combo chevron) are unaffected. Hover/focus keep egui's
 /// gray/accent strokes.
 fn bordered_text_edit(ui: &mut egui::Ui, te: egui::TextEdit<'_>) -> egui::Response {
-    let prev = ui.visuals().widgets.inactive.bg_stroke;
-    // Border in the field's own fill color, so it reads as the same height
-    // as the buttons beside it without a contrasting outline. Hover/focus
-    // keep egui's gray/accent strokes.
-    let fill = ui.visuals().text_edit_bg_color();
-    ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0, fill);
-    let resp = ui.add(te);
-    ui.visuals_mut().widgets.inactive.bg_stroke = prev;
-    resp
+    // Force the field to CONTROL_HEIGHT (its natural height is a touch
+    // shorter) so it matches the buttons/chevrons. The always-on border
+    // comes from the global widget visuals (see apply_style).
+    ui.add(te.min_size(egui::vec2(0.0, CONTROL_HEIGHT)))
 }
 
 /// Single-line text input with consistent inner padding so fields
@@ -2496,6 +2521,11 @@ const SETTING_BLOCK_SPACING: f32 = 22.0;
 /// reserved when a field shares a row with another widget, or the field's
 /// true outer width overflows the row.
 const TEXT_EDIT_MARGIN_X: f32 = 16.0;
+
+/// Shared height for every interactive control (inputs, buttons, combo
+/// chevrons). Forced via `interact_size.y` (button floor) and
+/// `TextEdit::min_size` so they all match in every state.
+const CONTROL_HEIGHT: f32 = 30.0;
 
 /// The Hyprland/Omarchy logo glyph in the bundled `omarchy.ttf`.
 /// Renders as a blank tofu box if the font isn't installed — we
@@ -2719,11 +2749,9 @@ fn apply_style(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 6.0);
         style.spacing.indent = 14.0;
-        // Keep the interaction-size floor BELOW a text field's natural
-        // height. egui floors a Button's height to interact_size.y but a
-        // TextEdit's it does not, so a too-high floor made buttons and the
-        // combo chevrons taller than the inputs beside them.
-        style.spacing.interact_size = egui::vec2(40.0, 22.0);
+        // Button height floors to interact_size.y; we force a TextEdit's to
+        // the same value via min_size, so all controls share CONTROL_HEIGHT.
+        style.spacing.interact_size = egui::vec2(40.0, CONTROL_HEIGHT);
         style.spacing.icon_width = 18.0;
         style.spacing.icon_spacing = 6.0;
         // Solid (space-reserving) scrollbar instead of egui's default
@@ -2735,14 +2763,26 @@ fn apply_style(ctx: &egui::Context) {
         style.spacing.scroll.dormant_background_opacity = 0.0;
         style.spacing.scroll.active_background_opacity = 0.0;
         style.spacing.scroll.interact_background_opacity = 0.0;
-        style.visuals.widgets.inactive.expansion = 0.0;
-        // 4px rounding on inputs, buttons, and other widgets.
+        // Every interactive control carries a 1px border at all times (only
+        // its color changes between states) and never expands — so inputs,
+        // buttons, and combo chevrons stay exactly CONTROL_HEIGHT in every
+        // state, with no hover/focus growth.
         let r = egui::CornerRadius::same(4);
-        style.visuals.widgets.noninteractive.corner_radius = r;
-        style.visuals.widgets.inactive.corner_radius = r;
-        style.visuals.widgets.hovered.corner_radius = r;
-        style.visuals.widgets.active.corner_radius = r;
-        style.visuals.widgets.open.corner_radius = r;
+        let w = &mut style.visuals.widgets;
+        w.noninteractive.corner_radius = r;
+        w.noninteractive.expansion = 0.0;
+        w.inactive.corner_radius = r;
+        w.inactive.expansion = 0.0;
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(72));
+        w.hovered.corner_radius = r;
+        w.hovered.expansion = 0.0;
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
+        w.active.corner_radius = r;
+        w.active.expansion = 0.0;
+        w.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
+        w.open.corner_radius = r;
+        w.open.expansion = 0.0;
+        w.open.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
     });
 }
 
@@ -3050,7 +3090,10 @@ pub(crate) fn run() {
             .with_app_id(APP_ID)
             .with_title("hyprcorrect — Preferences")
             .with_inner_size([640.0, 480.0])
-            .with_min_inner_size([520.0, 360.0]),
+            .with_min_inner_size([520.0, 360.0])
+            // Cap the width so a floating window doesn't stretch the form
+            // across a huge monitor (the compositor clamps to this hint).
+            .with_max_inner_size([900.0, 4000.0]),
         vsync: false, // matches vernier — better Wayland responsiveness
         ..Default::default()
     };
