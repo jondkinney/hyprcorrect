@@ -39,6 +39,8 @@ pub enum VimKey {
     Right,
     Up,
     Down,
+    Home,
+    End,
 }
 
 /// What the popup should do after a key — most keys are [`None`].
@@ -217,6 +219,20 @@ impl VimEdit {
             VimKey::Enter => VimOutcome::Submit,
             VimKey::Backspace => {
                 self.move_motion('h');
+                VimOutcome::None
+            }
+            VimKey::Home => {
+                self.cursor = self.line_start(self.cursor);
+                self.vcol = 0;
+                self.reset_pending();
+                VimOutcome::None
+            }
+            VimKey::End => {
+                // Match `$`: land on the last character (insert-mode End,
+                // below, goes one past).
+                self.cursor = self.line_last_char(self.cursor);
+                self.vcol = self.col(self.cursor);
+                self.reset_pending();
                 VimOutcome::None
             }
             VimKey::Char(c) => self.handle_normal_char(c),
@@ -561,6 +577,8 @@ impl VimEdit {
             VimKey::Right => self.cursor = self.next_boundary(self.cursor).min(self.text.len()),
             VimKey::Up => self.cursor = self.line_up(self.cursor),
             VimKey::Down => self.cursor = self.line_down(self.cursor),
+            VimKey::Home => self.cursor = self.line_start(self.cursor),
+            VimKey::End => self.cursor = self.line_end(self.cursor),
             VimKey::Char(c) => {
                 self.text.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
@@ -1093,6 +1111,19 @@ mod tests {
         assert_eq!(v.cursor(), 5); // 'e' on line 2, same column
         feed(&mut v, "k");
         assert_eq!(v.cursor(), 1); // back to 'b'
+    }
+
+    #[test]
+    fn home_and_end_jump_to_line_edges() {
+        let mut v = VimEdit::new("hello world".into(), 6);
+        v.handle(VimKey::Home);
+        assert_eq!(v.cursor(), 0);
+        v.handle(VimKey::End);
+        assert_eq!(v.cursor(), 10); // last char 'd', like `$`
+        // In insert mode End goes one past the last char.
+        feed(&mut v, "i");
+        v.handle(VimKey::End);
+        assert_eq!(v.cursor(), 11);
     }
 
     #[test]
