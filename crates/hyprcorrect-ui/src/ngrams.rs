@@ -200,6 +200,14 @@ fn extract_zip(zip_path: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), 
     Ok(())
 }
 
+/// The n-gram data root under `parent` (the directory containing `en/`)
+/// when a download has been unpacked there, else `None`. Lets prefs tell
+/// whether the app already downloaded the data, regardless of the config
+/// field's contents.
+pub fn data_root(parent: &Path) -> Option<PathBuf> {
+    find_lang_root(parent)
+}
+
 /// Find the directory that holds the `en/` n-gram folder — usually the
 /// extract root, but cope with a single wrapper directory one level down.
 fn find_lang_root(root: &Path) -> Option<PathBuf> {

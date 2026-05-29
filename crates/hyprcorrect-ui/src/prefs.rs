@@ -308,6 +308,10 @@ impl PrefsApp {
                             self.config.providers.languagetool.enabled = true;
                             "n-grams enabled — container recreated with the dataset."
                         }
+                        OpKind::RemoveNgrams => {
+                            self.config.providers.languagetool.ngram_dir = None;
+                            "n-grams removed — container recreated and data deleted."
+                        }
                     };
                     self.ok(msg);
                 }
@@ -318,6 +322,7 @@ impl PrefsApp {
                         OpKind::Stop => "stop",
                         OpKind::Remove => "remove",
                         OpKind::EnableNgrams => "enable n-grams",
+                        OpKind::RemoveNgrams => "remove n-grams",
                     };
                     self.err(format!("Docker {verb} failed: {e}"));
                 }
@@ -832,11 +837,53 @@ impl PrefsApp {
         }
     }
 
-    /// The optional "point at n-gram data you already have" folder input,
-    /// rendered at the bottom of Providers (below the Download/Enable
-    /// controls). Returns whether the value changed this frame.
+    /// The n-gram data-folder row at the bottom of Providers. When the app
+    /// has downloaded the data it shows that (read-only) with a Remove
+    /// button, so the empty box never implies the user must supply their
+    /// own. Otherwise it's an editable field for data they already have.
+    /// Returns whether the config value changed this frame.
     fn ngram_folder_field(&mut self, ui: &mut egui::Ui) -> bool {
         ui.add_space(SETTING_BLOCK_SPACING);
+
+        // App-downloaded data takes over the row: show where it lives
+        // (grayed) + a Remove option.
+        let base = hyprcorrect_core::config::ngram_data_dir();
+        if let Some(base) = base
+            .as_deref()
+            .filter(|b| crate::ngrams::data_root(b).is_some())
+        {
+            field_label(ui, "n-gram data folder");
+            ui.add_space(4.0);
+            let mut shown = base.to_string_lossy().to_string();
+            ui.add_enabled_ui(false, |ui| {
+                padded_text_edit(ui, &mut shown);
+            });
+            ui.add_space(4.0);
+            let port = docker::host_port_from_url(&self.config.providers.languagetool.url);
+            if ui
+                .add_enabled(
+                    self.docker_op.is_none() && port.is_some(),
+                    egui::Button::new("Remove downloaded data").frame(false),
+                )
+                .on_hover_text(
+                    "Recreates the container without n-grams and deletes the downloaded \
+                     folder (frees ~16 GB).",
+                )
+                .clicked()
+                && let Some(port) = port
+            {
+                self.docker_op = Some(docker::remove_ngrams(port, base.to_path_buf()));
+                self.ok(OpKind::RemoveNgrams.label());
+            }
+            ui.add_space(4.0);
+            caption(
+                ui,
+                "Downloaded and installed by hyprcorrect — you don't need to set your own.",
+            );
+            return false;
+        }
+
+        // No app download — editable field for data the user already has.
         field_label(ui, "n-gram data folder (optional)");
         ui.add_space(4.0);
         let mut ngram = self
@@ -984,22 +1031,30 @@ impl PrefsApp {
             return;
         }
 
-        let dir = self
+        let port = docker::host_port_from_url(url);
+        // What we'd mount: the app's download (filesystem truth, even if the
+        // config field was never saved), else a folder the user set.
+        let base = hyprcorrect_core::config::ngram_data_dir();
+        let downloaded = base.as_deref().and_then(crate::ngrams::data_root);
+        let user_dir = self
             .config
             .providers
             .languagetool
             .ngram_dir
             .clone()
             .filter(|d| !d.trim().is_empty());
-        let port = docker::host_port_from_url(url);
 
-        // Loaded: green confirmation + a Reload to pick up a changed folder.
+        // Loaded: green confirmation. Reload only matters for a user's own
+        // folder (the app's downloaded data is static) — when it's ours,
+        // the "Remove downloaded data" control lives in the field below.
         if self.lt_ngrams == Some(true) {
             ui.colored_label(
                 egui::Color32::from_rgb(110, 200, 130),
                 "Loaded — real-word confusions are caught.",
             );
-            if let (Some(dir), Some(port)) = (dir.as_deref(), port) {
+            if downloaded.is_none()
+                && let (Some(dir), Some(port)) = (user_dir.as_deref(), port)
+            {
                 ui.add_space(4.0);
                 if ui
                     .add_enabled(
@@ -1007,10 +1062,9 @@ impl PrefsApp {
                         egui::Button::new("Reload n-grams").frame(false),
                     )
                     .on_hover_text(
-                        "Optional — n-grams already work. Only needed if you point the \
-                         folder below at a different path (re-mounts it), or swap the data \
-                         files there (LanguageTool reads n-grams only at startup, so it \
-                         must restart). Recreates the container.",
+                        "Optional — n-grams already work. Only needed if you swap the data \
+                         at the folder below (LanguageTool reads n-grams only at startup). \
+                         Recreates the container.",
                     )
                     .clicked()
                 {
@@ -1021,13 +1075,31 @@ impl PrefsApp {
             return;
         }
 
-        // Not loaded: offer the one-click download (primary), plus "Enable"
-        // for users who already have the data in the folder below.
-        let data_dir = hyprcorrect_core::config::ngram_data_dir();
+        // Not loaded. If the app already has the data, just Enable it;
+        // otherwise offer the one-click Download (+ Enable for a folder the
+        // user supplied below).
+        if let Some(mount) = &downloaded {
+            let mount = mount.to_string_lossy().to_string();
+            if let Some(port) = port
+                && ui
+                    .add_enabled(!op_in_flight, egui::Button::new("Enable n-grams"))
+                    .on_hover_text(
+                        "Mounts the already-downloaded data and recreates the container.",
+                    )
+                    .clicked()
+            {
+                self.docker_op = Some(docker::enable_ngrams(port, &mount));
+                self.ok(OpKind::EnableNgrams.label());
+            }
+            ui.add_space(4.0);
+            caption(ui, "Off — data is downloaded. Click Enable to turn it on.");
+            return;
+        }
+
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !op_in_flight && data_dir.is_some(),
+                    !op_in_flight && base.is_some(),
                     egui::Button::new("Download n-grams (~8.4 GB)"),
                 )
                 .on_hover_text(
@@ -1035,12 +1107,12 @@ impl PrefsApp {
                      folder and enables it. Needs ~24 GB free while unzipping.",
                 )
                 .clicked()
-                && let Some(d) = data_dir.clone()
+                && let Some(d) = base.clone()
             {
                 self.ngram_download = Some(crate::ngrams::spawn_ngram_download(d));
                 self.ok("Downloading n-grams…");
             }
-            if let (Some(dir), Some(port)) = (dir.as_deref(), port) {
+            if let (Some(dir), Some(port)) = (user_dir.as_deref(), port) {
                 if ui
                     .add_enabled(
                         !op_in_flight,

@@ -21,6 +21,7 @@
 //! the probe takes up to ~2 s on a cold URL and would stutter the UI
 //! if done inline.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -89,6 +90,9 @@ pub enum OpKind {
     Remove,
     /// Recreate the container with the n-gram data mounted.
     EnableNgrams,
+    /// Recreate the container without n-grams and delete the downloaded
+    /// data folder.
+    RemoveNgrams,
 }
 
 impl OpKind {
@@ -99,6 +103,7 @@ impl OpKind {
             Self::Stop => "Stopping container…",
             Self::Remove => "Removing container…",
             Self::EnableNgrams => "Recreating the container with n-grams…",
+            Self::RemoveNgrams => "Removing n-grams and deleting the data…",
         }
     }
 }
@@ -367,6 +372,21 @@ pub fn enable_ngrams(host_port: u16, ngram_dir: &str) -> OpHandle {
     spawn_op(OpKind::EnableNgrams, move || {
         let _ = run_command("docker", &["rm", "-f", CONTAINER]); // ignore "no such container"
         run_install(host_port, Some(&dir))
+    })
+}
+
+/// Undo [`enable_ngrams`]: recreate the container *without* the n-gram
+/// mount, then delete the downloaded data folder to reclaim the disk.
+/// `data_dir` is the app's download folder (`config::ngram_data_dir`).
+pub fn remove_ngrams(host_port: u16, data_dir: PathBuf) -> OpHandle {
+    spawn_op(OpKind::RemoveNgrams, move || {
+        let _ = run_command("docker", &["rm", "-f", CONTAINER]); // ignore "no such container"
+        let recreate = run_install(host_port, None);
+        // Delete the data even if the recreate failed — the user asked to
+        // remove it; surface the recreate error if there was one.
+        let deleted = std::fs::remove_dir_all(&data_dir);
+        recreate?;
+        deleted.map_err(|e| format!("deleting {}: {e}", data_dir.display()))
     })
 }
 
