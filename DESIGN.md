@@ -361,15 +361,17 @@ editable text and has two modes:
 - **Vim mode** (`Ctrl+E`): the whole sentence becomes a small modal
   editor — a deliberate *subset* of vim, for when the correction is
   wrong and needs free-form fixing. NORMAL/INSERT/COMMAND; motions
-  `h l w b e 0 ^ $ j k` / `gg` / `G`; edits `x r s S D C dd cc`;
-  operators `d`/`c` over those motions and the `iw`/`aw` text objects
-  (so `ciw`, `dw`, `daw`, with vim's `cw`==`ce`); leading counts.
-  `:w`/`:wq`/`:x` and normal-mode `Enter` apply; `:q`/`:q!` cancel;
-  INSERT `Enter` inserts a newline. It is a self-contained Rust state
-  machine (`hyprcorrect-ui/src/vimedit.rs`), **not** real nvim — chosen
-  to stay in-window, dependency-free, and identical on macOS.
-  **Out of scope (v1):** undo/redo, registers/yank/paste, visual mode,
-  `.` repeat, marks, search, ex ranges.
+  `h l w b e 0 ^ $ j k` / `gg` / `G` / Home / End (with `virtualedit`-style
+  column-keeping `j`/`k` and end-of-line access); edits
+  `x r s S D C dd cc`; operators `d`/`c` over those motions and the
+  `iw`/`aw` text objects (so `ciw`, `dw`, `daw`, with vim's `cw`==`ce`);
+  leading counts; undo `u`, redo `Ctrl+R`, and repeat `.`. `:w`/`:wq`/`:x`
+  and normal-mode `Enter` apply; `:q`/`:q!` cancel; INSERT `Enter` inserts
+  a newline. It is a self-contained Rust state machine
+  (`hyprcorrect-ui/src/vimedit.rs`), **not** real nvim — chosen to stay
+  in-window, dependency-free, and identical on macOS.
+  **Out of scope (v1):** registers/yank/paste, visual mode, marks, search,
+  ex ranges, and `.`/counts composition beyond a single recorded change.
 
 On apply the popup writes the (possibly edited) sentence back into the
 review-request file and signals the daemon, which performs the emit.

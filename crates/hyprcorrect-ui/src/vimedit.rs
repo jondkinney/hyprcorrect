@@ -14,18 +14,22 @@
 //! - Enter INSERT: `i a I A o O`; leave with `Esc` (cursor steps left,
 //!   vim-style).
 //! - Motions (also operator targets): `h l w b e 0 ^ $ j k G`, `gg`,
-//!   and the arrow keys.
+//!   Home/End, and the arrow keys; `virtualedit`-style end-of-line access
+//!   and column-keeping `j`/`k`.
 //! - Edits: `x`, `r{char}`, `s`, `S`, `D`, `C`, `dd`, `cc`.
 //! - Operator + motion / text object: `d{m}` and `c{m}` over
 //!   `w b e h l 0 ^ $`; `diw ciw daw caw` (with the vim `cw`==`ce`
 //!   special case).
 //! - Leading counts: e.g. `3x`, `2w`, `2dw`.
+//! - Undo `u`, redo `Ctrl+R` (one step per change / per insert session),
+//!   and repeat `.` (replays the last change's keystrokes).
 //! - COMMAND: `:w :wq :x` (+ `!`/`a` variants) submit; `:q :q!` cancel;
 //!   normal-mode `Enter` submits; INSERT `Enter` inserts a newline.
 //!
 //! ## Out of scope (v1)
-//! Undo/redo, registers/yank/paste, visual mode, `.` repeat, marks,
-//! search (`/`), and ex ranges — documented as non-goals in `DESIGN.md`.
+//! Registers/yank/paste, visual mode, marks, search (`/`), ex ranges, and
+//! `.`/count composition beyond a single recorded change — documented as
+//! non-goals in `DESIGN.md`.
 
 /// A key handed to the editor. The popup maps egui events to these;
 /// the machine never sees egui types.
@@ -41,6 +45,8 @@ pub enum VimKey {
     Down,
     Home,
     End,
+    /// `Ctrl+R` — redo.
+    Redo,
 }
 
 /// What the popup should do after a key — most keys are [`None`].
@@ -94,6 +100,24 @@ pub struct VimEdit {
     await_g: bool,
     /// After an operator, `i`/`a` was pressed; expecting `w`.
     await_textobj: Option<char>,
+
+    // --- undo / redo / repeat ---
+    /// `(text, cursor)` snapshots, one per change; `u` pops.
+    undo: Vec<(String, usize)>,
+    /// Snapshots popped by `u`, restored by `Ctrl+R`.
+    redo: Vec<(String, usize)>,
+    /// True once the current command has taken its undo snapshot, so a
+    /// multi-key change (and a whole insert session) is one undo step.
+    change_open: bool,
+    /// Keys of the command currently being entered, and of the last
+    /// change (for `.`).
+    cur: Vec<VimKey>,
+    dot: Vec<VimKey>,
+    /// Whether `cur` so far has modified text (a real change worth
+    /// recording for `.`).
+    cur_is_change: bool,
+    /// True while replaying `.` — suppresses re-recording.
+    replaying: bool,
 }
 
 impl VimEdit {
@@ -112,6 +136,13 @@ impl VimEdit {
             await_r: false,
             await_g: false,
             await_textobj: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            change_open: false,
+            cur: Vec::new(),
+            dot: Vec::new(),
+            cur_is_change: false,
+            replaying: false,
         };
         v.cursor = cursor.min(v.text.len());
         while v.cursor > 0 && !v.text.is_char_boundary(v.cursor) {
@@ -148,6 +179,26 @@ impl VimEdit {
 
     /// Feed one key. Returns whether the popup should submit/cancel.
     pub fn handle(&mut self, key: VimKey) -> VimOutcome {
+        // Record keystrokes for `.`. At a clean NORMAL boundary the
+        // previous command is finished: commit it to `dot` if it changed
+        // text, then start recording the next one.
+        if !self.replaying {
+            let clean = self.mode == Mode::Normal
+                && self.op.is_none()
+                && !self.await_r
+                && !self.await_g
+                && self.await_textobj.is_none();
+            if clean {
+                self.change_open = false;
+                if self.cur_is_change {
+                    self.dot = std::mem::take(&mut self.cur);
+                }
+                self.cur.clear();
+                self.cur_is_change = false;
+            }
+            self.cur.push(key);
+        }
+
         match self.mode {
             Mode::Insert => {
                 self.handle_insert(key);
@@ -156,6 +207,57 @@ impl VimEdit {
             Mode::Command => self.handle_command(key),
             Mode::Normal => self.handle_normal(key),
         }
+    }
+
+    /// Take an undo snapshot at the first text mutation of a command, so
+    /// a multi-key change (or a whole insert session) is one undo step.
+    fn begin_change(&mut self) {
+        if !self.change_open {
+            self.undo.push((self.text.clone(), self.cursor));
+            self.redo.clear();
+            self.change_open = true;
+            if !self.replaying {
+                self.cur_is_change = true;
+            }
+        }
+    }
+
+    /// `u` — restore the previous snapshot.
+    fn undo(&mut self) {
+        if let Some((text, cursor)) = self.undo.pop() {
+            self.redo
+                .push((std::mem::take(&mut self.text), self.cursor));
+            self.text = text;
+            self.cursor = cursor;
+            self.clamp_normal();
+            self.vcol = self.col(self.cursor);
+        }
+    }
+
+    /// `Ctrl+R` — re-apply a snapshot undone by `u`.
+    fn redo(&mut self) {
+        if let Some((text, cursor)) = self.redo.pop() {
+            self.undo
+                .push((std::mem::take(&mut self.text), self.cursor));
+            self.text = text;
+            self.cursor = cursor;
+            self.clamp_normal();
+            self.vcol = self.col(self.cursor);
+        }
+    }
+
+    /// `.` — replay the last change's keystrokes as one undo step.
+    fn repeat(&mut self) {
+        if self.dot.is_empty() || self.replaying {
+            return;
+        }
+        let dot = self.dot.clone();
+        self.replaying = true;
+        self.change_open = false; // the whole replay is one new change
+        for k in dot {
+            self.handle(k);
+        }
+        self.replaying = false;
     }
 
     // ----------------------------------------------------------------
@@ -235,6 +337,11 @@ impl VimEdit {
                 self.reset_pending();
                 VimOutcome::None
             }
+            VimKey::Redo => {
+                self.redo();
+                self.reset_pending();
+                VimOutcome::None
+            }
             VimKey::Char(c) => self.handle_normal_char(c),
             // Left/Right/Up/Down already remapped above.
             _ => VimOutcome::None,
@@ -299,11 +406,13 @@ impl VimEdit {
                 self.enter_insert_at(p);
             }
             'o' => {
+                self.begin_change();
                 let le = self.line_end(self.cursor);
                 self.text.insert(le, '\n');
                 self.enter_insert_at(le + 1);
             }
             'O' => {
+                self.begin_change();
                 let ls = self.line_start(self.cursor);
                 self.text.insert(ls, '\n');
                 self.enter_insert_at(ls);
@@ -329,6 +438,8 @@ impl VimEdit {
             }
             'r' => self.await_r = true,
             'g' => self.await_g = true,
+            'u' => self.undo(),
+            '.' => self.repeat(),
             ':' => {
                 self.mode = Mode::Command;
                 self.cmdline = String::from(":");
@@ -464,6 +575,7 @@ impl VimEdit {
     }
 
     fn apply_op_range(&mut self, op: char, start: usize, end: usize) {
+        self.begin_change();
         if start < end {
             self.text.replace_range(start..end, "");
             self.cursor = start;
@@ -479,6 +591,7 @@ impl VimEdit {
     /// `dd` (delete line + its newline) / `cc`/`S` (clear line content,
     /// stay on it, enter insert).
     fn linewise_op(&mut self, op: char) {
+        self.begin_change();
         let ls = self.line_start(self.cursor);
         let le = self.line_end(self.cursor);
         if op == 'c' {
@@ -518,6 +631,7 @@ impl VimEdit {
 
     fn delete_range(&mut self, start: usize, end: usize) {
         if start < end {
+            self.begin_change();
             self.text.replace_range(start..end, "");
             self.cursor = start.min(self.text.len());
             self.clamp_normal();
@@ -536,6 +650,7 @@ impl VimEdit {
         if end == self.cursor {
             return;
         }
+        self.begin_change();
         let n_chars = self.text[self.cursor..end].chars().count();
         let repl: String = std::iter::repeat_n(c, n_chars).collect();
         let repl_len = repl.len();
@@ -563,11 +678,13 @@ impl VimEdit {
                 self.vcol = self.col(self.cursor);
             }
             VimKey::Enter => {
+                self.begin_change();
                 self.text.insert(self.cursor, '\n');
                 self.cursor += 1;
             }
             VimKey::Backspace => {
                 if self.cursor > 0 {
+                    self.begin_change();
                     let pb = self.prev_boundary(self.cursor);
                     self.text.replace_range(pb..self.cursor, "");
                     self.cursor = pb;
@@ -580,9 +697,11 @@ impl VimEdit {
             VimKey::Home => self.cursor = self.line_start(self.cursor),
             VimKey::End => self.cursor = self.line_end(self.cursor),
             VimKey::Char(c) => {
+                self.begin_change();
                 self.text.insert(self.cursor, c);
                 self.cursor += c.len_utf8();
             }
+            VimKey::Redo => {}
         }
     }
 
@@ -1150,5 +1269,59 @@ mod tests {
         assert!((12..=14).contains(&v.cursor()));
         feed(&mut v, "j"); // line 3 is long → column 8 restored
         assert_eq!(v.cursor(), 15 + 8);
+    }
+
+    #[test]
+    fn undo_restores_and_redo_reapplies() {
+        let mut v = VimEdit::new("hello".into(), 0);
+        feed(&mut v, "x");
+        assert_eq!(v.text(), "ello");
+        feed(&mut v, "u");
+        assert_eq!(v.text(), "hello");
+        v.handle(VimKey::Redo);
+        assert_eq!(v.text(), "ello");
+    }
+
+    #[test]
+    fn an_insert_session_is_one_undo_step() {
+        let mut v = VimEdit::new("ab".into(), 0);
+        feed(&mut v, "A"); // append
+        feed(&mut v, "XYZ");
+        v.handle(VimKey::Esc);
+        assert_eq!(v.text(), "abXYZ");
+        feed(&mut v, "u"); // one undo unwinds the whole session
+        assert_eq!(v.text(), "ab");
+    }
+
+    #[test]
+    fn ciw_then_undo_restores_the_word() {
+        let mut v = VimEdit::new("teh quick".into(), 0);
+        feed(&mut v, "ciw");
+        feed(&mut v, "the");
+        v.handle(VimKey::Esc);
+        assert_eq!(v.text(), "the quick");
+        feed(&mut v, "u");
+        assert_eq!(v.text(), "teh quick");
+    }
+
+    #[test]
+    fn dot_repeats_the_last_change() {
+        let mut v = VimEdit::new("aaaa".into(), 0);
+        feed(&mut v, "x");
+        feed(&mut v, ".");
+        feed(&mut v, ".");
+        assert_eq!(v.text(), "a");
+    }
+
+    #[test]
+    fn dot_repeats_a_change_with_inserted_text() {
+        let mut v = VimEdit::new("one two".into(), 0);
+        feed(&mut v, "ciw");
+        feed(&mut v, "X");
+        v.handle(VimKey::Esc);
+        assert_eq!(v.text(), "X two");
+        feed(&mut v, "w"); // move to "two"
+        feed(&mut v, "."); // repeat ciwX
+        assert_eq!(v.text(), "X X");
     }
 }
