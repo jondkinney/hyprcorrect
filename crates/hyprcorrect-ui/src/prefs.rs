@@ -1007,8 +1007,10 @@ impl PrefsApp {
                         egui::Button::new("Reload n-grams").frame(false),
                     )
                     .on_hover_text(
-                        "Optional — n-grams are already working. Only needed to re-apply \
-                         the data folder below after you change it (recreates the container).",
+                        "Optional — n-grams already work. Only needed if you point the \
+                         folder below at a different path (re-mounts it), or swap the data \
+                         files there (LanguageTool reads n-grams only at startup, so it \
+                         must restart). Recreates the container.",
                     )
                     .clicked()
                 {
