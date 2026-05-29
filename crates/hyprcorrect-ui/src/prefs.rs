@@ -821,7 +821,22 @@ impl PrefsApp {
         ui.add_space(4.0);
         caption(ui, "POST endpoint of your self-hosted LanguageTool server.");
 
-        ui.add_space(8.0);
+        ui.add_space(SETTING_BLOCK_SPACING);
+        self.languagetool_docker_row(ui);
+        // The manual "I already have the data" folder lives at the bottom,
+        // below the n-grams status + Download button.
+        touched |= self.ngram_folder_field(ui);
+
+        if touched {
+            self.clear_status();
+        }
+    }
+
+    /// The optional "point at n-gram data you already have" folder input,
+    /// rendered at the bottom of Providers (below the Download/Enable
+    /// controls). Returns whether the value changed this frame.
+    fn ngram_folder_field(&mut self, ui: &mut egui::Ui) -> bool {
+        ui.add_space(SETTING_BLOCK_SPACING);
         field_label(ui, "n-gram data folder (optional)");
         ui.add_space(4.0);
         let mut ngram = self
@@ -831,26 +846,19 @@ impl PrefsApp {
             .ngram_dir
             .clone()
             .unwrap_or_default();
-        let ngram_changed = padded_text_edit(ui, &mut ngram).changed();
-        if ngram_changed {
+        let changed = padded_text_edit(ui, &mut ngram).changed();
+        if changed {
             self.config.providers.languagetool.ngram_dir =
                 (!ngram.trim().is_empty()).then(|| ngram.trim().to_string());
         }
-        touched |= ngram_changed;
         ui.add_space(4.0);
         caption(
             ui,
-            "Optional — only if you already have the unzipped n-gram data (the folder \
-             containing en/); point here, then \"Enable n-grams\" below. Otherwise just \
-             use \"Download n-grams\" below to fetch it.",
+            "Only if you already have the unzipped n-gram data (the folder containing \
+             en/) — point here, then \"Enable n-grams\" above. Otherwise use \
+             \"Download n-grams\" above.",
         );
-
-        ui.add_space(SETTING_BLOCK_SPACING);
-        self.languagetool_docker_row(ui);
-
-        if touched {
-            self.clear_status();
-        }
+        changed
     }
 
     /// One-click LanguageTool-in-Docker row under the LanguageTool
@@ -998,7 +1006,10 @@ impl PrefsApp {
                         !op_in_flight,
                         egui::Button::new("Reload n-grams").frame(false),
                     )
-                    .on_hover_text("Recreate the container with the current data folder.")
+                    .on_hover_text(
+                        "Optional — n-grams are already working. Only needed to re-apply \
+                         the data folder below after you change it (recreates the container).",
+                    )
                     .clicked()
                 {
                     self.docker_op = Some(docker::enable_ngrams(port, dir));
@@ -1009,7 +1020,7 @@ impl PrefsApp {
         }
 
         // Not loaded: offer the one-click download (primary), plus "Enable"
-        // for users who already have the data in the folder above.
+        // for users who already have the data in the folder below.
         let data_dir = hyprcorrect_core::config::ngram_data_dir();
         ui.horizontal(|ui| {
             if ui
@@ -1033,7 +1044,7 @@ impl PrefsApp {
                         !op_in_flight,
                         egui::Button::new("Enable n-grams").frame(false),
                     )
-                    .on_hover_text("Use n-gram data you already have at the folder above.")
+                    .on_hover_text("Use n-gram data you already have at the folder below.")
                     .clicked()
                 {
                     self.docker_op = Some(docker::enable_ngrams(port, dir));
@@ -1044,7 +1055,7 @@ impl PrefsApp {
         ui.add_space(4.0);
         caption(
             ui,
-            "Off. Download the data, or point the folder above at a copy you have.",
+            "Off. Download the data, or point the folder below at a copy you have.",
         );
     }
 
