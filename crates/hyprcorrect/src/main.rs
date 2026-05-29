@@ -1528,12 +1528,19 @@ fn install_window_rules() {
     // (A stale `float on, hyprcorrect-prefs` rule injected by an older
     // daemon clears on `hyprctl reload`.)
     const REVIEW_CLASS: &str = "hyprcorrect-review";
+    // The prefs "Browse…" file picker is a GTK portal dialog; without a
+    // rule Hyprland tiles it and it opens *behind* the prefs window. Float
+    // + center it so it pops over the top. (Generic portal class, but
+    // floating file-choosers is the conventional behavior anyway.)
+    const PORTAL_CLASS: &str = "xdg-desktop-portal-gtk";
     // Hyprland's current syntax (post-deprecation of windowrulev2):
     // `windowrule = <rule>, match:class <CLASS>`. State-bearing rules
     // require the `on` suffix (`float on`, not bare `float`).
     for rule in [
         format!("float on, match:class {REVIEW_CLASS}"),
         format!("center on, match:class {REVIEW_CLASS}"),
+        format!("float on, match:class {PORTAL_CLASS}"),
+        format!("center on, match:class {PORTAL_CLASS}"),
     ] {
         let result = Command::new("hyprctl")
             .args(["keyword", "windowrule", &rule])

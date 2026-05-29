@@ -888,9 +888,9 @@ impl PrefsApp {
         );
 
         ui.add_space(SETTING_BLOCK_SPACING);
-        caption(
+        caption_with_code(
             ui,
-            "$HYPRCORRECT_CHORD overrides Fix last word for one-off dev runs.",
+            "`$HYPRCORRECT_CHORD` overrides Fix last word for one-off dev runs.",
         );
     }
 
@@ -1052,11 +1052,12 @@ impl PrefsApp {
                 (!ngram.trim().is_empty()).then(|| ngram.trim().to_string());
         }
         ui.add_space(4.0);
-        caption(
+        caption_with_code(
             ui,
-            "Only if you already have the unzipped n-gram data — the folder that contains \
-             an en/ subfolder (e.g. …/ngrams/, with en/2grams, en/3grams inside). Point \
-             here, then \"Enable n-grams\" above. Otherwise use \"Download n-grams\".",
+            "Only needed if you already have the unzipped n-gram data — the folder that \
+             contains an `en/` subfolder (e.g. `…/ngrams/`, with `en/2grams`, `en/3grams` \
+             inside). Point here, then click \"Enable n-grams\" above. Otherwise use \
+             \"Download n-grams\".",
         );
         changed
     }
@@ -2133,7 +2134,9 @@ fn editable_combo(
         // value). Anchor it to the field (not the narrow chevron, which made
         // egui clamp the menu to a sliver), exactly the field's width, and a
         // few px below so it clears the field's focus border.
-        let popup_w = edit.rect.width();
+        // The popup's menu frame adds `menu_margin` (6px) on each side, so
+        // subtract 12 to make the popup's outer width match the field.
+        let popup_w = (edit.rect.width() - 12.0).max(80.0);
         let toggled = edit.clicked() || btn.clicked();
         egui::Popup::menu(&btn)
             .anchor(&edit)
@@ -2577,31 +2580,113 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Like [`caption`] but renders backtick-delimited spans as inline code
-/// chips (monospace with a faint background), e.g. `` `~/.config/` ``.
-/// The text wraps as one flowing paragraph (a single `LayoutJob`).
+/// pills (monospace on a subtle dark backdrop), GitHub-comment style.
+/// Mirrors vernier's `caption`: the pill backdrops are painted by hand at
+/// a tight y-range hugging the glyph metrics (not the full row height) so
+/// they sit centered on the text rather than riding high.
 fn caption_with_code(ui: &mut egui::Ui, text: &str) {
-    let mut job = egui::text::LayoutJob::default();
+    use egui::text::LayoutJob;
+    // `valign: Center` keeps the (smaller, monospace) code glyphs centered
+    // on the plain text's line instead of sitting on its baseline.
     let plain = egui::TextFormat {
         font_id: egui::FontId::proportional(CAPTION_SIZE),
         color: egui::Color32::from_gray(170),
         line_height: Some(CAPTION_LINE_HEIGHT),
+        valign: egui::Align::Center,
         ..Default::default()
     };
     let code = egui::TextFormat {
         font_id: egui::FontId::monospace(CAPTION_SIZE - 1.0),
-        color: egui::Color32::from_gray(220),
-        background: ui.visuals().code_bg_color,
+        color: egui::Color32::from_gray(225),
         line_height: Some(CAPTION_LINE_HEIGHT),
+        valign: egui::Align::Center,
         ..Default::default()
     };
-    // Even segments are plain text, odd segments sat between backticks.
-    for (i, part) in text.split('`').enumerate() {
-        if part.is_empty() {
-            continue;
+    // A no-break space inside each pill pads the backdrop a glyph-width
+    // past the code text on each side without opening a wrap point.
+    const NBSP: char = '\u{00A0}';
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    let mut in_code = false;
+    let mut buf = String::new();
+    let flush = |job: &mut LayoutJob, buf: &mut String, in_code: bool| {
+        if buf.is_empty() {
+            return;
         }
-        job.append(part, 0.0, if i % 2 == 1 { code.clone() } else { plain.clone() });
+        if in_code {
+            job.append(&format!("{NBSP}{buf}{NBSP}"), 0.0, code.clone());
+        } else {
+            job.append(buf, 0.0, plain.clone());
+        }
+        buf.clear();
+    };
+    for c in text.chars() {
+        if c == '`' {
+            flush(&mut job, &mut buf, in_code);
+            in_code = !in_code;
+        } else {
+            buf.push(c);
+        }
     }
-    ui.label(job);
+    flush(&mut job, &mut buf, in_code);
+
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let origin = rect.min;
+    let painter = ui.painter();
+    let bg_color = egui::Color32::from_gray(48);
+    // Code spans are marked by the NBSP padding injected above.
+    type CodeRun = (f32, f32, f32, f32); // (x0, x1, y_min, y_max)
+    for row in &galley.rows {
+        let row_rect = row.rect();
+        let mut run: Option<CodeRun> = None;
+        let mut in_run = false;
+        let flush_run = |run: &mut Option<CodeRun>| {
+            if let Some((x0, x1, y_min, y_max)) = run.take()
+                && y_min.is_finite()
+                && y_max.is_finite()
+            {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0 + 1.0, y_min - 2.0),
+                        egui::pos2(x1 - 1.0, y_max + 1.0),
+                    ),
+                    3.0,
+                    bg_color,
+                );
+            }
+        };
+        for glyph in &row.glyphs {
+            let x0 = origin.x + row_rect.min.x + glyph.pos.x;
+            let x1 = x0 + glyph.size().x;
+            let baseline = origin.y + row_rect.min.y + glyph.pos.y;
+            let gy_min = baseline - glyph.font_ascent;
+            let gy_max = baseline + (glyph.font_height - glyph.font_ascent);
+            if glyph.chr == NBSP {
+                match run {
+                    Some((_, ref mut x_end, _, _)) => *x_end = x1,
+                    None => run = Some((x0, x1, f32::INFINITY, f32::NEG_INFINITY)),
+                }
+                if in_run {
+                    in_run = false;
+                    flush_run(&mut run);
+                } else {
+                    in_run = true;
+                }
+            } else if in_run {
+                match run {
+                    Some((_, ref mut x_end, ref mut y_min, ref mut y_max)) => {
+                        *x_end = x1;
+                        *y_min = y_min.min(gy_min);
+                        *y_max = y_max.max(gy_max);
+                    }
+                    None => run = Some((x0, x1, gy_min, gy_max)),
+                }
+            }
+        }
+        flush_run(&mut run);
+    }
+    painter.galley(origin, galley, egui::Color32::PLACEHOLDER);
 }
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
