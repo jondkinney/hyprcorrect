@@ -1790,7 +1790,12 @@ impl PrefsApp {
                 });
             let selected_ref = &mut self.selected_app;
             let filter = &mut self.app_filter;
-            let combo_w = (ui.available_width() - 80.0).max(120.0);
+            // `ComboBox::width` is the button's *outer* width, whereas the
+            // "by class name" text field below sets `desired_width` plus an
+            // 8px symmetric margin (outer = width + 16). Subtract 64 (= 80 - 16)
+            // so the combo's outer width matches that field's and the two "Add"
+            // buttons line up 20px from the edge.
+            let combo_w = (ui.available_width() - 64.0).max(120.0);
             egui::ComboBox::from_id_salt("blocklist_app_picker")
                 .selected_text(selected_display)
                 .width(combo_w)
