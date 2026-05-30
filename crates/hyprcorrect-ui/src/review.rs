@@ -958,10 +958,13 @@ impl ReviewApp {
                         // Match the Original card's row pitch — it spaces its
                         // rows by row_h*0.5 via item_spacing, i.e. a 1.5×
                         // line height. The galley defaults to the font's tight
-                        // row height, which is what made the Corrected box look
-                        // more cramped than the Original. valign stays BOTTOM,
-                        // so glyphs + squiggles keep sitting on the baseline and
-                        // only the caret needs bottom-anchoring below.
+                        // row height, which made the Corrected box look more
+                        // cramped than the Original. Because every glyph gets
+                        // the same line_height, egui's valign term cancels
+                        // (max_row_height == glyph.line_height) and the glyph is
+                        // top-anchored in the taller row with the extra space
+                        // *below* it — so the caret/squiggles below anchor from
+                        // the row top (= glyph top), not the row bottom.
                         line_height: Some(row_h * 1.5),
                         ..Default::default()
                     },
@@ -992,7 +995,10 @@ impl ReviewApp {
                     } else {
                         origin.x + galley.size().x
                     };
-                    squiggle(ui.painter(), r0.min.x, x1, r0.max.y, SQUIGGLE_BLUE);
+                    // Glyph is top-anchored in the 1.5× row, so its bottom is
+                    // row_top + row_h, not the row's max.y (which includes the
+                    // extra space below).
+                    squiggle(ui.painter(), r0.min.x, x1, r0.min.y + row_h, SQUIGGLE_BLUE);
                 }
 
                 let at = cursor.min(text.len());
@@ -1000,10 +1006,11 @@ impl ReviewApp {
                 let caret = galley
                     .pos_from_cursor(CCursor::new(char_idx))
                     .translate(origin.to_vec2());
-                // The cursor rect now spans the taller 1.5× line box; with
-                // valign=BOTTOM the glyph sits in its bottom `row_h`, so anchor
-                // the caret there instead of filling the whole line height.
-                let glyph_top = egui::pos2(caret.min.x, caret.max.y - row_h);
+                // The cursor rect spans the taller 1.5× line box; the glyph is
+                // top-anchored within it, so the glyph's own cell starts at the
+                // row top. Draw the caret one `row_h` tall from there instead of
+                // filling the whole (taller) line.
+                let glyph_top = egui::pos2(caret.min.x, caret.min.y);
                 match mode {
                     vimedit::Mode::Insert => {
                         // Thin i-beam between glyphs.
