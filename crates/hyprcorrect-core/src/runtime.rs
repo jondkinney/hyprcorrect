@@ -112,6 +112,13 @@ pub struct ReviewRequest {
     /// its "Ask LLM" escalation button only when this is true.
     #[serde(default)]
     pub llm_available: bool,
+    /// Whether the LLM produced the `corrected` text shown. When `true`
+    /// the popup hides the "Ask LLM" button — the result is already the
+    /// LLM's, so there's nothing to escalate. Keyed on the provider that
+    /// actually produced the correction, so an LLM miss that fell back to
+    /// LanguageTool/Spellbook still offers the button.
+    #[serde(default)]
+    pub from_llm: bool,
 }
 
 /// Write a fresh review request to disk. Overwrites any pending one.

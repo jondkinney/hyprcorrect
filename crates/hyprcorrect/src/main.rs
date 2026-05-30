@@ -1464,6 +1464,9 @@ fn start_review(
         pending: true,
         screen_width,
         llm_available,
+        // Unknown until the correction lands; the button stays available
+        // through the brief "Checking…" state.
+        from_llm: false,
     };
     if let Err(e) = write_review_request(&pending) {
         eprintln!("hyprcorrect: could not write pending review request: {e}");
@@ -1471,7 +1474,7 @@ fn start_review(
     }
     spawn_review_window();
 
-    let (corrected, _used_provider, suggestions) = correct_sentence_with_suggestions(
+    let (corrected, used_provider, suggestions) = correct_sentence_with_suggestions(
         &at.sentence,
         smart,
         llm,
@@ -1502,6 +1505,9 @@ fn start_review(
         pending: false,
         screen_width,
         llm_available,
+        // Hide "Ask LLM" when the LLM itself produced this — but not when
+        // an LLM miss fell back to LanguageTool/Spellbook (still escalatable).
+        from_llm: used_provider == hyprcorrect_core::ProviderId::Llm,
     };
     if let Err(e) = write_review_request(&request) {
         eprintln!("hyprcorrect: could not write finished review request: {e}");
@@ -1543,7 +1549,7 @@ fn reprocess_review_with_llm(
         return;
     }
 
-    let (corrected, _used, suggestions) = correct_sentence_with_suggestions(
+    let (corrected, used, suggestions) = correct_sentence_with_suggestions(
         &req.original,
         ProviderId::Llm,
         llm,
@@ -1560,6 +1566,9 @@ fn reprocess_review_with_llm(
     req.corrected = corrected;
     req.suggestions = suggestions;
     req.pending = false;
+    // The escalation succeeded only if the LLM actually produced it; if it
+    // missed and fell back, keep "Ask LLM" available for another try.
+    req.from_llm = used == ProviderId::Llm;
     if let Err(e) = write_review_request(&req) {
         eprintln!("hyprcorrect: review-llm — could not write finished request: {e}");
     }

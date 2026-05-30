@@ -1147,24 +1147,28 @@ impl eframe::App for ReviewApp {
                     {
                         do_cancel = true;
                     }
-                    // Escalate to the LLM. Always offered (progressive
+                    // Escalate to the LLM — only when the shown correction
+                    // did NOT come from the LLM (nothing to escalate if it
+                    // did). Otherwise always offered (progressive
                     // discovery); the trailing ellipsis hints it opens
                     // setup first when no LLM key is configured yet.
-                    ui.add_space(8.0);
-                    let (llm_label, llm_hint) = if self.request.llm_available {
-                        ("Ask LLM", "Re-run this sentence through the LLM")
-                    } else {
-                        (
-                            "Ask LLM…",
-                            "Opens Preferences → Providers to add an LLM API key",
-                        )
-                    };
-                    if ui
-                        .button(egui::RichText::new(llm_label).size(15.0))
-                        .on_hover_text(llm_hint)
-                        .clicked()
-                    {
-                        do_llm = true;
+                    if !self.request.from_llm {
+                        ui.add_space(8.0);
+                        let (llm_label, llm_hint) = if self.request.llm_available {
+                            ("Ask LLM", "Re-run this sentence through the LLM")
+                        } else {
+                            (
+                                "Ask LLM…",
+                                "Opens Preferences → Providers to add an LLM API key",
+                            )
+                        };
+                        if ui
+                            .button(egui::RichText::new(llm_label).size(15.0))
+                            .on_hover_text(llm_hint)
+                            .clicked()
+                        {
+                            do_llm = true;
+                        }
                     }
                     // Apply is the primary action — filled, pinned to the right.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
