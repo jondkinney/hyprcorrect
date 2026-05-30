@@ -895,7 +895,9 @@ impl ReviewApp {
 
     fn render_vim(&mut self, ui: &mut egui::Ui) {
         ui.heading("Edit sentence  ·  vim");
-        ui.add_space(10.0);
+        // Spacing below mirrors render_word exactly so toggling Ctrl+E
+        // doesn't shift the Original / second-section boxes vertically.
+        ui.add_space(16.0);
         section_label(ui, "Original");
 
         let (text, cursor, mode, status) = match self.vim.as_ref() {
@@ -911,7 +913,7 @@ impl ReviewApp {
         // mode.
         let layout = worddiff::align(&self.request.original, &text);
         original_card(ui, &self.request.original, &text, layout.as_ref());
-        ui.add_space(16.0);
+        ui.add_space(18.0);
         section_label(ui, "Corrected");
 
         let marks = self.vim_marks.clone();
@@ -953,6 +955,14 @@ impl ReviewApp {
                     egui::TextFormat {
                         font_id: font.clone(),
                         color: fg,
+                        // Match the Original card's row pitch — it spaces its
+                        // rows by row_h*0.5 via item_spacing, i.e. a 1.5×
+                        // line height. The galley defaults to the font's tight
+                        // row height, which is what made the Corrected box look
+                        // more cramped than the Original. valign stays BOTTOM,
+                        // so glyphs + squiggles keep sitting on the baseline and
+                        // only the caret needs bottom-anchoring below.
+                        line_height: Some(row_h * 1.5),
                         ..Default::default()
                     },
                 );
@@ -990,23 +1000,25 @@ impl ReviewApp {
                 let caret = galley
                     .pos_from_cursor(CCursor::new(char_idx))
                     .translate(origin.to_vec2());
+                // The cursor rect now spans the taller 1.5× line box; with
+                // valign=BOTTOM the glyph sits in its bottom `row_h`, so anchor
+                // the caret there instead of filling the whole line height.
+                let glyph_top = egui::pos2(caret.min.x, caret.max.y - row_h);
                 match mode {
                     vimedit::Mode::Insert => {
                         // Thin i-beam between glyphs.
-                        let ibeam =
-                            egui::Rect::from_min_size(caret.min, egui::vec2(2.0, caret.height()));
+                        let ibeam = egui::Rect::from_min_size(glyph_top, egui::vec2(2.0, row_h));
                         ui.painter().rect_filled(ibeam, 0.0, accent);
                     }
                     _ => {
                         // Block over the character under the cursor — one
                         // monospace cell wide (never the padding after it).
-                        let block =
-                            egui::Rect::from_min_size(caret.min, egui::vec2(cw, caret.height()));
+                        let block = egui::Rect::from_min_size(glyph_top, egui::vec2(cw, row_h));
                         ui.painter().rect_filled(block, 0.0, accent);
                         if let Some(ch) = text[at..].chars().next() {
                             if ch != '\n' {
                                 ui.painter().text(
-                                    caret.min,
+                                    glyph_top,
                                     egui::Align2::LEFT_TOP,
                                     ch,
                                     font.clone(),
