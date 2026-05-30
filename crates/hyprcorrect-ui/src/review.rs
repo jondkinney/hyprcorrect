@@ -1505,8 +1505,10 @@ fn wrap_columns(col_widths: &[usize], avail: f32, cw: f32) -> Vec<(usize, usize)
 /// same `rows`. Returns the padded string plus a map from each raw char
 /// index (`0..=char_len`) to its char index in the padded string — so the
 /// vim caret and squiggles, which index the raw buffer, land in the right
-/// place. Padding is appended *after* each word (and gaps/newlines are
-/// inserted), so every raw char keeps its identity and maps cleanly.
+/// place. Padding is appended *after* each word's separator space (so the
+/// caret on the space after a shortened word stays tight against the word),
+/// with gaps/newlines inserted; every raw char keeps its identity and maps
+/// cleanly.
 fn aligned_display(
     buffer: &str,
     layout: &worddiff::AlignLayout,
@@ -1585,14 +1587,29 @@ fn aligned_display(
             map[sep_start + ci] = di;
             push(&mut disp, &mut di, ch);
         }
-        for _ in 0..width.saturating_sub(wlen + punct_len) {
-            push(&mut disp, &mut di, ' ');
+        let pad = width.saturating_sub(wlen + punct_len);
+        // Emit the real separator space *before* the alignment padding so it
+        // maps to the slot right after the word. A `cw` that shortens a word
+        // leaves the caret on this space; we want it tight against the word
+        // with the column padding to its right, not jumped to the column's
+        // far edge. Exception: a separator newline (a user INSERT-Enter) ends
+        // the row, so any padding has to stay before it.
+        let pad_first = ws.contains('\n');
+        if pad_first {
+            for _ in 0..pad {
+                push(&mut disp, &mut di, ' ');
+            }
         }
         for (ci, ch) in ws.chars().enumerate() {
             map[sep_start + punct_len + ci] = di;
             // Keep real newlines (INSERT-Enter line breaks) — collapsing
             // them would lose multi-line editing.
             push(&mut disp, &mut di, ch);
+        }
+        if !pad_first {
+            for _ in 0..pad {
+                push(&mut disp, &mut di, ' ');
+            }
         }
     }
     map[raw_len] = di;
@@ -1855,6 +1872,21 @@ fn open_prefs_providers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caret_after_shortened_word_maps_tight() {
+        // After a `cw` shortens "investigte" → "investi", the caret sits on
+        // the space that follows. In the column-aligned display it must map
+        // to the slot right after the word, not past the alignment padding.
+        let original = "investigte the";
+        let buffer = "investi the"; // 'i' is char 6, the space is char 7
+        let layout = worddiff::align(original, buffer).expect("layout");
+        let rows = wrap_columns(&layout.col_widths, 10_000.0, 8.0); // one row
+        let (_disp, map) = aligned_display(buffer, &layout, &rows);
+        // The space (raw char 7) lands immediately after the last 'i'
+        // (raw char 6) — no column padding is skipped before the caret.
+        assert_eq!(map[7], map[6] + 1);
+    }
 
     #[test]
     fn changed_region_finds_the_edit() {
