@@ -16,6 +16,8 @@
 //! (possibly edited) sentence back into the review-request file and
 //! signals, so focus has time to return to the source window first.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use eframe::egui;
@@ -142,13 +144,40 @@ struct ReviewApp {
     /// successful `load_review` flips straight into vim mode. Cleared
     /// after, so flipping back to word mode (Ctrl+E) sticks.
     pending_initial_vim: bool,
+    /// Definition source for the suggestion dropdown (Off / Local /
+    /// Online), read from config at startup.
+    def_source: hyprcorrect_core::DefinitionSource,
+    /// Resolved definitions keyed by lowercased word; a `None` value means
+    /// "looked up, none found". Online results arrive via `def_rx`.
+    def_cache: HashMap<String, Option<String>>,
+    /// Words with an online lookup in flight, so repeated frames don't
+    /// spawn duplicate fetches.
+    def_inflight: HashSet<String>,
+    /// Channel carrying online definition results back from worker
+    /// threads (`(lowercased word, result)`).
+    def_tx: Sender<(String, Option<String>)>,
+    def_rx: Receiver<(String, Option<String>)>,
+}
+
+/// What the dropdown should show on its definition line for the
+/// currently-highlighted option.
+enum DefView {
+    /// Definitions disabled (or nothing to define) — no line.
+    Off,
+    /// Online lookup in flight.
+    Loading,
+    /// Looked up, no definition found.
+    Missing,
+    /// The definition text.
+    Text(String),
 }
 
 impl ReviewApp {
     fn new(request: ReviewRequest) -> Self {
-        let start_in_vim = hyprcorrect_core::Config::load()
-            .map(|c| c.behavior.review_starts_in_vim)
-            .unwrap_or(false);
+        let behavior = hyprcorrect_core::Config::load()
+            .map(|c| c.behavior)
+            .unwrap_or_default();
+        let (def_tx, def_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             request,
             decision: None,
@@ -167,12 +196,66 @@ impl ReviewApp {
             field_originals: Vec::new(),
             vim_suggest: None,
             reprocessing: false,
-            pending_initial_vim: start_in_vim,
+            pending_initial_vim: behavior.review_starts_in_vim,
+            def_source: behavior.definitions,
+            def_cache: HashMap::new(),
+            def_inflight: HashSet::new(),
+            def_tx,
+            def_rx,
         };
         if !app.request.pending {
             app.load_review();
         }
         app
+    }
+
+    /// Drain any online definition results that worker threads have sent
+    /// since the last frame into the cache. Called once per frame.
+    fn drain_definitions(&mut self) {
+        while let Ok((key, result)) = self.def_rx.try_recv() {
+            self.def_inflight.remove(&key);
+            self.def_cache.insert(key, result);
+        }
+    }
+
+    /// Resolve the definition line for `word` under the current source.
+    /// Local is a synchronous in-memory lookup; Online is fetched on a
+    /// worker thread (cached, deduped) and returns `Loading` until it
+    /// lands. The thread requests a repaint so the line fills in.
+    fn definition_view(&mut self, ctx: &egui::Context, word: &str) -> DefView {
+        use hyprcorrect_core::DefinitionSource;
+        let key = word.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return DefView::Off;
+        }
+        match self.def_source {
+            DefinitionSource::Off => DefView::Off,
+            DefinitionSource::Local => {
+                match hyprcorrect_core::define(word, DefinitionSource::Local) {
+                    Some(d) => DefView::Text(d),
+                    None => DefView::Missing,
+                }
+            }
+            DefinitionSource::Online => {
+                if let Some(cached) = self.def_cache.get(&key) {
+                    return match cached {
+                        Some(d) => DefView::Text(d.clone()),
+                        None => DefView::Missing,
+                    };
+                }
+                if self.def_inflight.insert(key.clone()) {
+                    let tx = self.def_tx.clone();
+                    let ctx = ctx.clone();
+                    let word = word.to_string();
+                    std::thread::spawn(move || {
+                        let result = hyprcorrect_core::define_online(&word);
+                        let _ = tx.send((key, result));
+                        ctx.request_repaint();
+                    });
+                }
+                DefView::Loading
+            }
+        }
     }
 
     /// Build the word-edit state from the (finished) request. Called
@@ -703,8 +786,16 @@ impl ReviewApp {
             let entries = self.field_entries(ord, &current);
             if !entries.is_empty() {
                 let labels: Vec<&str> = entries.iter().map(|(l, _)| l.as_str()).collect();
+                // Define the highlighted option's word, or the field's
+                // current word when nothing is highlighted.
+                let def_word = self
+                    .dropdown_highlight
+                    .and_then(|i| entries.get(i))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| current.clone());
+                let def = self.definition_view(ui.ctx(), &def_word);
                 if let Some(pick) =
-                    render_suggestion_dropdown(ui, &current, &labels, self.dropdown_highlight)
+                    render_suggestion_dropdown(ui, &current, &labels, self.dropdown_highlight, def)
                 {
                     let value = entries[pick].1.clone();
                     let ctx = ui.ctx().clone();
@@ -1044,7 +1135,12 @@ impl ReviewApp {
             .map(|s| (s.word.clone(), s.options.clone(), s.highlight));
         if let Some((word, options, highlight)) = dropdown {
             let opts: Vec<&str> = options.iter().map(String::as_str).collect();
-            if let Some(pick) = render_suggestion_dropdown(ui, &word, &opts, highlight) {
+            let def_word = highlight
+                .and_then(|i| options.get(i))
+                .cloned()
+                .unwrap_or_else(|| word.clone());
+            let def = self.definition_view(ui.ctx(), &def_word);
+            if let Some(pick) = render_suggestion_dropdown(ui, &word, &opts, highlight, def) {
                 let opt = options[pick].clone();
                 let ctx = ui.ctx().clone();
                 self.pick_vim_suggest(&ctx, &opt);
@@ -1089,6 +1185,8 @@ impl ReviewApp {
 
 impl eframe::App for ReviewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Fold in any online definition results that arrived since last frame.
+        self.drain_definitions();
         // A daemon-initiated re-process (the review-llm chord) flips the
         // request file back to `pending`; notice it even while a finished
         // review is on screen, and drop into the "Checking…" view. Poll on
@@ -1757,6 +1855,7 @@ fn render_suggestion_dropdown(
     current: &str,
     options: &[&str],
     highlight: Option<usize>,
+    def: DefView,
 ) -> Option<usize> {
     let mut clicked = None;
     ui.add_space(10.0);
@@ -1781,6 +1880,37 @@ fn render_suggestion_dropdown(
                     .color(TEXT_FG);
                 if ui.selectable_label(highlight == Some(i), label).clicked() {
                     clicked = Some(i);
+                }
+            }
+            // Definition of the highlighted option (or the applied word
+            // when nothing is highlighted), under the options.
+            match def {
+                DefView::Off => {}
+                DefView::Loading => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("looking up…")
+                            .size(12.0)
+                            .italics()
+                            .color(egui::Color32::from_gray(120)),
+                    );
+                }
+                DefView::Missing => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("no definition")
+                            .size(12.0)
+                            .italics()
+                            .color(egui::Color32::from_gray(110)),
+                    );
+                }
+                DefView::Text(d) => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(d)
+                            .size(12.5)
+                            .color(egui::Color32::from_gray(185)),
+                    );
                 }
             }
             ui.add_space(4.0);

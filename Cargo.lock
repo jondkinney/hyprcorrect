@@ -1479,6 +1479,7 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "directories",
+ "flate2",
  "keyring",
  "serde",
  "serde_json",

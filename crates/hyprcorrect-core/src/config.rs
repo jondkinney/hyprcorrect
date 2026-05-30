@@ -184,6 +184,20 @@ impl Default for LanguageToolConfig {
     }
 }
 
+/// Where the review popup's per-option word definitions come from.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionSource {
+    /// Don't show definitions.
+    Off,
+    /// Bundled offline WordNet glosses — the privacy-preserving default.
+    #[default]
+    Local,
+    /// Online dictionary API (`api.dictionaryapi.dev`). Sends the
+    /// looked-up word to a third party, so it's opt-in.
+    Online,
+}
+
 /// Behavior knobs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -225,6 +239,11 @@ pub struct Behavior {
     /// Spellbook either way. On by default so a configured LanguageTool
     /// is preferred over the offline dictionary.
     pub fallback_to_languagetool: bool,
+
+    /// Source for the per-option word definitions under the review
+    /// popup's suggestion dropdown. Defaults to the bundled offline
+    /// dictionary; can be turned off or pointed at an online API.
+    pub definitions: DefinitionSource,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -233,6 +252,7 @@ impl Default for Behavior {
             reset_keys: ResetKeys::default(),
             review_starts_in_vim: false,
             fallback_to_languagetool: true,
+            definitions: DefinitionSource::Local,
         }
     }
 }

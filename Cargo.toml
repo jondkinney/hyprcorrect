@@ -43,6 +43,9 @@ serde_json = "1"
 zip = "2"
 fs2 = "0.4"
 
+# Decompressing the bundled WordNet definitions (gzip) at first lookup.
+flate2 = "1"
+
 # GUI.
 eframe = { version = "0.32", default-features = false, features = [
     "default_fonts",

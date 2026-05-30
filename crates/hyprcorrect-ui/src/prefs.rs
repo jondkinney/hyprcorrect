@@ -1603,6 +1603,32 @@ impl PrefsApp {
         );
         ui.add_space(SETTING_BLOCK_SPACING);
 
+        field_label(ui, "Word definitions");
+        ui.add_space(4.0);
+        {
+            use hyprcorrect_core::DefinitionSource as DS;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let cur = &mut self.config.behavior.definitions;
+                changed |= ui.selectable_value(cur, DS::Local, "Offline").clicked();
+                changed |= ui.selectable_value(cur, DS::Online, "Online").clicked();
+                changed |= ui.selectable_value(cur, DS::Off, "Off").clicked();
+            });
+            if changed {
+                self.clear_status();
+            }
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "Show a word's definition under the review popup's suggestion \
+             options, updating as you move between them. Offline uses a bundled \
+             dictionary (WordNet); Online queries api.dictionaryapi.dev, which \
+             sends the looked-up word to a third party.",
+        );
+        ui.add_space(SETTING_BLOCK_SPACING);
+
         field_label(ui, "Pause per backspace");
         caption(
             ui,

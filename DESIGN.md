@@ -488,10 +488,23 @@ url      = "http://localhost:8081"
 [behavior]
 pause_per_backspace_ms   = 8
 fallback_to_languagetool = true   # LLM miss → LanguageTool before Spellbook
+definitions              = "local"  # off | local (bundled WordNet) | online
 
 [privacy]
 app_blocklist = ["1password", "keepassxc"]
 ```
+
+**Word definitions.** The review popup's suggestion dropdown shows the
+definition of the highlighted option (or the applied word), updating as
+you move between options. Source is `behavior.definitions`: `local`
+(default) reads a bundled, gzipped WordNet 3.1 gloss set
+(`hyprcorrect-core/assets/definitions-en.tsv.gz`, ~83k single-word
+lemmas, lazily decompressed + looked up in-process) — fully offline;
+`online` queries `api.dictionaryapi.dev` on a worker thread (cached,
+non-blocking) and sends the looked-up word to a third party; `off`
+hides the line. Words WordNet doesn't cover (proper nouns, most function
+words, misspellings) show *no definition*. WordNet's permissive license
+is reproduced in `assets/WORDNET-LICENSE.txt`.
 
 ## Security & privacy
 
