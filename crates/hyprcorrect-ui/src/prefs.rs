@@ -857,15 +857,6 @@ impl PrefsApp {
             self.clear_status();
             notify_daemon_release();
         }
-        if !self.config.hotkeys.fix_sentence.is_empty()
-            && ui
-                .add(egui::Button::new("Clear").frame(false))
-                .on_hover_text("Unbind this chord")
-                .clicked()
-        {
-            self.config.hotkeys.fix_sentence.clear();
-            self.clear_status();
-        }
         ui.add_space(6.0);
         caption(
             ui,
@@ -889,15 +880,6 @@ impl PrefsApp {
             self.clear_status();
             notify_daemon_release();
         }
-        if !self.config.hotkeys.review.is_empty()
-            && ui
-                .add(egui::Button::new("Clear").frame(false))
-                .on_hover_text("Unbind this chord")
-                .clicked()
-        {
-            self.config.hotkeys.review.clear();
-            self.clear_status();
-        }
         ui.add_space(6.0);
         caption(
             ui,
@@ -919,15 +901,6 @@ impl PrefsApp {
             self.capturing_chord = Some(HotkeyTarget::ReviewLlm);
             self.clear_status();
             notify_daemon_release();
-        }
-        if !self.config.hotkeys.review_llm.is_empty()
-            && ui
-                .add(egui::Button::new("Clear").frame(false))
-                .on_hover_text("Unbind this chord")
-                .clicked()
-        {
-            self.config.hotkeys.review_llm.clear();
-            self.clear_status();
         }
         ui.add_space(6.0);
         caption(
