@@ -702,6 +702,15 @@ impl ReviewApp {
                                     let out = egui::TextEdit::singleline(t)
                                         .id(id)
                                         .frame(false)
+                                        // We drive Tab/Shift+Tab ourselves
+                                        // (focus_relative). Locking tab to the
+                                        // field stops egui latching its own
+                                        // focus move in begin_pass — without
+                                        // this, Shift+Tab ejects to the action
+                                        // buttons instead of cycling fields
+                                        // backward. (Singleline never inserts a
+                                        // tab char; that path is multiline-only.)
+                                        .lock_focus(true)
                                         .desired_width(w)
                                         .margin(egui::Margin::ZERO)
                                         .font(font.clone())
@@ -1867,6 +1876,38 @@ fn render_suggestion_dropdown(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 2.0;
+            // Definition of the highlighted option (or the applied word when
+            // nothing is highlighted) shown first, labeled, then a gap before
+            // the options below.
+            match def {
+                DefView::Off => {}
+                DefView::Loading => {
+                    ui.label(
+                        egui::RichText::new("Definition:  looking up…")
+                            .size(12.5)
+                            .italics()
+                            .color(egui::Color32::from_gray(120)),
+                    );
+                    ui.add_space(10.0);
+                }
+                DefView::Missing => {
+                    ui.label(
+                        egui::RichText::new("Definition:  not found")
+                            .size(12.5)
+                            .italics()
+                            .color(egui::Color32::from_gray(110)),
+                    );
+                    ui.add_space(10.0);
+                }
+                DefView::Text(d) => {
+                    ui.label(
+                        egui::RichText::new(format!("Definition:  {d}"))
+                            .size(12.5)
+                            .color(egui::Color32::from_gray(185)),
+                    );
+                    ui.add_space(10.0);
+                }
+            }
             ui.label(
                 egui::RichText::new(format!("Other options for  {current}"))
                     .size(12.0)
@@ -1880,37 +1921,6 @@ fn render_suggestion_dropdown(
                     .color(TEXT_FG);
                 if ui.selectable_label(highlight == Some(i), label).clicked() {
                     clicked = Some(i);
-                }
-            }
-            // Definition of the highlighted option (or the applied word
-            // when nothing is highlighted), under the options.
-            match def {
-                DefView::Off => {}
-                DefView::Loading => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("looking up…")
-                            .size(12.0)
-                            .italics()
-                            .color(egui::Color32::from_gray(120)),
-                    );
-                }
-                DefView::Missing => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("no definition")
-                            .size(12.0)
-                            .italics()
-                            .color(egui::Color32::from_gray(110)),
-                    );
-                }
-                DefView::Text(d) => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(d)
-                            .size(12.5)
-                            .color(egui::Color32::from_gray(185)),
-                    );
                 }
             }
             ui.add_space(4.0);

@@ -495,8 +495,9 @@ app_blocklist = ["1password", "keepassxc"]
 ```
 
 **Word definitions.** The review popup's suggestion dropdown shows the
-definition of the highlighted option (or the applied word), updating as
-you move between options. Source is `behavior.definitions`: `local`
+definition of the highlighted option (or the applied word) first, on a
+line labeled "Definition:" above the options, updating as you move
+between options. Source is `behavior.definitions`: `local`
 (default) reads a bundled, gzipped WordNet 3.1 gloss set
 (`hyprcorrect-core/assets/definitions-en.tsv.gz`, ~83k single-word
 lemmas, lazily decompressed + looked up in-process) — fully offline;
