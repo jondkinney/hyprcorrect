@@ -219,6 +219,7 @@ impl PrefsApp {
             llm_draft: LlmConfig {
                 backend: String::new(),
                 model: String::new(),
+                base_url: None,
             },
             llm_draft_key: String::new(),
             #[cfg(target_os = "linux")]
@@ -563,6 +564,7 @@ impl PrefsApp {
         self.llm_draft = LlmConfig {
             backend: String::new(),
             model: String::new(),
+            base_url: None,
         };
         self.llm_draft_key.clear();
         self.llm_tab = self
@@ -1579,6 +1581,28 @@ impl PrefsApp {
         );
         ui.add_space(SETTING_BLOCK_SPACING);
 
+        field_label(ui, "Provider fallback");
+        ui.add_space(4.0);
+        if ui
+            .checkbox(
+                &mut self.config.behavior.fallback_to_languagetool,
+                "Try LanguageTool before Spellbook",
+            )
+            .changed()
+        {
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "When a fix routed to the LLM can't run — no API key, an unsupported \
+             backend, or the call fails — try your LanguageTool server before \
+             dropping to the offline Spellbook. Only takes effect when LanguageTool \
+             is enabled with a URL in Providers; otherwise fixes fall straight \
+             through to Spellbook.",
+        );
+        ui.add_space(SETTING_BLOCK_SPACING);
+
         field_label(ui, "Pause per backspace");
         caption(
             ui,
@@ -1982,9 +2006,10 @@ fn info_icon(ui: &mut egui::Ui) -> egui::Response {
 }
 
 /// Hosted LLM backends offered in the Add-provider dropdown. The combo is
-/// editable, so this is a convenience list, not a hard constraint.
-/// Anthropic is first — it's the only backend wired today (see
-/// [`hyprcorrect_core::llm::is_backend_wired`]).
+/// editable, so this is a convenience list, not a hard constraint. All of
+/// these are wired (see [`hyprcorrect_core::llm::is_backend_wired`]);
+/// `openai-compatible` is last because it's the catch-all custom/local
+/// endpoint that needs a Base URL.
 const LLM_BACKENDS: &[&str] = &[
     "anthropic",
     "openai",
@@ -1993,20 +2018,41 @@ const LLM_BACKENDS: &[&str] = &[
     "mistral",
     "groq",
     "deepseek",
+    "xai",
+    "openai-compatible",
 ];
+
+/// The custom/local backend id: an OpenAI-compatible endpoint whose Base
+/// URL the user supplies (Ollama, LM Studio, vLLM, or any other vendor).
+const CUSTOM_BACKEND: &str = "openai-compatible";
+
+/// Whether `backend` is the custom/local OpenAI-compatible endpoint that
+/// needs a user-supplied Base URL.
+fn is_custom_backend(backend: &str) -> bool {
+    let b = backend.trim().to_ascii_lowercase();
+    b == CUSTOM_BACKEND || b == "custom"
+}
 
 /// Suggested models for a backend, cheapest/fastest first → most
 /// capable/expensive last. The model combo is editable, so these are
-/// starting points. Anthropic IDs are current; the rest are best-effort
-/// (and unwired today).
+/// starting points. Anthropic/OpenAI/Gemini IDs are current; the rest
+/// are best-effort.
 fn models_for_backend(backend: &str) -> &'static [&'static str] {
     match backend.trim().to_ascii_lowercase().as_str() {
         "anthropic" => &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"],
         "openai" => &["gpt-4o-mini", "gpt-4o", "o4-mini", "o3", "gpt-4.1"],
         "gemini" => &["gemini-2.5-flash", "gemini-2.5-pro"],
+        "openrouter" => &[
+            "openai/gpt-4o-mini",
+            "anthropic/claude-haiku-4-5",
+            "google/gemini-2.5-flash",
+        ],
         "groq" => &["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
         "mistral" => &["mistral-small-latest", "mistral-large-latest"],
         "deepseek" => &["deepseek-chat", "deepseek-reasoner"],
+        "xai" => &["grok-3-mini", "grok-3"],
+        // Local model tags vary by install; these are common Ollama names.
+        "openai-compatible" | "custom" => &["llama3.1", "qwen2.5", "gemma2"],
         _ => &[],
     }
 }
@@ -2023,6 +2069,8 @@ fn backend_display(backend: &str) -> String {
         "mistral" => "Mistral".into(),
         "groq" => "Groq".into(),
         "deepseek" => "DeepSeek".into(),
+        "xai" => "xAI (Grok)".into(),
+        "openai-compatible" | "custom" => "OpenAI-compatible".into(),
         _ => t.to_string(),
     }
 }
@@ -2040,6 +2088,42 @@ fn not_wired_note(ui: &mut egui::Ui, backend: &str) {
         .line_height(Some(CAPTION_LINE_HEIGHT))
         .color(egui::Color32::from_rgb(220, 160, 50)),
     );
+}
+
+/// The Base-URL row for the custom `openai-compatible` endpoint. Edits
+/// `slot` in place — a blank field clears it to `None` so named cloud
+/// backends never carry an empty URL. Returns whether it changed.
+fn base_url_field(ui: &mut egui::Ui, slot: &mut Option<String>) -> bool {
+    field_label_with_note(ui, "Base URL", "OpenAI-compatible endpoint");
+    ui.add_space(4.0);
+    let mut url = slot.clone().unwrap_or_default();
+    let changed = padded_text_edit(ui, &mut url).changed();
+    if changed {
+        *slot = if url.trim().is_empty() {
+            None
+        } else {
+            Some(url)
+        };
+    }
+    ui.add_space(4.0);
+    caption(
+        ui,
+        "Up to but not including /chat/completions — e.g. http://localhost:11434/v1 \
+         for a local Ollama server, or your provider's OpenAI-compatible URL.",
+    );
+    changed
+}
+
+/// API-key caption. The custom/local endpoint notes the key is optional
+/// (Ollama and friends need none); cloud backends just say where it's
+/// stored.
+fn api_key_caption(backend: &str) -> &'static str {
+    if is_custom_backend(backend) {
+        "Stored in your OS keychain, not in config.toml. Leave blank for local \
+         servers (e.g. Ollama) that need no key."
+    } else {
+        "Stored in your OS keychain, not in config.toml."
+    }
 }
 
 /// Whether `name` resolves to an executable on `$PATH`.
@@ -2329,13 +2413,18 @@ impl PrefsApp {
             "Pick or type a model",
         );
 
+        if is_custom_backend(backend) {
+            ui.add_space(SETTING_BLOCK_SPACING);
+            touched |= base_url_field(ui, &mut self.config.providers.llms[idx].base_url);
+        }
+
         ui.add_space(SETTING_BLOCK_SPACING);
         field_label(ui, "API key");
         ui.add_space(4.0);
         let key = self.llm_keys.entry(backend.to_string()).or_default();
         touched |= padded_password_edit(ui, key).changed();
         ui.add_space(4.0);
-        caption(ui, "Stored in your OS keychain, not in config.toml.");
+        caption(ui, api_key_caption(backend));
 
         if !hyprcorrect_core::llm::is_backend_wired(backend) {
             ui.add_space(6.0);
@@ -2411,6 +2500,11 @@ impl PrefsApp {
             "Pick or type a model",
         );
 
+        if is_custom_backend(&self.llm_draft.backend) {
+            ui.add_space(SETTING_BLOCK_SPACING);
+            touched |= base_url_field(ui, &mut self.llm_draft.base_url);
+        }
+
         // Validate up front so the Save button on the API-key row can gate.
         let backend = self.llm_draft.backend.trim().to_string();
         let dup = self
@@ -2447,7 +2541,7 @@ impl PrefsApp {
                 .clicked();
         });
         ui.add_space(4.0);
-        caption(ui, "Stored in your OS keychain, not in config.toml.");
+        caption(ui, api_key_caption(&backend));
 
         if !backend.is_empty() && !hyprcorrect_core::llm::is_backend_wired(&backend) {
             ui.add_space(6.0);
@@ -2476,9 +2570,18 @@ impl PrefsApp {
             } else {
                 self.llm_draft.model.trim().to_string()
             };
+            // Only the custom endpoint carries a base URL; drop a blank
+            // one to None so named backends never persist an empty string.
+            let base_url = self
+                .llm_draft
+                .base_url
+                .clone()
+                .filter(|_| is_custom_backend(&backend))
+                .filter(|s| !s.trim().is_empty());
             self.config.providers.llms.push(LlmConfig {
                 backend: backend.clone(),
                 model,
+                base_url,
             });
             self.llm_keys
                 .insert(backend.clone(), self.llm_draft_key.clone());
@@ -2486,6 +2589,7 @@ impl PrefsApp {
             self.llm_draft = LlmConfig {
                 backend: String::new(),
                 model: String::new(),
+                base_url: None,
             };
             self.llm_draft_key.clear();
             touched = true;

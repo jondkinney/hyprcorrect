@@ -152,6 +152,7 @@ fn run_daemon() {
     let mut default_provider_id = initial_config.providers.default;
     let mut smart_provider_id = initial_config.providers.smart;
     let mut pause_per_backspace_ms = initial_config.behavior.pause_per_backspace_ms;
+    let mut lt_fallback = initial_config.behavior.fallback_to_languagetool;
     capture::set_reset_keys(reset_key_config(&initial_config.behavior.reset_keys));
     let mut chord = match effective_chord(&initial_config) {
         Ok(c) => c,
@@ -363,9 +364,12 @@ fn run_daemon() {
                     // LLM configured, open Preferences so the user can add
                     // one). Operates on the review file, not the buffer —
                     // the focused window is the popup, not the source.
-                    "review-llm" => {
-                        reprocess_review_with_llm(llm.as_ref(), languagetool.as_ref(), &provider)
-                    }
+                    "review-llm" => reprocess_review_with_llm(
+                        llm.as_ref(),
+                        languagetool.as_ref(),
+                        &provider,
+                        lt_fallback,
+                    ),
                     _ => {
                         if !paused.load(Ordering::Relaxed)
                             && !current_blocked
@@ -380,6 +384,7 @@ fn run_daemon() {
                                     smart_provider_id,
                                     llm.as_ref(),
                                     languagetool.as_ref(),
+                                    lt_fallback,
                                 ),
                                 "sentence" => fix_last_sentence(
                                     buffer,
@@ -388,6 +393,7 @@ fn run_daemon() {
                                     llm.as_ref(),
                                     languagetool.as_ref(),
                                     pause_per_backspace_ms,
+                                    lt_fallback,
                                 ),
                                 _ => fix_last_word(
                                     buffer,
@@ -396,6 +402,7 @@ fn run_daemon() {
                                     languagetool.as_ref(),
                                     &provider,
                                     pause_per_backspace_ms,
+                                    lt_fallback,
                                 ),
                             }
                         }
@@ -463,6 +470,7 @@ fn run_daemon() {
                             default_provider_id = new_config.providers.default;
                             smart_provider_id = new_config.providers.smart;
                             pause_per_backspace_ms = new_config.behavior.pause_per_backspace_ms;
+                            lt_fallback = new_config.behavior.fallback_to_languagetool;
                             capture::set_reset_keys(reset_key_config(
                                 &new_config.behavior.reset_keys,
                             ));
@@ -672,6 +680,7 @@ fn fix_last_word(
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     provider: &hyprcorrect_core::OfflineProvider,
     pause_per_backspace_ms: u32,
+    lt_fallback: bool,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -695,6 +704,7 @@ fn fix_last_word(
         llm,
         languagetool,
         provider,
+        lt_fallback,
     ) else {
         return;
     };
@@ -771,11 +781,13 @@ const NEARBY_WORD_MAX_CHARS: i32 = 30;
 /// [`NEARBY_WORD_MAX_CHARS`] by default, or the entire buffer
 /// when [`capture::caret_suspect_flag`] is set (a recent mouse
 /// click means the buffer caret may be far from the visible
-/// cursor). On any LLM failure falls back to Spellbook so the
-/// chord never silently no-ops. Returns `None` after firing the
-/// "nothing to do" toast and logging — callers exit without
-/// emitting.
+/// cursor). On an LLM miss, falls back to LanguageTool when
+/// `lt_fallback` is set and a server is configured, otherwise
+/// straight to Spellbook — so the chord never silently no-ops.
+/// Returns `None` after firing the "nothing to do" toast and
+/// logging — callers exit without emitting.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // provider-routing context; see also capture.rs
 fn pick_word_fix(
     buffer: &hyprcorrect_core::Buffer,
     at: &hyprcorrect_core::WordAtCaret,
@@ -784,6 +796,7 @@ fn pick_word_fix(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
+    lt_fallback: bool,
 ) -> Option<WordFixPlan> {
     use std::sync::atomic::Ordering;
 
@@ -812,7 +825,12 @@ fn pick_word_fix(
         );
     }
 
-    // Primary pass: the picked word at the caret.
+    // Primary pass: the picked word at the caret. Each branch either
+    // returns a finished plan / "nothing to do", or sets `run_lt` to
+    // route through LanguageTool next — as the selected provider, or as
+    // the LLM-miss fallback when the user enabled it. Anything not
+    // handled here drops to the Spellbook tail below.
+    let mut run_lt = false;
     if use_llm {
         let llm = llm.expect("checked above");
         match llm.fix_word_in_context(&sentence, &at.word) {
@@ -840,81 +858,62 @@ fn pick_word_fix(
                 return None;
             }
             Err(e) => {
-                eprintln!("hyprcorrect: word-fix LLM failed ({e}) — falling back to spellbook");
-                notify_warning(
-                    "LLM unavailable",
-                    &format!("Falling back to Spellbook for {bracketed}."),
-                );
-                // Fall through to spellbook for both primary and nearby.
+                // Prefer LanguageTool over Spellbook when the user
+                // enabled the fallback and a server is configured.
+                if lt_fallback && languagetool.is_some() {
+                    eprintln!(
+                        "hyprcorrect: word-fix LLM failed ({e}) — trying LanguageTool fallback"
+                    );
+                    run_lt = true;
+                } else {
+                    eprintln!("hyprcorrect: word-fix LLM failed ({e}) — falling back to spellbook");
+                    notify_warning(
+                        "LLM unavailable",
+                        &format!("Falling back to Spellbook for {bracketed}."),
+                    );
+                }
             }
         }
     } else if default == ProviderId::Llm {
-        eprintln!(
-            "hyprcorrect: word-fix — default provider is LLM but no key configured; falling back to spellbook"
-        );
-        notify_warning(
-            "LLM API key not set",
-            "Open Preferences → Providers → LLM and paste your Anthropic API key.",
-        );
-    } else if default == ProviderId::LanguageTool
-        && let Some(lt) = languagetool
-    {
-        // Send the *sentence*, not the bare word, so LT's homonym /
-        // confusable rules (their/there/they're, your/you're, …) can
-        // fire. Then pick the first match whose span overlaps the
-        // target word's position inside the sentence.
-        //
-        // `primary_sentence` carries the buffer-byte range, so the
-        // target's in-sentence position is a subtraction —
-        // `PrimaryTarget` already holds buffer-byte positions.
-        let primary_sentence = buffer.sentence_containing(buffer.caret());
-        let target_in_sentence = primary_sentence
-            .as_ref()
-            .and_then(|s| word_in_sentence_bytes(s, primary.byte_start, primary.byte_end));
-        // Per-sentence corrections cache shared with the nearby
-        // scan: any nearby word whose containing sentence we've
-        // already checked reuses the result.
-        let mut sentence_cache = SentenceCache::new();
-        match lt.check_text(&sentence) {
-            Ok(corrections) => {
-                if let Some(s) = primary_sentence.as_ref() {
-                    sentence_cache.seed(s.buffer_byte_start, corrections.clone());
-                }
-                let pick = match &target_in_sentence {
-                    Some(range) => first_overlap_suggestion(&corrections, range),
-                    // No sentence context (very short buffer, etc.):
-                    // fall back to the old behavior of taking whatever
-                    // LT found first.
-                    None => corrections
-                        .iter()
-                        .find_map(|c| c.suggestions.first().cloned()),
-                };
-                if let Some(fix) = pick
-                    && fix != at.word
-                {
-                    eprintln!(
-                        "hyprcorrect: word-fix — LT picked {:?} for {:?} (with sentence context)",
-                        fix, at.word
-                    );
-                    return Some(plan_for(&primary, fix, bracketed, ProviderId::LanguageTool));
-                }
-                eprintln!(
-                    "hyprcorrect: word-fix — LT left {:?} unchanged, scanning nearby",
-                    at.word
-                );
-                if let Some(plan) =
-                    scan_nearby_lt(buffer, &at.word, lt, max_chars, &mut sentence_cache)
-                {
-                    return Some(plan);
-                }
+        if lt_fallback && languagetool.is_some() {
+            eprintln!(
+                "hyprcorrect: word-fix — default provider is LLM but no key configured; trying LanguageTool fallback"
+            );
+            run_lt = true;
+        } else {
+            eprintln!(
+                "hyprcorrect: word-fix — default provider is LLM but no key configured; falling back to spellbook"
+            );
+            notify_warning(
+                "LLM API key not set",
+                "Open Preferences → Providers → LLM and add your API key.",
+            );
+        }
+    } else if default == ProviderId::LanguageTool {
+        if languagetool.is_some() {
+            run_lt = true;
+        } else {
+            eprintln!(
+                "hyprcorrect: word-fix — default provider is LanguageTool but it isn't configured; falling back to spellbook"
+            );
+            notify_warning(
+                "LanguageTool not configured",
+                "Open Preferences → Providers → LanguageTool, enable it, and set the URL.",
+            );
+        }
+    }
+
+    if run_lt && let Some(lt) = languagetool {
+        match try_languagetool_word_fix(buffer, at, &sentence, &primary, bracketed, lt, max_chars) {
+            LtWordOutcome::Fixed(plan) => return Some(plan),
+            LtWordOutcome::NothingFound => {
                 notify_info(
                     "Nothing to correct",
                     &format!("LanguageTool thinks {bracketed} (and nearby) are fine."),
                 );
                 return None;
             }
-            Err(e) => {
-                eprintln!("hyprcorrect: word-fix LT failed ({e}) — falling back to spellbook");
+            LtWordOutcome::Failed => {
                 notify_warning(
                     "LanguageTool unavailable",
                     &format!("Falling back to Spellbook for {bracketed}."),
@@ -922,14 +921,6 @@ fn pick_word_fix(
                 // Fall through to spellbook.
             }
         }
-    } else if default == ProviderId::LanguageTool {
-        eprintln!(
-            "hyprcorrect: word-fix — default provider is LanguageTool but it isn't configured; falling back to spellbook"
-        );
-        notify_warning(
-            "LanguageTool not configured",
-            "Open Preferences → Providers → LanguageTool, enable it, and set the URL.",
-        );
     }
 
     if let Some(fix) = spellbook_pick(spell, &at.word) {
@@ -947,6 +938,92 @@ fn pick_word_fix(
         &format!("Spellbook didn't find an error in {bracketed} or nearby."),
     );
     None
+}
+
+/// Result of a LanguageTool word-fix attempt — see
+/// [`try_languagetool_word_fix`]. The caller turns this into the user
+/// toasts so the wording can reflect whether LanguageTool was the
+/// selected provider or the LLM-miss fallback.
+#[cfg(target_os = "linux")]
+enum LtWordOutcome {
+    /// LanguageTool produced a fix — here's the emit plan.
+    Fixed(WordFixPlan),
+    /// LanguageTool ran cleanly but flagged nothing to change.
+    NothingFound,
+    /// The LanguageTool call itself failed (network, server, …).
+    Failed,
+}
+
+/// Try to fix the caret word — and, failing that, a nearby word —
+/// through LanguageTool, sending the whole `sentence` as context so
+/// confusable rules (their/there/they're, your/you're) can fire. Picks
+/// the first match whose span overlaps the target's position in the
+/// sentence. Logs its own decisions but leaves user-facing toasts to the
+/// caller. Shared by the `default == LanguageTool` path and the
+/// LLM-miss fallback.
+#[cfg(target_os = "linux")]
+fn try_languagetool_word_fix(
+    buffer: &hyprcorrect_core::Buffer,
+    at: &hyprcorrect_core::WordAtCaret,
+    sentence: &str,
+    primary: &PrimaryTarget,
+    bracketed: &str,
+    lt: &hyprcorrect_core::LanguageToolProvider,
+    max_chars: i32,
+) -> LtWordOutcome {
+    use hyprcorrect_core::ProviderId;
+    // `primary_sentence` carries the buffer-byte range, so the target's
+    // in-sentence position is a subtraction — `PrimaryTarget` already
+    // holds buffer-byte positions.
+    let primary_sentence = buffer.sentence_containing(buffer.caret());
+    let target_in_sentence = primary_sentence
+        .as_ref()
+        .and_then(|s| word_in_sentence_bytes(s, primary.byte_start, primary.byte_end));
+    // Per-sentence corrections cache shared with the nearby scan: any
+    // nearby word whose containing sentence we've already checked reuses
+    // the result.
+    let mut sentence_cache = SentenceCache::new();
+    match lt.check_text(sentence) {
+        Ok(corrections) => {
+            if let Some(s) = primary_sentence.as_ref() {
+                sentence_cache.seed(s.buffer_byte_start, corrections.clone());
+            }
+            let pick = match &target_in_sentence {
+                Some(range) => first_overlap_suggestion(&corrections, range),
+                // No sentence context (very short buffer, etc.): take
+                // whatever LT found first.
+                None => corrections
+                    .iter()
+                    .find_map(|c| c.suggestions.first().cloned()),
+            };
+            if let Some(fix) = pick
+                && fix != at.word
+            {
+                eprintln!(
+                    "hyprcorrect: word-fix — LT picked {:?} for {:?} (with sentence context)",
+                    fix, at.word
+                );
+                return LtWordOutcome::Fixed(plan_for(
+                    primary,
+                    fix,
+                    bracketed,
+                    ProviderId::LanguageTool,
+                ));
+            }
+            eprintln!(
+                "hyprcorrect: word-fix — LT left {:?} unchanged, scanning nearby",
+                at.word
+            );
+            match scan_nearby_lt(buffer, &at.word, lt, max_chars, &mut sentence_cache) {
+                Some(plan) => LtWordOutcome::Fixed(plan),
+                None => LtWordOutcome::NothingFound,
+            }
+        }
+        Err(e) => {
+            eprintln!("hyprcorrect: word-fix LT failed ({e})");
+            LtWordOutcome::Failed
+        }
+    }
 }
 
 /// First spellbook suggestion for `word`, or `None` if the word
@@ -1358,6 +1435,7 @@ fn start_review(
     smart: hyprcorrect_core::ProviderId,
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
+    lt_fallback: bool,
 ) {
     use hyprcorrect_core::runtime::{ReviewRequest, write_review_request};
     let Some(at) = buffer.sentence_at_caret() else {
@@ -1393,8 +1471,14 @@ fn start_review(
     }
     spawn_review_window();
 
-    let (corrected, _used_provider, suggestions) =
-        correct_sentence_with_suggestions(&at.sentence, smart, llm, languagetool, provider);
+    let (corrected, _used_provider, suggestions) = correct_sentence_with_suggestions(
+        &at.sentence,
+        smart,
+        llm,
+        languagetool,
+        provider,
+        lt_fallback,
+    );
     if corrected == at.sentence {
         eprintln!("hyprcorrect: review-build — no changes; popup will close");
     } else {
@@ -1433,6 +1517,7 @@ fn reprocess_review_with_llm(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     provider: &hyprcorrect_core::OfflineProvider,
+    lt_fallback: bool,
 ) {
     use hyprcorrect_core::ProviderId;
     use hyprcorrect_core::runtime::{read_review_request, write_review_request};
@@ -1464,6 +1549,7 @@ fn reprocess_review_with_llm(
         llm,
         languagetool,
         provider,
+        lt_fallback,
     );
     eprintln!(
         "hyprcorrect: review-llm — LLM corrected ({} chars): {:?}, {} suggestion set(s)",
@@ -1672,17 +1758,23 @@ fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmP
     }
 }
 
-/// Build the LanguageTool provider when the user has the smart path
-/// set to it and the URL is non-empty. Same non-fatal contract as
-/// `build_llm`.
+/// Build the LanguageTool provider when the user either routes a path to
+/// it (smart/default) or wants it as the LLM-miss fallback
+/// (`behavior.fallback_to_languagetool`). Nothing to build unless it's
+/// enabled, so a disabled LanguageTool short-circuits without noise even
+/// when the fallback toggle is on (the common case). Same non-fatal
+/// contract as `build_llm`.
 #[cfg(target_os = "linux")]
 fn build_languagetool(
     config: &hyprcorrect_core::Config,
 ) -> Option<hyprcorrect_core::LanguageToolProvider> {
     use hyprcorrect_core::{LanguageToolProvider, ProviderId};
-    if config.providers.smart != ProviderId::LanguageTool
-        && config.providers.default != ProviderId::LanguageTool
-    {
+    if !config.providers.languagetool.enabled {
+        return None;
+    }
+    let selected = config.providers.smart == ProviderId::LanguageTool
+        || config.providers.default == ProviderId::LanguageTool;
+    if !selected && !config.behavior.fallback_to_languagetool {
         return None;
     }
     match LanguageToolProvider::from_config(&config.providers.languagetool) {
@@ -1727,6 +1819,7 @@ fn fix_last_sentence(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     pause_per_backspace_ms: u32,
+    lt_fallback: bool,
 ) {
     use hyprcorrect_platform::linux::emit;
 
@@ -1743,8 +1836,14 @@ fn fix_last_sentence(
         llm.is_some(),
         languagetool.is_some(),
     );
-    let (corrected, used_provider) =
-        correct_sentence(&at.sentence, smart, llm, languagetool, provider);
+    let (corrected, used_provider) = correct_sentence(
+        &at.sentence,
+        smart,
+        llm,
+        languagetool,
+        provider,
+        lt_fallback,
+    );
     if corrected == at.sentence {
         eprintln!("hyprcorrect: sentence-fix — provider returned the same text, nothing to emit");
         return;
@@ -1859,8 +1958,12 @@ fn correct_sentence(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
+    lt_fallback: bool,
 ) -> (String, hyprcorrect_core::ProviderId) {
     use hyprcorrect_core::ProviderId;
+    // LanguageTool is only consulted as an LLM-miss fallback when the
+    // user enabled it; otherwise an LLM miss drops straight to Spellbook.
+    let lt_after_llm = languagetool.filter(|_| lt_fallback);
     match smart {
         ProviderId::Llm => match llm {
             Some(llm) => match llm.rewrite(text) {
@@ -1869,7 +1972,7 @@ fn correct_sentence(
                     let msg = format!("LLM call failed: {e}");
                     eprintln!("hyprcorrect: {msg} — falling back");
                     notify_warning("LLM unavailable", &msg);
-                    llm_unavailable_fallback(text, languagetool, spell)
+                    llm_unavailable_fallback(text, lt_after_llm, spell)
                 }
             },
             None => {
@@ -1878,7 +1981,7 @@ fn correct_sentence(
                            Providers → LLM.";
                 eprintln!("hyprcorrect: {msg} — falling back");
                 notify_warning("LLM API key not set", msg);
-                llm_unavailable_fallback(text, languagetool, spell)
+                llm_unavailable_fallback(text, lt_after_llm, spell)
             }
         },
         ProviderId::LanguageTool => match languagetool {
@@ -1919,6 +2022,7 @@ fn correct_sentence_with_suggestions(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     spell: &hyprcorrect_core::OfflineProvider,
+    lt_fallback: bool,
 ) -> (
     String,
     hyprcorrect_core::ProviderId,
@@ -1931,6 +2035,9 @@ fn correct_sentence_with_suggestions(
         let (corrected, suggestions) = apply_with_suggestions(text, spell.check_text(text));
         (corrected, ProviderId::Spellbook, suggestions)
     };
+    // LanguageTool is only consulted as an LLM-miss fallback when the
+    // user enabled it; otherwise an LLM miss drops straight to Spellbook.
+    let lt_after_llm = languagetool.filter(|_| lt_fallback);
     match smart {
         ProviderId::Llm => match llm {
             Some(llm) => match llm.rewrite_with_alternatives(text) {
@@ -1942,7 +2049,7 @@ fn correct_sentence_with_suggestions(
                     let msg = format!("LLM call failed: {e}");
                     eprintln!("hyprcorrect: {msg} — falling back");
                     notify_warning("LLM unavailable", &msg);
-                    llm_unavailable_fallback_with_suggestions(text, languagetool, spell)
+                    llm_unavailable_fallback_with_suggestions(text, lt_after_llm, spell)
                 }
             },
             None => {
@@ -1951,7 +2058,7 @@ fn correct_sentence_with_suggestions(
                            Providers → LLM.";
                 eprintln!("hyprcorrect: {msg} — falling back");
                 notify_warning("LLM API key not set", msg);
-                llm_unavailable_fallback_with_suggestions(text, languagetool, spell)
+                llm_unavailable_fallback_with_suggestions(text, lt_after_llm, spell)
             }
         },
         ProviderId::LanguageTool => match languagetool {

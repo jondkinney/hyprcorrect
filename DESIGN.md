@@ -328,13 +328,20 @@ Shipped implementations:
 | Provider | Locality | Use | Notes |
 |---|---|---|---|
 | **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
-| **LLM** (Claude/OpenAI/…) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. Preferences stores **up to 5 hosted providers** as tabs (one per backend), each with its own model and OS-keychain key (`llm.<backend>`); the **active** provider is the first in the list (an *Active* checkbox move-to-front reorders, MRU-style) and is the one `ProviderId::Llm` uses. The Backend/Model fields are editable combo boxes (pick a suggestion or type your own). Only the Anthropic backend is wired today; other backends can be configured (keys pre-staged) but fall back to the offline provider until their integration lands — the UI flags this inline. |
+| **LLM** (Claude/OpenAI/…) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. Preferences stores **up to 5 hosted providers** as tabs (one per backend), each with its own model and OS-keychain key (`llm.<backend>`); the **active** provider is the first in the list (an *Active* checkbox move-to-front reorders, MRU-style) and is the one `ProviderId::Llm` uses. The Backend/Model fields are editable combo boxes (pick a suggestion or type your own). Three request shapes cover every backend: **Anthropic** Messages, **OpenAI-compatible** Chat Completions (`openai`, `openrouter`, `mistral`, `groq`, `deepseek`, `xai`, and a custom `openai-compatible` endpoint — one code path, different base URLs), and **Gemini** `generateContent`. The `openai-compatible` backend takes a user-supplied **Base URL** (persisted in `config.toml`) so it can target a local Ollama / LM Studio / vLLM server or any other OpenAI-style API; its API key is optional (local servers need none). An unrecognized typed-in backend is the only thing that still falls back to the offline provider — the UI flags that inline. |
 | **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL with `level=picky`. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. Real-word confusions (`wear`/`where`) need the server's optional **n-gram** dataset (~8.4 GB), tracked separately from the container: a Preferences *Download n-grams* button streams + unzips it to the app data dir (progress + cancel) and recreates the container with it mounted (`langtool_languageModel`), or a folder field accepts data you already have. The chosen folder is persisted to `config.toml` (`ngram_dir`) when enabled, and — since the recreated container outlives the prefs — recovered from the container's `/ngrams` mount if the config ever loses it, so the UI doesn't forget a path the server is still serving. Without n-grams those confusions are missed by design (the LLM-escalation button is the alternative). |
 
 **Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key
 is set, else spellbook). Offline-first-then-LLM-on-demand is a config
-option. This offline+LLM split is deliberate: spellbook kills obvious
+option. **Fallback chain:** when a path routed to the LLM can't run — no
+key, an unwired/typed-in backend, or the call fails — the daemon prefers
+a configured LanguageTool server over the offline spellbook, gated by the
+**Behavior → "Try LanguageTool before Spellbook"** toggle
+(`behavior.fallback_to_languagetool`, on by default). With the toggle off,
+or LanguageTool disabled, an LLM miss drops straight to spellbook. This
+applies to every path (fix-word, fix-sentence, review). This offline+LLM
+split is deliberate: spellbook kills obvious
 typos with zero latency and zero network; the LLM handles genuinely
 ambiguous corrections that need context — the cases the Google-search
 prototype was really being used for.
@@ -462,8 +469,15 @@ backend = "anthropic"
 model   = "claude-haiku-4-5"
 
 [[providers.llms]]
-backend = "openai"            # configurable but not wired yet → offline fallback
+backend = "openai"
 model   = "gpt-4o-mini"
+
+# A local / custom OpenAI-compatible endpoint (Ollama, LM Studio, …).
+# `base_url` is required for this backend; the key is optional.
+[[providers.llms]]
+backend  = "openai-compatible"
+model    = "llama3.1"
+base_url = "http://localhost:11434/v1"
 
 [providers.languagetool]
 enabled  = false
@@ -472,7 +486,8 @@ url      = "http://localhost:8081"
                                  # from the running container if ever lost
 
 [behavior]
-inter_key_delay_ms = 2
+pause_per_backspace_ms   = 8
+fallback_to_languagetool = true   # LLM miss → LanguageTool before Spellbook
 
 [privacy]
 app_blocklist = ["1password", "keepassxc"]

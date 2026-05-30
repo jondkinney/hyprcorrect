@@ -134,16 +134,28 @@ pub enum ProviderId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// LLM vendor. Today only `"anthropic"` is wired in (M4).
+    /// LLM vendor: one of `anthropic`, `openai`, `gemini`, `openrouter`,
+    /// `mistral`, `groq`, `deepseek`, `xai`, or `openai-compatible` for a
+    /// custom/local OpenAI-style endpoint (see `base_url`). See
+    /// [`crate::llm::is_backend_wired`].
     pub backend: String,
     /// Model name passed to the vendor API.
     pub model: String,
+    /// Base URL for the `openai-compatible` backend — a local
+    /// Ollama / LM Studio server or any other OpenAI-style endpoint, up
+    /// to but not including `/chat/completions`
+    /// (e.g. `http://localhost:11434/v1`). The named cloud backends
+    /// ignore it and use their own built-in URLs, so it's `None` for
+    /// them and omitted from the TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             backend: "anthropic".into(),
             model: "claude-haiku-4-5".into(),
+            base_url: None,
         }
     }
 }
@@ -204,6 +216,15 @@ pub struct Behavior {
     /// word-edit (Tab) mode. `Ctrl+E` still toggles between the two — so
     /// when this is on, `Ctrl+E` flips *to* word-edit mode.
     pub review_starts_in_vim: bool,
+
+    /// When a fix routed to the LLM can't run — no API key, an
+    /// unsupported/unwired backend, or the network call itself fails —
+    /// try a configured LanguageTool server before dropping to the
+    /// offline Spellbook. Only has an effect when LanguageTool is
+    /// enabled with a URL; otherwise the fix falls straight through to
+    /// Spellbook either way. On by default so a configured LanguageTool
+    /// is preferred over the offline dictionary.
+    pub fallback_to_languagetool: bool,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -211,6 +232,7 @@ impl Default for Behavior {
             pause_per_backspace_ms: 8,
             reset_keys: ResetKeys::default(),
             review_starts_in_vim: false,
+            fallback_to_languagetool: true,
         }
     }
 }
@@ -390,10 +412,18 @@ fix_word = "CTRL+J"
             LlmConfig {
                 backend: "anthropic".into(),
                 model: "claude-haiku-4-5".into(),
+                base_url: None,
             },
             LlmConfig {
                 backend: "openai".into(),
                 model: "gpt-4o-mini".into(),
+                base_url: None,
+            },
+            // A custom OpenAI-compatible endpoint carries its base URL.
+            LlmConfig {
+                backend: "openai-compatible".into(),
+                model: "llama3.1".into(),
+                base_url: Some("http://localhost:11434/v1".into()),
             },
         ];
         let text = toml::to_string_pretty(&cfg).unwrap();
