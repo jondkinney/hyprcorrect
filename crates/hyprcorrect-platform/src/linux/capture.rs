@@ -781,8 +781,9 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, triggers: &[TriggerSpec]
 /// modifier-only presses so prefs can keep recording until the user
 /// hits a real key.
 ///
-/// Format matches [`hyprcorrect_core::Chord::parse`] exactly, e.g.
-/// `"SUPER+CTRL+SHIFT+ALT+F"` or `"CTRL+SPACE"` or bare `"F1"`.
+/// Format matches [`hyprcorrect_core::Chord::parse`] exactly and uses
+/// the canonical modifier order, e.g.
+/// `"CTRL+SHIFT+ALT+SUPER+F"` or `"CTRL+SPACE"` or bare `"F1"`.
 fn chord_from_state(state: &xkb::State, keycode: xkb::Keycode) -> Option<String> {
     let sym = state.key_get_one_sym(keycode).raw();
     if is_modifier_keysym(sym) {
@@ -791,12 +792,16 @@ fn chord_from_state(state: &xkb::State, keycode: xkb::Keycode) -> Option<String>
     let key_token = chord_key_token(sym)?;
 
     let active = |m: &str| state.mod_name_is_active(m, xkb::STATE_MODS_EFFECTIVE);
+    // Canonical order — CTRL, SHIFT, ALT, SUPER — matching
+    // `hyprcorrect_core::Chord::Display` and `hyprland_modifiers` so a
+    // freshly recorded chord round-trips to the same string the rest of
+    // the app renders.
     let mut parts: Vec<&str> = Vec::new();
-    if active(xkb::MOD_NAME_SHIFT) {
-        parts.push("SHIFT");
-    }
     if active(xkb::MOD_NAME_CTRL) {
         parts.push("CTRL");
+    }
+    if active(xkb::MOD_NAME_SHIFT) {
+        parts.push("SHIFT");
     }
     if active(xkb::MOD_NAME_ALT) {
         parts.push("ALT");
