@@ -2624,28 +2624,7 @@ impl PrefsApp {
 /// we want a rounded, contained pill. Allocates a click-sized rect
 /// and paints the selection backdrop + label ourselves.
 fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    let height = 32.0;
-    let response = ui.allocate_response(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::click(),
-    );
-    let visuals = ui.style().interact_selectable(&response, selected);
-    if selected || response.hovered() {
-        ui.painter().rect_filled(
-            response.rect.expand(-2.0),
-            egui::CornerRadius::same(6),
-            visuals.bg_fill,
-        );
-    }
-    let text_pos = response.rect.left_center() + egui::vec2(12.0, 0.0);
-    ui.painter().text(
-        text_pos,
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(14.0),
-        visuals.text_color(),
-    );
-    response
+    kanso::widgets::nav_item(ui, selected, label)
 }
 
 /// Add a [`egui::TextEdit`] with a visible border in its *non-focused*
@@ -2688,7 +2667,7 @@ fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response 
 /// Bold-ish label introducing a setting. Slightly larger than the
 /// caption text below the input.
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).strong().size(15.0));
+    kanso::widgets::field_label(ui, text);
 }
 
 /// A [`field_label`] with a trailing `(i)` info icon whose tooltip
@@ -2724,12 +2703,9 @@ const CAPTION_SIZE: f32 = 13.5;
 const CAPTION_LINE_HEIGHT: f32 = 20.0;
 
 fn caption(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(CAPTION_SIZE)
-            .line_height(Some(CAPTION_LINE_HEIGHT))
-            .color(egui::Color32::from_gray(170)),
-    );
+    // kanso's caption renders plain muted text and parses `backtick` spans
+    // into inline code pills — a superset of this one.
+    kanso::widgets::caption(ui, text);
 }
 
 /// Like [`caption`] but renders backtick-delimited spans as inline code
@@ -2738,108 +2714,9 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 /// a tight y-range hugging the glyph metrics (not the full row height) so
 /// they sit centered on the text rather than riding high.
 fn caption_with_code(ui: &mut egui::Ui, text: &str) {
-    use egui::text::LayoutJob;
-    // `valign: Center` keeps the (smaller, monospace) code glyphs centered
-    // on the plain text's line instead of sitting on its baseline.
-    let plain = egui::TextFormat {
-        font_id: egui::FontId::proportional(CAPTION_SIZE),
-        color: egui::Color32::from_gray(170),
-        line_height: Some(CAPTION_LINE_HEIGHT),
-        valign: egui::Align::Center,
-        ..Default::default()
-    };
-    let code = egui::TextFormat {
-        font_id: egui::FontId::monospace(CAPTION_SIZE - 1.0),
-        color: egui::Color32::from_gray(225),
-        line_height: Some(CAPTION_LINE_HEIGHT),
-        valign: egui::Align::Center,
-        ..Default::default()
-    };
-    // A no-break space inside each pill pads the backdrop a glyph-width
-    // past the code text on each side without opening a wrap point.
-    const NBSP: char = '\u{00A0}';
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = ui.available_width();
-    let mut in_code = false;
-    let mut buf = String::new();
-    let flush = |job: &mut LayoutJob, buf: &mut String, in_code: bool| {
-        if buf.is_empty() {
-            return;
-        }
-        if in_code {
-            job.append(&format!("{NBSP}{buf}{NBSP}"), 0.0, code.clone());
-        } else {
-            job.append(buf, 0.0, plain.clone());
-        }
-        buf.clear();
-    };
-    for c in text.chars() {
-        if c == '`' {
-            flush(&mut job, &mut buf, in_code);
-            in_code = !in_code;
-        } else {
-            buf.push(c);
-        }
-    }
-    flush(&mut job, &mut buf, in_code);
-
-    let galley = ui.fonts(|f| f.layout_job(job));
-    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
-    let origin = rect.min;
-    let painter = ui.painter();
-    let bg_color = egui::Color32::from_gray(48);
-    // Code spans are marked by the NBSP padding injected above.
-    type CodeRun = (f32, f32, f32, f32); // (x0, x1, y_min, y_max)
-    for row in &galley.rows {
-        let row_rect = row.rect();
-        let mut run: Option<CodeRun> = None;
-        let mut in_run = false;
-        let flush_run = |run: &mut Option<CodeRun>| {
-            if let Some((x0, x1, y_min, y_max)) = run.take()
-                && y_min.is_finite()
-                && y_max.is_finite()
-            {
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x0 + 1.0, y_min - 2.0),
-                        egui::pos2(x1 - 1.0, y_max + 1.0),
-                    ),
-                    3.0,
-                    bg_color,
-                );
-            }
-        };
-        for glyph in &row.glyphs {
-            let x0 = origin.x + row_rect.min.x + glyph.pos.x;
-            let x1 = x0 + glyph.size().x;
-            let baseline = origin.y + row_rect.min.y + glyph.pos.y;
-            let gy_min = baseline - glyph.font_ascent;
-            let gy_max = baseline + (glyph.font_height - glyph.font_ascent);
-            if glyph.chr == NBSP {
-                match run {
-                    Some((_, ref mut x_end, _, _)) => *x_end = x1,
-                    None => run = Some((x0, x1, f32::INFINITY, f32::NEG_INFINITY)),
-                }
-                if in_run {
-                    in_run = false;
-                    flush_run(&mut run);
-                } else {
-                    in_run = true;
-                }
-            } else if in_run {
-                match run {
-                    Some((_, ref mut x_end, ref mut y_min, ref mut y_max)) => {
-                        *x_end = x1;
-                        *y_min = y_min.min(gy_min);
-                        *y_max = y_max.max(gy_max);
-                    }
-                    None => run = Some((x0, x1, gy_min, gy_max)),
-                }
-            }
-        }
-        flush_run(&mut run);
-    }
-    painter.galley(origin, galley, egui::Color32::PLACEHOLDER);
+    // Was a ~90-line glyph-metric pill painter, byte-for-byte vernier's;
+    // now the shared design system owns it.
+    kanso::widgets::caption(ui, text);
 }
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
