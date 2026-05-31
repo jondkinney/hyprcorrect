@@ -603,6 +603,9 @@ fn spawn_prefs_window() {
 /// section (e.g. `"providers"` so the user can add an LLM key). The
 /// section is passed via `$HYPRCORRECT_PREFS_SECTION` rather than a CLI
 /// flag to keep the subcommand surface unchanged.
+// Linux-only: both callers (spawn_prefs_window, reprocess_review_with_llm)
+// are Linux-gated, so this would be dead code on other targets.
+#[cfg(target_os = "linux")]
 fn spawn_prefs_window_section(section: Option<&str>) {
     use std::process::{Command, Stdio};
     let Ok(exe) = std::env::current_exe() else {
@@ -1519,6 +1522,10 @@ fn start_review(
 /// with the LLM's correction + suggestions. With no LLM configured,
 /// open Preferences at the Providers section instead so the user can add
 /// one (the popup keeps its "Ask LLM" button — progressive setup).
+// Linux-only: invoked solely from the (Linux-gated) daemon dispatch in
+// `run_daemon`, and calls Linux-only helpers (notify_warning,
+// correct_sentence_with_suggestions).
+#[cfg(target_os = "linux")]
 fn reprocess_review_with_llm(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
@@ -1600,11 +1607,6 @@ fn focused_monitor_width() -> f32 {
     let width = monitor["width"].as_f64().unwrap_or(0.0) as f32;
     let scale = monitor["scale"].as_f64().unwrap_or(1.0) as f32;
     if scale > 0.0 { width / scale } else { width }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn focused_monitor_width() -> f32 {
-    0.0
 }
 
 /// Install per-class Hyprland windowrules so the review popup
