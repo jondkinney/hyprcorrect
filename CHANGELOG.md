@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/jondkinney/hyprcorrect/compare/v0.1.3...v0.2.0) - 2026-05-31
+
+### Added
+
+- *(providers)* wire all LLM backends + LanguageTool fallback toggle
+- *(review)* key glyphs, per-command vim help, open prefs on Ask LLM
+- *(prefs)* vim-start review option; tiling; n-gram + UI polish
+- *(prefs)* multi-provider LLM config with tabs, per-backend keys
+- *(review)* escalate to the LLM on demand + LanguageTool n-gram install
+- *(review)* word-diff column alignment, adaptive width, wrap line-height
+- *(review)* responsive popup, revert-to-original, suggestion list
+- *(review)* gather ranked per-word backup suggestions
+- *(review)* per-option word definitions (offline default, online opt-in)
+- *(prefs)* one-click "Download n-grams" button
+- *(languagetool)* request the picky rule level
+- *(emit)* type newlines as Shift+Enter so multi-line edits don't submit
+- *(prefs)* remove the "Clear" links from the Hotkeys page
+- *(review)* Add word definition line
+- *(prefs)* cap floating window width at 900 via compositor resize
+- *(prefs)* editable combo opens below the field; styling pass
+- *(prefs)* show app-downloaded n-grams (read-only) with a Remove option
+- *(prefs)* track n-grams separately from the LanguageTool container
+- *(review)* vim spell-suggest (z=), multi-line fix, Esc, field wrap
+- *(review)* column-align the Original in vim mode too
+- *(review)* picking a suggestion advances to the next correction
+- *(vimedit)* undo, redo, and repeat
+- *(review)* align each correction directly under the word it replaces
+- *(vimedit)* Home and End keys
+- *(review)* backup-suggestion dropdown under the focused field
+- *(vimedit)* virtualedit-style vertical navigation
+- *(review)* squiggle underlines + borderless auto-sized fields
+- *(review)* inline word-edit and Ctrl+E vim modes in the review popup
+
+### Fixed
+
+- *(review)* hide "Ask LLM" when the correction is already the LLM's
+- *(prefs)* code-fence class-name caption; drop dead maxsize rule
+- *(prefs)* tile by default; cap floating width; persist n-gram folder
+- *(prefs)* vernier-style code pills; dropdown width; portal float
+- *(hotkeys)* record chord modifiers in canonical CTRL+SHIFT+ALT+SUPER order
+- *(prefs)* widen blocklist app picker so its Add button aligns
+- *(review)* correct vim caret/squiggle anchoring under the 1.5× line-height
+- *(review)* match vim mode's vertical spacing + line-height to word mode
+- *(review)* keep the vim caret tight against a word after cw
+- *(prefs)* render "Reload n-grams" as a framed button
+- *(prefs)* hard-cap floating width via runtime max_size (no overshoot)
+- *(prefs)* uniform 30px controls, fixed float, 900px cap, privacy polish
+- *(prefs)* equal control heights, balanced padding, Save on key row
+- *(prefs)* non-focused border on inputs; right-align Save provider
+- *(prefs)* dropdown width, flush scrollbar, combo height, bar padding
+- *(prefs)* stop combos overflowing the right margin; n-gram Browse + details
+- *(prefs)* cap form column width so inputs don't clip on wide windows
+- *(prefs)* correct LanguageTool URL label — it's the base URL
+- *(review)* size the popup wide enough to keep the sentence on one line
+- *(review)* fold trailing punctuation into a word's column
+
+### Other
+
+- *(prefs)* drop the floating-width cap entirely
+- *(prefs)* tidy Providers page with info icons + framed Remove
+- *(prefs)* clarify the "Reload n-grams" tooltip
+- *(prefs)* move the n-gram folder field below the n-grams controls
+- *(review)* roomier action buttons with a filled primary
+
 ## [0.1.3](https://github.com/jondkinney/hyprcorrect/compare/v0.1.2...v0.1.3) - 2026-05-28
 
 ### Added
