@@ -1939,50 +1939,11 @@ fn provider_radio(
             ],
         );
         if let Some(tip) = llm_tooltip {
-            info_icon(ui).on_hover_text(tip);
+            kanso::widgets::info_icon(ui, tip);
         }
         changed
     })
     .inner
-}
-
-/// Paint a small circle-with-`i` info icon at the current cursor
-/// in `ui`, sized to the row height. Drawn with the egui painter
-/// directly so we don't have to bundle an icon font or SVG just
-/// for one glyph — the bundled Adwaita Sans doesn't include the
-/// Unicode ⓘ codepoint and falls back to a tofu box otherwise.
-/// Caller chains `.on_hover_text(...)` on the returned response
-/// to attach a tooltip.
-fn info_icon(ui: &mut egui::Ui) -> egui::Response {
-    // Size the icon to the body text height so it sits flush
-    // with the "LLM" label next to it, not the larger radio
-    // hit-box.
-    let font_size = egui::TextStyle::Body.resolve(ui.style()).size;
-    let size = font_size;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-    let visuals = ui.visuals();
-    let stroke_color = if response.hovered() {
-        visuals.strong_text_color()
-    } else {
-        visuals.weak_text_color()
-    };
-    let painter = ui.painter();
-    let center = rect.center();
-    let radius = (size * 0.5) - 1.0;
-    painter.circle_stroke(center, radius, egui::Stroke::new(1.0, stroke_color));
-    // The "i" — drawn slightly above center because the glyph
-    // baseline sits low in most fonts.
-    painter.text(
-        center + egui::vec2(0.0, -0.5),
-        egui::Align2::CENTER_CENTER,
-        "i",
-        egui::FontId::proportional(size * 0.75),
-        stroke_color,
-    );
-    response
 }
 
 /// Hosted LLM backends offered in the Add-provider dropdown. The combo is
@@ -2645,7 +2606,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 fn field_label_with_info(ui: &mut egui::Ui, label: &str, tip: &str) {
     ui.horizontal(|ui| {
         field_label(ui, label);
-        info_icon(ui).on_hover_text(tip);
+        kanso::widgets::info_icon(ui, tip);
     });
 }
 
