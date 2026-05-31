@@ -2968,26 +2968,11 @@ fn apply_style(ctx: &egui::Context) {
         style.spacing.scroll.dormant_background_opacity = 0.0;
         style.spacing.scroll.active_background_opacity = 0.0;
         style.spacing.scroll.interact_background_opacity = 0.0;
-        // Every interactive control carries a 1px border at all times (only
-        // its color changes between states) and never expands — so inputs,
-        // buttons, and combo chevrons stay exactly CONTROL_HEIGHT in every
-        // state, with no hover/focus growth.
-        let r = egui::CornerRadius::same(4);
-        let w = &mut style.visuals.widgets;
-        w.noninteractive.corner_radius = r;
-        w.noninteractive.expansion = 0.0;
-        w.inactive.corner_radius = r;
-        w.inactive.expansion = 0.0;
-        w.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(72));
-        w.hovered.corner_radius = r;
-        w.hovered.expansion = 0.0;
-        w.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
-        w.active.corner_radius = r;
-        w.active.expansion = 0.0;
-        w.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
-        w.open.corner_radius = r;
-        w.open.expansion = 0.0;
-        w.open.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
+        // Inputs, buttons, and combo chevrons adopt kanso's control
+        // treatment: a 1px border color-matched to the fill at rest (reads
+        // as borderless), colored on hover/press, never expanding — applied
+        // globally so every direct egui widget picks it up.
+        kanso::theme::control_visuals(&mut style.visuals);
     });
 }
 
