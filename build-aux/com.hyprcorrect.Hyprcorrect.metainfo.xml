@@ -34,6 +34,14 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.2.1" date="2026-05-31">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>gate the daemon review-llm flow to Linux</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-05-31">
       <description>
         <p>Added:</p>
