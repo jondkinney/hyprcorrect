@@ -740,21 +740,18 @@ impl eframe::App for PrefsApp {
                         ui.colored_label(color, &self.status.text);
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 20.0;
-                        if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Save"))
-                            .clicked()
-                        {
-                            self.save();
-                        }
-                        if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Cancel"))
-                            .clicked()
-                        {
-                            self.cancel();
-                        }
-                    });
+                    // The shared design system's settings action bar. Our
+                    // dirty state is multi-source (config + llm_keys +
+                    // autostart), so feed the precomputed flag via
+                    // `from_dirty`; kanso paints the unsaved dot + Cancel/Save.
+                    match kanso::widgets::DirtyFooter::from_dirty(self.dirty())
+                        .revert_label("Cancel")
+                        .show(ui)
+                    {
+                        kanso::widgets::FooterAction::Save => self.save(),
+                        kanso::widgets::FooterAction::Revert => self.cancel(),
+                        kanso::widgets::FooterAction::None => {}
+                    }
                 });
             });
 
@@ -2769,7 +2766,9 @@ pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
     // key glyphs (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣ ↑↓←→), so the chip renders
     // identically on any system without depending on whatever
     // fonts happen to be installed.
-    const ADWAITA_SANS: &[u8] = include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+    // The font bytes come from the shared design system (single source) —
+    // hyprcorrect no longer bundles its own copy.
+    const ADWAITA_SANS: &[u8] = kanso::fonts::ADWAITA_SANS;
     fonts.font_data.insert(
         "shortcut_symbols".into(),
         Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
@@ -2937,43 +2936,14 @@ fn chord_record_error(err: &ClientError) -> String {
 /// Apply hyprcorrect's egui style — larger fonts and more generous
 /// spacing than egui's defaults, mirroring `vernier`'s prefs window.
 fn apply_style(ctx: &egui::Context) {
-    use egui::FontFamily::Proportional;
-    use egui::TextStyle::{Body, Button, Heading, Monospace, Small};
-    ctx.style_mut(|style| {
-        style.text_styles = [
-            (Heading, egui::FontId::new(21.0, Proportional)),
-            (Body, egui::FontId::new(14.0, Proportional)),
-            (
-                Monospace,
-                egui::FontId::new(13.0, egui::FontFamily::Monospace),
-            ),
-            (Button, egui::FontId::new(14.0, Proportional)),
-            (Small, egui::FontId::new(12.0, Proportional)),
-        ]
-        .into();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-        style.spacing.indent = 14.0;
-        // Button height floors to interact_size.y; we force a TextEdit's to
-        // the same value via min_size, so all controls share CONTROL_HEIGHT.
-        style.spacing.interact_size = egui::vec2(40.0, CONTROL_HEIGHT);
-        style.spacing.icon_width = 18.0;
-        style.spacing.icon_spacing = 6.0;
-        // Solid (space-reserving) scrollbar instead of egui's default
-        // floating one, which overlays content — full-width fields and the
-        // combo-box drop buttons were being clipped under the float lane.
-        // Zero the track opacities so the bar area blends into the panel
-        // (only the handle shows).
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
-        style.spacing.scroll.dormant_background_opacity = 0.0;
-        style.spacing.scroll.active_background_opacity = 0.0;
-        style.spacing.scroll.interact_background_opacity = 0.0;
-        // Inputs, buttons, and combo chevrons adopt kanso's control
-        // treatment: a 1px border color-matched to the fill at rest (reads
-        // as borderless), colored on hover/press, never expanding — applied
-        // globally so every direct egui widget picks it up.
-        kanso::theme::control_visuals(&mut style.visuals);
-    });
+    // Type scale, spacing, the solid scrollbar, and corner radius all come
+    // from the shared design system now; control_visuals adds the
+    // input/button border (color-matched at rest, colored on hover/press,
+    // never expanding). Fonts are installed once at startup by
+    // install_glyph_fonts (shared with the review popup), so this stays
+    // font-free and cheap to call per frame.
+    kanso::theme::apply_styles(ctx);
+    ctx.style_mut(|style| kanso::theme::control_visuals(&mut style.visuals));
 }
 
 /// `true` when the daemon's on-disk binary has been replaced since the
