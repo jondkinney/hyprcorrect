@@ -7,6 +7,7 @@
 pub mod buffer;
 pub mod chord;
 pub mod config;
+pub mod definitions;
 pub mod languagetool;
 pub mod llm;
 pub mod providers;
@@ -17,9 +18,10 @@ pub mod secrets;
 pub use buffer::{Buffer, Key, NearbyWord, Sentence, SentenceAtCaret, WordAtCaret};
 pub use chord::{Chord, ChordError};
 pub use config::{
-    Behavior, Config, ConfigError, Hotkeys, LanguageToolConfig, LlmConfig, Privacy, ProviderId,
-    Providers, ResetKeys,
+    Behavior, Config, ConfigError, DefinitionSource, Hotkeys, LanguageToolConfig, LlmConfig,
+    Privacy, ProviderId, Providers, ResetKeys,
 };
+pub use definitions::{define, define_online};
 pub use languagetool::{LanguageToolError, LanguageToolProvider};
 pub use llm::{LlmError, LlmProvider};
 pub use providers::{Context, Correction, CorrectionProvider, OfflineProvider};

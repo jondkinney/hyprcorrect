@@ -19,6 +19,10 @@ toml.workspace = true
 directories.workspace = true
 keyring.workspace = true
 
-# HTTP for network correction providers (LLM, LanguageTool).
+# HTTP for network correction providers (LLM, LanguageTool) and the
+# online definition lookup.
 ureq.workspace = true
 serde_json.workspace = true
+
+# Decompress the bundled WordNet definitions at first lookup.
+flate2.workspace = true

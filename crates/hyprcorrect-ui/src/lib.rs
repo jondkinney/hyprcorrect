@@ -13,8 +13,11 @@ mod apps;
 pub mod autostart;
 mod docker;
 pub mod icon;
+mod ngrams;
 mod prefs;
 mod review;
+mod vimedit;
+mod worddiff;
 
 /// Open the preferences window. Blocks until the user closes it.
 ///

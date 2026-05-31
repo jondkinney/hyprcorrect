@@ -62,12 +62,13 @@ cargo install hyprcorrect
 hyprcorrect install-desktop   # register the icon + launcher entry
 ```
 
-`cargo install` drops only the binary in `~/.cargo/bin`, so
-`install-desktop` writes the app icon and `.desktop` entry into your
-XDG data dir to make hyprcorrect appear in launchers and file
-managers. (The daemon does this on every start too, so it's optional
-— but it's the one explicit step for a launcher entry before the
-first run.)
+`cargo install` drops only the binary in `~/.cargo/bin` — no icon, no
+`.desktop` entry — so on its own hyprcorrect won't appear in launchers
+or file managers. `install-desktop` writes the app icon and `.desktop`
+entry into your XDG data dir. The daemon also does this automatically on
+its **first launch** (once — not on every start), so running the command
+is optional: use it when you want the launcher entry before that first
+run, or to refresh the icon and entry after a rebuild.
 
 ### From source
 

@@ -54,6 +54,18 @@ pub fn review_path() -> PathBuf {
     runtime_dir().join("hyprcorrect.review")
 }
 
+/// Ranked alternative spellings for one corrected word, for the review
+/// popup's per-field suggestion dropdown. `options` is best-first and
+/// the first entry is normally the applied correction; the popup drops
+/// whatever matches the field's current text and shows the rest.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WordSuggestions {
+    /// The corrected word these options belong to.
+    pub word: String,
+    /// Candidate replacements, best first.
+    pub options: Vec<String>,
+}
+
 /// A pending review request — what the user typed, what the smart
 /// provider suggested, and where to emit the result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -79,6 +91,34 @@ pub struct ReviewRequest {
     /// the daemon uses it to update that window's buffer when the
     /// user accepts.
     pub window_address: String,
+    /// Ranked backup suggestions for each changed word, ordered by the
+    /// word's position in `corrected` so it lines up with the popup's
+    /// editable fields. Empty when no provider offered alternatives.
+    #[serde(default)]
+    pub suggestions: Vec<WordSuggestions>,
+    /// `true` while the daemon is still computing the correction (e.g.
+    /// an in-flight LLM call). The popup is spawned immediately in this
+    /// state — showing the original text and a "Checking…" line — and
+    /// re-reads the request until the daemon writes the finished one
+    /// with `pending: false`.
+    #[serde(default)]
+    pub pending: bool,
+    /// Logical width (points) of the monitor the source window sits on,
+    /// so the popup can grow with the sentence up to half the screen.
+    /// Zero when unknown — the popup then falls back to a fixed cap.
+    #[serde(default)]
+    pub screen_width: f32,
+    /// Whether the daemon has an LLM provider configured. The popup shows
+    /// its "Ask LLM" escalation button only when this is true.
+    #[serde(default)]
+    pub llm_available: bool,
+    /// Whether the LLM produced the `corrected` text shown. When `true`
+    /// the popup hides the "Ask LLM" button — the result is already the
+    /// LLM's, so there's nothing to escalate. Keyed on the provider that
+    /// actually produced the correction, so an LLM miss that fell back to
+    /// LanguageTool/Spellbook still offers the button.
+    #[serde(default)]
+    pub from_llm: bool,
 }
 
 /// Write a fresh review request to disk. Overwrites any pending one.

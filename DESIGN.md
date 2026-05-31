@@ -328,13 +328,20 @@ Shipped implementations:
 | Provider | Locality | Use | Notes |
 |---|---|---|---|
 | **spellbook** | in-process, offline | bundled default | Pure-Rust, Hunspell-compatible — one dependency. Spell-check + suggestions over the standard en_US dictionary; instant, English. |
-| **LLM** (Claude/OpenAI) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. |
-| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. |
+| **LLM** (Claude/OpenAI/…) | network | contextual + sentence | Best at ambiguous cases (`vernuer` → `veneer` vs `vernier`) and whole-sentence fixes; needs an API key; ~1s latency. Reference impl: Anthropic, a fast model (e.g. Haiku) with prompt caching. Preferences stores **up to 5 hosted providers** as tabs (one per backend), each with its own model and OS-keychain key (`llm.<backend>`); the **active** provider is the first in the list (an *Active* checkbox move-to-front reorders, MRU-style) and is the one `ProviderId::Llm` uses. The Backend/Model fields are editable combo boxes (pick a suggestion or type your own). Three request shapes cover every backend: **Anthropic** Messages, **OpenAI-compatible** Chat Completions (`openai`, `openrouter`, `mistral`, `groq`, `deepseek`, `xai`, and a custom `openai-compatible` endpoint — one code path, different base URLs), and **Gemini** `generateContent`. The `openai-compatible` backend takes a user-supplied **Base URL** (persisted in `config.toml`) so it can target a local Ollama / LM Studio / vLLM server or any other OpenAI-style API; its API key is optional (local servers need none). An unrecognized typed-in backend is the only thing that still falls back to the offline provider — the UI flags that inline. |
+| **LanguageTool** (HTTP) | network (self-host) | optional | POSTs to a configurable `/v2/check` URL with `level=picky`. Off until a URL is set — for when you run your own server. No bundled Java. Preferences offers an optional one-click *Install with Docker* convenience that pulls `erikvl87/languagetool` and runs it on the configured port; the provider itself remains URL-only and works against any LanguageTool server. Real-word confusions (`wear`/`where`) need the server's optional **n-gram** dataset (~8.4 GB), tracked separately from the container: a Preferences *Download n-grams* button streams + unzips it to the app data dir (progress + cancel) and recreates the container with it mounted (`langtool_languageModel`), or a folder field accepts data you already have. The chosen folder is persisted to `config.toml` (`ngram_dir`) when enabled, and — since the recreated container outlives the prefs — recovered from the container's `/ngrams` mount if the config ever loses it, so the UI doesn't forget a path the server is still serving. Without n-grams those confusions are missed by design (the LLM-escalation button is the alternative). |
 
 **Routing:** "fix last word" → spellbook (instant, local). "fix last
 sentence" / "show options" → the configured smart provider (LLM if a key
 is set, else spellbook). Offline-first-then-LLM-on-demand is a config
-option. This offline+LLM split is deliberate: spellbook kills obvious
+option. **Fallback chain:** when a path routed to the LLM can't run — no
+key, an unwired/typed-in backend, or the call fails — the daemon prefers
+a configured LanguageTool server over the offline spellbook, gated by the
+**Behavior → "Try LanguageTool before Spellbook"** toggle
+(`behavior.fallback_to_languagetool`, on by default). With the toggle off,
+or LanguageTool disabled, an LLM miss drops straight to spellbook. This
+applies to every path (fix-word, fix-sentence, review). This offline+LLM
+split is deliberate: spellbook kills obvious
 typos with zero latency and zero network; the LLM handles genuinely
 ambiguous corrections that need context — the cases the Google-search
 prototype was really being used for.
@@ -349,12 +356,79 @@ hotkey:
 - `fix-last-sentence` — quick, no UI.
 - `review` — open the popup for the last word / N words / sentence.
 
-The **review popup** (egui): shows the text with flagged words marked;
-←/→ or Tab moves between flagged words, ↑/↓ cycles suggestions, Enter
-accepts the current word, a key applies all, Esc cancels. On Wayland it
-is an egui window plus a shipped Hyprland window rule (float/pin/focus)
-for MVP; a real `wlr-layer-shell` surface is a later upgrade. On macOS it
-is a borderless `NSPanel`.
+The **review popup** (egui) opens with the proposed correction shown as
+editable text and has two modes that `Ctrl+E` toggles between. The popup
+opens in word-edit by default, or straight into vim when
+`behavior.review_starts_in_vim` is set (in which case `Ctrl+E` flips to
+word-edit); switching from vim re-diffs the edited sentence so vim edits
+carry into the word fields:
+
+- **Word-edit mode**: the words the corrector *changed* render
+  as inline single-line fields; unchanged words stay static. The first
+  changed word opens focused with its text selected, so typing replaces
+  it. `Tab`/`Shift+Tab` and `←`/`→` move between fields, `Enter` applies,
+  `Esc` cancels. A word-level LCS diff of original vs corrected decides
+  which words are editable (`hyprcorrect-ui/src/worddiff.rs`).
+  The original sentence is shown above the proposed one in monospace,
+  **column-aligned** so each correction sits directly under the word it
+  replaces — the same LCS pairing assigns both rows to a shared column
+  grid, padding words and leaving a blank gap on whichever row inserted
+  or deleted a word (`worddiff::align`). A word's trailing punctuation is
+  folded into its column width (a corrected `well,` shares a column with
+  `well`), so added/removed punctuation can't shove later columns
+  sideways; only whitespace separates columns. Misspellings carry a red
+  squiggle, corrections a blue one. Each focused field shows a ranked
+  **suggestion list** inline below (number keys or `↑`/`↓`+`Enter`;
+  picking one advances to the next correction, or applies on the last).
+  The popup grows with the sentence up to **half the monitor width**
+  (the daemon passes the focused monitor's logical width); longer
+  sentences wrap, with both rows broken at identical columns and ~1.5
+  line-height between wrapped lines. Column widths track each field's
+  *current* length, so a field grown by typing re-wraps with the rest of
+  the line instead of running off the edge.
+- **Vim mode**: the whole sentence becomes a small modal
+  editor — a deliberate *subset* of vim, for when the correction is
+  wrong and needs free-form fixing. NORMAL/INSERT/COMMAND; motions
+  `h l w b e 0 ^ $ j k` / `gg` / `G` / Home / End (with `virtualedit`-style
+  column-keeping `j`/`k` and end-of-line access); edits
+  `x r s S D C dd cc`; operators `d`/`c` over those motions and the
+  `iw`/`aw` text objects (so `ciw`, `dw`, `daw`, with vim's `cw`==`ce`);
+  leading counts; undo `u`, redo `Ctrl+R`, and repeat `.`. `z=` over a
+  word opens the same ranked spell-suggest dropdown as word-edit mode
+  (`1`–`5` / `j`/`k` / arrows + `Enter` choose; picking advances to the
+  next word with suggestions, or applies on the last). `:w`/`:wq`/`:x`
+  and normal-mode `Enter` apply; `:q`/`:q!` *and `Esc` in NORMAL* cancel;
+  `Esc` in INSERT returns to NORMAL; INSERT `Enter` inserts a newline. The
+  Original is shown column-aligned above the editor on the
+  same grid as word-edit mode (the buffer's *display* is space-padded to
+  the columns while the vim cursor/motions keep working on the raw text,
+  via a raw→display index map). It is a self-contained Rust state machine
+  (`hyprcorrect-ui/src/vimedit.rs`), **not** real nvim — chosen to stay
+  in-window, dependency-free, and identical on macOS.
+  **Out of scope (v1):** registers/yank/paste, visual mode, marks, search,
+  ex ranges, and `.`/counts composition beyond a single recorded change.
+
+**Escalate to the LLM.** When the smart provider (LanguageTool/spellbook)
+gets it wrong, an *"Ask LLM"* button — and a configurable chord (default
+`Super+Ctrl+Alt+Shift+L`) — re-run the *original* sentence through the LLM
+and reload the popup with its correction + suggestions. The button is
+always shown (progressive discovery); with no LLM key configured it opens
+Preferences → Providers so the user can add one. The daemon builds the LLM
+provider whenever a key exists (not only when it's the smart/default
+provider), so on-demand escalation works while keeping routine fixes
+offline. Mechanically: the popup/chord writes a `review-llm` action and
+signals; the daemon re-corrects and rewrites the request file with
+`pending` toggled, which the popup notices (it polls the file while idle)
+and reloads.
+
+On apply the popup writes the (possibly edited) sentence back into the
+review-request file and signals the daemon, which performs the emit.
+Newlines in a correction are emitted as Shift+Enter (not a bare Return)
+so a multi-line edit inserts line breaks rather than submitting
+chat-style inputs like the Claude Code prompt. On Wayland it is an egui
+window plus a shipped Hyprland window rule
+(float/pin/focus) for MVP; a real `wlr-layer-shell` surface is a later
+upgrade. On macOS it is a borderless `NSPanel`.
 
 ## Configuration & GUI
 
@@ -366,7 +440,16 @@ is a borderless `NSPanel`.
 - egui preferences window (`hyprcorrect-ui`, pattern from
   `vernier-ui/prefs.rs`), panels: Hotkeys, Providers, Behavior
   (inter-key delay, reset sensitivity), Privacy (app blocklist, password
-  handling), About.
+  handling), About. It opens **tiled** (no float rule) and is freely
+  resizable — we deliberately do **not** cap its floating width. That was
+  tried and abandoned: no clean lever exists on Hyprland. A Wayland
+  `max_size` set via `ViewportBuilder` force-floats the window (breaks
+  tiling); a client self-resize (`ViewportCommand::InnerSize`) is ignored
+  for a mapped window; the `maxsize` *windowrule* is open-time only (doesn't
+  clamp a live drag); a `resizewindowpixel` snap overshoots then animates
+  back; and a *runtime* `MaxInnerSize` does hard-clamp the width but then
+  blocks un-floating and makes the window jump to its forced size on move.
+  Not worth the trade-offs — let it be whatever size.
 
 ```toml
 # config.toml sketch
@@ -378,21 +461,51 @@ review        = "..."
 default = "spellbook"
 smart   = "llm"                # used by fix-last-sentence / review
 
-[providers.llm]
+# Up to 5 LLM providers, one per backend. The FIRST entry is the active
+# one (ProviderId::Llm uses it). Each key lives in the OS keychain at
+# `llm.<backend>`, never here.
+[[providers.llms]]
 backend = "anthropic"
 model   = "claude-haiku-4-5"
-# api key lives in the OS keychain, not here
+
+[[providers.llms]]
+backend = "openai"
+model   = "gpt-4o-mini"
+
+# A local / custom OpenAI-compatible endpoint (Ollama, LM Studio, …).
+# `base_url` is required for this backend; the key is optional.
+[[providers.llms]]
+backend  = "openai-compatible"
+model    = "llama3.1"
+base_url = "http://localhost:11434/v1"
 
 [providers.languagetool]
-enabled = false
-url     = "http://localhost:8081"
+enabled  = false
+url      = "http://localhost:8081"
+# ngram_dir = "/path/to/ngrams"  # set once n-grams are enabled; recovered
+                                 # from the running container if ever lost
 
 [behavior]
-inter_key_delay_ms = 2
+pause_per_backspace_ms   = 8
+fallback_to_languagetool = true   # LLM miss → LanguageTool before Spellbook
+definitions              = "local"  # off | local (bundled WordNet) | online
 
 [privacy]
 app_blocklist = ["1password", "keepassxc"]
 ```
+
+**Word definitions.** The review popup's suggestion dropdown shows the
+definition of the highlighted option (or the applied word) first, on a
+line labeled "Definition:" above the options, updating as you move
+between options. Source is `behavior.definitions`: `local`
+(default) reads a bundled, gzipped WordNet 3.1 gloss set
+(`hyprcorrect-core/assets/definitions-en.tsv.gz`, ~83k single-word
+lemmas, lazily decompressed + looked up in-process) — fully offline;
+`online` queries `api.dictionaryapi.dev` on a worker thread (cached,
+non-blocking) and sends the looked-up word to a third party; `off`
+hides the line. Words WordNet doesn't cover (proper nouns, most function
+words, misspellings) show *no definition*. WordNet's permissive license
+is reproduced in `assets/WORDNET-LICENSE.txt`.
 
 ## Security & privacy
 
@@ -428,7 +541,7 @@ Wayland protocols.
 | **M1 — Linux quick-fix slice** | `evdev` capture + xkb mapping → per-window buffers driven by Hyprland focus events; offline spell-check provider (spellbook); `wtype`-based synthetic input; one hyprctl-bound hotkey signaling `SIGUSR1`; ksni tray; `fix-last-word` working end-to-end on Hyprland incl. terminals. No GUI. Proves the riskiest path. |
 | **M2 — macOS parity** | `CGEventTap` capture, `CGEvent` emulation, Carbon hotkey, TCC permission flow. `fix-last-word` on macOS. Core now runs on both. |
 | **M3 — Config GUI + tray** | egui prefs (Hotkeys / Providers / Behavior / Privacy / About) running standalone via `hyprcorrect prefs`; `config.toml` with serde defaults; `keyring`-backed LLM API key storage; ksni tray expanded with Pause/Resume + Open Preferences + Quit, live status refresh; pause control gates the daemon; `SIGHUP` config reload with safe trigger rebind; daemon PID file for targeted reload. (Linux landed first; the macOS side is a `NSStatusItem` tray + a cfg-gated focus call — the UI itself is platform-independent.) |
-| **M4 — Review popup + sentence mode** | egui popup with keyboard nav; `fix-last-sentence`; multi-word review/apply; LLM provider wired in. |
+| **M4 — Review popup + sentence mode** | egui popup with two edit modes — inline word-field editing and a `Ctrl+E` in-app vim subset — that writes the edited sentence back to the daemon for emit; `fix-last-sentence`; LLM provider wired in. |
 | **M5 — Selection fallback + polish** | Clipboard/selection secondary mode; per-app behavior; inter-key delay tuning; LanguageTool-HTTP provider; IME caveats handled. |
 | **M6 — Packaging** | AUR (source/-bin/-git like `vernier`), macOS dmg (ad-hoc signed), GitHub releases via `release-plz`. Windows remains a stub. |
 

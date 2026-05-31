@@ -59,6 +59,11 @@ pub struct Hotkeys {
     /// correction in a small egui window and waits for Apply / Cancel
     /// before emitting. Empty = unbound.
     pub review: String,
+    /// Accelerator that, while the review popup is open, re-processes the
+    /// original sentence through the LLM and reloads the popup with its
+    /// suggestions — for escalating past a weak LanguageTool/spellbook
+    /// correction without calling the LLM on every fix. Empty = unbound.
+    pub review_llm: String,
 }
 impl Default for Hotkeys {
     fn default() -> Self {
@@ -66,9 +71,16 @@ impl Default for Hotkeys {
             fix_word: "CTRL+SHIFT+ALT+SUPER+F".into(),
             fix_sentence: "CTRL+SHIFT+ALT+SUPER+S".into(),
             review: "CTRL+SHIFT+ALT+SUPER+R".into(),
+            review_llm: "CTRL+SHIFT+ALT+SUPER+L".into(),
         }
     }
 }
+
+/// Most LLM provider tabs the prefs UI lets you configure. Each is a
+/// distinct hosted backend (Anthropic, OpenAI, …) with its own model and
+/// keychain entry. The prefs UI enforces this cap and one-tab-per-backend
+/// uniqueness when adding providers.
+pub const MAX_LLM_PROVIDERS: usize = 5;
 
 /// Provider routing settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,7 +90,13 @@ pub struct Providers {
     pub default: ProviderId,
     /// Provider used for `fix-last-sentence` and the review popup.
     pub smart: ProviderId,
-    pub llm: LlmConfig,
+    /// Configured LLM providers, one per hosted backend (max
+    /// [`MAX_LLM_PROVIDERS`]). When [`ProviderId::Llm`] is selected the
+    /// daemon uses the first entry whose backend is wired and keyed. The
+    /// field-level `#[serde(default)]` makes an absent `llms` deserialize
+    /// to an empty list, so the prefs UI can persist "no providers".
+    #[serde(default)]
+    pub llms: Vec<LlmConfig>,
     pub languagetool: LanguageToolConfig,
 }
 impl Default for Providers {
@@ -86,7 +104,7 @@ impl Default for Providers {
         Self {
             default: ProviderId::Spellbook,
             smart: ProviderId::Llm,
-            llm: LlmConfig::default(),
+            llms: vec![LlmConfig::default()],
             languagetool: LanguageToolConfig::default(),
         }
     }
@@ -116,16 +134,28 @@ pub enum ProviderId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// LLM vendor. Today only `"anthropic"` is wired in (M4).
+    /// LLM vendor: one of `anthropic`, `openai`, `gemini`, `openrouter`,
+    /// `mistral`, `groq`, `deepseek`, `xai`, or `openai-compatible` for a
+    /// custom/local OpenAI-style endpoint (see `base_url`). See
+    /// [`crate::llm::is_backend_wired`].
     pub backend: String,
     /// Model name passed to the vendor API.
     pub model: String,
+    /// Base URL for the `openai-compatible` backend — a local
+    /// Ollama / LM Studio server or any other OpenAI-style endpoint, up
+    /// to but not including `/chat/completions`
+    /// (e.g. `http://localhost:11434/v1`). The named cloud backends
+    /// ignore it and use their own built-in URLs, so it's `None` for
+    /// them and omitted from the TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             backend: "anthropic".into(),
             model: "claude-haiku-4-5".into(),
+            base_url: None,
         }
     }
 }
@@ -137,14 +167,35 @@ impl Default for LlmConfig {
 pub struct LanguageToolConfig {
     pub enabled: bool,
     pub url: String,
+    /// Host folder of LanguageTool's n-gram dataset (the unzipped
+    /// directory that contains an `en/` subfolder). When set, the
+    /// Install-with-Docker convenience mounts it and points the server at
+    /// it so real-word confusions (wear/where) get caught. `None` = the
+    /// server runs without n-grams.
+    pub ngram_dir: Option<String>,
 }
 impl Default for LanguageToolConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             url: "http://localhost:8081".into(),
+            ngram_dir: None,
         }
     }
+}
+
+/// Where the review popup's per-option word definitions come from.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionSource {
+    /// Don't show definitions.
+    Off,
+    /// Bundled offline WordNet glosses — the privacy-preserving default.
+    #[default]
+    Local,
+    /// Online dictionary API (`api.dictionaryapi.dev`). Sends the
+    /// looked-up word to a third party, so it's opt-in.
+    Online,
 }
 
 /// Behavior knobs.
@@ -174,12 +225,34 @@ pub struct Behavior {
     /// on so a subsequent fix-word can still operate on the
     /// already-typed text.
     pub reset_keys: ResetKeys,
+
+    /// Open the review popup straight into vim mode instead of the
+    /// word-edit (Tab) mode. `Ctrl+E` still toggles between the two — so
+    /// when this is on, `Ctrl+E` flips *to* word-edit mode.
+    pub review_starts_in_vim: bool,
+
+    /// When a fix routed to the LLM can't run — no API key, an
+    /// unsupported/unwired backend, or the network call itself fails —
+    /// try a configured LanguageTool server before dropping to the
+    /// offline Spellbook. Only has an effect when LanguageTool is
+    /// enabled with a URL; otherwise the fix falls straight through to
+    /// Spellbook either way. On by default so a configured LanguageTool
+    /// is preferred over the offline dictionary.
+    pub fallback_to_languagetool: bool,
+
+    /// Source for the per-option word definitions under the review
+    /// popup's suggestion dropdown. Defaults to the bundled offline
+    /// dictionary; can be turned off or pointed at an online API.
+    pub definitions: DefinitionSource,
 }
 impl Default for Behavior {
     fn default() -> Self {
         Self {
             pause_per_backspace_ms: 8,
             reset_keys: ResetKeys::default(),
+            review_starts_in_vim: false,
+            fallback_to_languagetool: true,
+            definitions: DefinitionSource::Local,
         }
     }
 }
@@ -241,7 +314,16 @@ impl Config {
             .ok_or(ConfigError::NoConfigDir)?;
         Ok(dirs.config_dir().join("config.toml"))
     }
+}
 
+/// The OS-conventional data folder where prefs downloads the LanguageTool
+/// n-gram dataset (`<data_dir>/ngrams`). `None` when no data directory is
+/// available (e.g. a sandbox with no `$HOME`).
+pub fn ngram_data_dir() -> Option<PathBuf> {
+    ProjectDirs::from("io", "hyprcorrect", "hyprcorrect").map(|dirs| dirs.data_dir().join("ngrams"))
+}
+
+impl Config {
     /// Load from the OS-conventional path. A missing file yields a
     /// default [`Config`] (not an error).
     ///
@@ -340,6 +422,40 @@ fix_word = "CTRL+J"
         let path = unique_tempdir().join("does-not-exist.toml");
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn llms_list_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        // Active provider is first in the list (index 0).
+        cfg.providers.llms = vec![
+            LlmConfig {
+                backend: "anthropic".into(),
+                model: "claude-haiku-4-5".into(),
+                base_url: None,
+            },
+            LlmConfig {
+                backend: "openai".into(),
+                model: "gpt-4o-mini".into(),
+                base_url: None,
+            },
+            // A custom OpenAI-compatible endpoint carries its base URL.
+            LlmConfig {
+                backend: "openai-compatible".into(),
+                model: "llama3.1".into(),
+                base_url: Some("http://localhost:11434/v1".into()),
+            },
+        ];
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.providers.llms, cfg.providers.llms);
+
+        // Deleting every provider persists as an empty list (doesn't
+        // silently resurrect the default).
+        cfg.providers.llms.clear();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(back.providers.llms.is_empty());
     }
 
     fn unique_tempdir() -> PathBuf {

@@ -39,6 +39,13 @@ keyring = { version = "3", features = ["linux-native", "apple-native", "windows-
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
 
+# Downloading + unzipping the LanguageTool n-gram archive from prefs.
+zip = "2"
+fs2 = "0.4"
+
+# Decompressing the bundled WordNet definitions (gzip) at first lookup.
+flate2 = "1"
+
 # GUI.
 eframe = { version = "0.32", default-features = false, features = [
     "default_fonts",

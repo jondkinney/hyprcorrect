@@ -36,6 +36,18 @@ package() {
 
     install -Dm755 hyprcorrect "$pkgdir/usr/bin/hyprcorrect"
     install -Dm644 hyprcorrect.desktop "$pkgdir/usr/share/applications/hyprcorrect.desktop"
+
+    # The release tarball ships the pre-rendered hicolor icon tree under
+    # icons/ (see release.yml) — without installing it the .desktop's
+    # Icon=hyprcorrect resolves to nothing and launchers (walker, etc.)
+    # show a blank entry.
+    install -Dm644 icons/hicolor/scalable/apps/hyprcorrect.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/hyprcorrect.svg"
+    for size in 16 22 24 32 48 64 128 256 512; do
+        install -Dm644 "icons/hicolor/${size}x${size}/apps/hyprcorrect.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/hyprcorrect.png"
+    done
+
     install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
     install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
