@@ -34,6 +34,72 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.2.0" date="2026-05-31">
+      <description>
+        <p>Added:</p>
+        <ul>
+          <li>wire all LLM backends + LanguageTool fallback toggle</li>
+          <li>key glyphs, per-command vim help, open prefs on Ask LLM</li>
+          <li>vim-start review option; tiling; n-gram + UI polish</li>
+          <li>multi-provider LLM config with tabs, per-backend keys</li>
+          <li>escalate to the LLM on demand + LanguageTool n-gram install</li>
+          <li>word-diff column alignment, adaptive width, wrap line-height</li>
+          <li>responsive popup, revert-to-original, suggestion list</li>
+          <li>gather ranked per-word backup suggestions</li>
+          <li>per-option word definitions (offline default, online opt-in)</li>
+          <li>one-click &quot;Download n-grams&quot; button</li>
+          <li>request the picky rule level</li>
+          <li>type newlines as Shift+Enter so multi-line edits don&#x27;t submit</li>
+          <li>remove the &quot;Clear&quot; links from the Hotkeys page</li>
+          <li>Add word definition line</li>
+          <li>cap floating window width at 900 via compositor resize</li>
+          <li>editable combo opens below the field; styling pass</li>
+          <li>show app-downloaded n-grams (read-only) with a Remove option</li>
+          <li>track n-grams separately from the LanguageTool container</li>
+          <li>vim spell-suggest (z=), multi-line fix, Esc, field wrap</li>
+          <li>column-align the Original in vim mode too</li>
+          <li>picking a suggestion advances to the next correction</li>
+          <li>undo, redo, and repeat</li>
+          <li>align each correction directly under the word it replaces</li>
+          <li>Home and End keys</li>
+          <li>backup-suggestion dropdown under the focused field</li>
+          <li>virtualedit-style vertical navigation</li>
+          <li>squiggle underlines + borderless auto-sized fields</li>
+          <li>inline word-edit and Ctrl+E vim modes in the review popup</li>
+        </ul>
+        <p>Fixed:</p>
+        <ul>
+          <li>hide &quot;Ask LLM&quot; when the correction is already the LLM&#x27;s</li>
+          <li>code-fence class-name caption; drop dead maxsize rule</li>
+          <li>tile by default; cap floating width; persist n-gram folder</li>
+          <li>vernier-style code pills; dropdown width; portal float</li>
+          <li>record chord modifiers in canonical CTRL+SHIFT+ALT+SUPER order</li>
+          <li>widen blocklist app picker so its Add button aligns</li>
+          <li>correct vim caret/squiggle anchoring under the 1.5× line-height</li>
+          <li>match vim mode&#x27;s vertical spacing + line-height to word mode</li>
+          <li>keep the vim caret tight against a word after cw</li>
+          <li>render &quot;Reload n-grams&quot; as a framed button</li>
+          <li>hard-cap floating width via runtime max_size (no overshoot)</li>
+          <li>uniform 30px controls, fixed float, 900px cap, privacy polish</li>
+          <li>equal control heights, balanced padding, Save on key row</li>
+          <li>non-focused border on inputs; right-align Save provider</li>
+          <li>dropdown width, flush scrollbar, combo height, bar padding</li>
+          <li>stop combos overflowing the right margin; n-gram Browse + details</li>
+          <li>cap form column width so inputs don&#x27;t clip on wide windows</li>
+          <li>correct LanguageTool URL label — it&#x27;s the base URL</li>
+          <li>size the popup wide enough to keep the sentence on one line</li>
+          <li>fold trailing punctuation into a word&#x27;s column</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>drop the floating-width cap entirely</li>
+          <li>tidy Providers page with info icons + framed Remove</li>
+          <li>clarify the &quot;Reload n-grams&quot; tooltip</li>
+          <li>move the n-gram folder field below the n-grams controls</li>
+          <li>roomier action buttons with a filled primary</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-05-28">
       <description>
         <p>Added:</p>
