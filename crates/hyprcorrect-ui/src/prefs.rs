@@ -663,30 +663,11 @@ impl eframe::App for PrefsApp {
             .resizable(false)
             .default_width(200.0)
             .show(ctx, |ui| {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    if let Some(handle) = &logo {
-                        // The icon's SVG is cropped tight (so it
-                        // fills the tray slot), which makes its
-                        // content reach the very top of a flush
-                        // 28×28 widget — visually higher than the
-                        // heading's baseline. Allocate a slightly
-                        // taller rect and paint the image into the
-                        // lower 28 px so it lines up with the
-                        // "hyprcorrect" cap height.
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(28.0, 34.0), egui::Sense::hover());
-                        let icon_rect = egui::Rect::from_min_size(
-                            rect.left_top() + egui::vec2(0.0, 6.0),
-                            egui::vec2(28.0, 28.0),
-                        );
-                        egui::Image::new(handle).paint_at(ui, icon_rect);
-                        ui.add_space(8.0);
-                    }
-                    ui.heading("hyprcorrect");
-                });
-                ui.add_space(14.0);
+                kanso::widgets::sidebar_header(
+                    ui,
+                    logo.as_ref().map(egui::Image::new),
+                    "hyprcorrect",
+                );
                 ui.separator();
                 ui.add_space(8.0);
                 for section in Section::all() {
@@ -714,14 +695,14 @@ impl eframe::App for PrefsApp {
                 ui.horizontal_centered(|ui| {
                     // 20px between buttons.
                     ui.spacing_mut().item_spacing.x = 20.0;
-                    let quit_label = egui::RichText::new("Quit hyprcorrect")
-                        .color(egui::Color32::from_rgb(220, 90, 90));
+                    let quit_label =
+                        egui::RichText::new("Quit hyprcorrect").color(kanso::palette::ERROR);
                     if ui.add(egui::Button::new(quit_label)).clicked() {
                         quit_requested = true;
                     }
                     if self.daemon_stale {
                         let relaunch_label = egui::RichText::new("Relaunch daemon (new build)")
-                            .color(egui::Color32::from_rgb(220, 160, 50));
+                            .color(kanso::palette::WARN);
                         let resp = ui.add(egui::Button::new(relaunch_label)).on_hover_text(
                             "The on-disk binary is newer than the running daemon. \
                                  Click to quit the old daemon and spawn the new one.",
@@ -1116,7 +1097,7 @@ impl PrefsApp {
             // "checking…" message instead of flashing a wrong state.
             if probe_in_flight {
                 ui.colored_label(
-                    egui::Color32::from_gray(170),
+                    kanso::palette::TEXT_MUTED,
                     "Checking for a running LanguageTool server…",
                 );
             }
@@ -1127,10 +1108,7 @@ impl PrefsApp {
             LanguageToolStatus::Reachable {
                 managed_container_running,
             } => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(110, 200, 130),
-                    format!("Reachable at {url}"),
-                );
+                ui.colored_label(kanso::palette::OK, format!("Reachable at {url}"));
                 ui.add_space(8.0);
                 if managed_container_running {
                     // This is our container — give the user the same
@@ -1210,11 +1188,13 @@ impl PrefsApp {
                     } else {
                         format!("Downloading {:.1} GB…", done as f64 / GB)
                     };
-                    ui.add(egui::ProgressBar::new(frac).text(text));
+                    kanso::widgets::progress(ui, frac, &text);
                 }
                 // Done/Failed/Cancelled are consumed by poll_ngram_download.
                 _ => {
-                    ui.add(egui::ProgressBar::new(1.0).text("Unzipping (~16 GB)…"));
+                    kanso::widgets::ProgressBar::indeterminate()
+                        .text("Unzipping (~16 GB)…")
+                        .show(ui);
                 }
             }
             ui.add_space(4.0);
@@ -1242,7 +1222,7 @@ impl PrefsApp {
         // the "Remove downloaded data" control lives in the field below.
         if self.lt_ngrams == Some(true) {
             ui.colored_label(
-                egui::Color32::from_rgb(110, 200, 130),
+                kanso::palette::OK,
                 "Loaded — real-word confusions are caught (their/there, its/it's, then/than).",
             );
             if downloaded.is_none()
@@ -1316,14 +1296,13 @@ impl PrefsApp {
 
         // No data anywhere → the one-click download.
         if ui
-            .add_enabled(
-                !op_in_flight && base.is_some(),
-                egui::Button::new("Download n-grams (~8.4 GB)"),
-            )
-            .on_hover_text(
-                "Downloads LanguageTool's English n-gram data to the app's data \
-                 folder and enables it. Needs ~24 GB free while unzipping.",
-            )
+            .add_enabled_ui(!op_in_flight && base.is_some(), |ui| {
+                kanso::widgets::primary_button(ui, "Download n-grams (~8.4 GB)").on_hover_text(
+                    "Downloads LanguageTool's English n-gram data to the app's data \
+                     folder and enables it. Needs ~24 GB free while unzipping.",
+                )
+            })
+            .inner
             .clicked()
             && let Some(d) = base.clone()
         {
@@ -1353,25 +1332,24 @@ impl PrefsApp {
                     "Nothing answers at {url}, and Docker isn't installed — \
                      install Docker or point the URL at an existing server."
                 ),
-                egui::Color32::from_gray(170),
+                kanso::palette::TEXT_MUTED,
             ),
-            DockerState::DockerUnavailable(msg) => (
-                format!("Docker unavailable: {msg}"),
-                egui::Color32::from_rgb(220, 160, 50),
-            ),
+            DockerState::DockerUnavailable(msg) => {
+                (format!("Docker unavailable: {msg}"), kanso::palette::WARN)
+            }
             DockerState::AbsentContainer => {
-                ("Not installed.".to_string(), egui::Color32::from_gray(170))
+                ("Not installed.".to_string(), kanso::palette::TEXT_MUTED)
             }
             DockerState::ContainerStopped => (
                 format!("Our container exists but is stopped. Start it to reach {url}."),
-                egui::Color32::from_rgb(220, 160, 50),
+                kanso::palette::WARN,
             ),
             DockerState::ContainerRunning => (
                 format!(
                     "Our container is running but {url} doesn't answer — \
                      likely a port-mapping mismatch."
                 ),
-                egui::Color32::from_rgb(220, 160, 50),
+                kanso::palette::WARN,
             ),
             DockerState::ForeignContainer { name, running } => (
                 if *running {
@@ -1386,7 +1364,7 @@ impl PrefsApp {
                          Start it manually (`docker start {name}`) or install ours."
                     )
                 },
-                egui::Color32::from_rgb(220, 160, 50),
+                kanso::palette::WARN,
             ),
         };
         ui.colored_label(status_color, status_text);
@@ -1426,8 +1404,11 @@ impl PrefsApp {
                         .to_string(),
                 };
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Install with Docker"))
-                    .on_hover_text(hover)
+                    .add_enabled_ui(enabled, |ui| {
+                        kanso::widgets::primary_button(ui, "Install with Docker")
+                            .on_hover_text(hover)
+                    })
+                    .inner
                     .clicked()
                     && let Some(port) = port
                 {
@@ -1481,7 +1462,7 @@ impl PrefsApp {
             // Tighten inline spacing so "Pulls the <link> image" reads as
             // one sentence rather than three widgets with default gaps.
             ui.spacing_mut().item_spacing.x = 0.0;
-            let muted = egui::Color32::from_gray(170);
+            let muted = kanso::palette::TEXT_MUTED;
             ui.label(
                 egui::RichText::new("Pulls the ")
                     .size(CAPTION_SIZE)
@@ -1513,78 +1494,67 @@ impl PrefsApp {
 
         #[cfg(target_os = "linux")]
         {
-            field_label(ui, "Start at login");
-            ui.add_space(4.0);
-            let resp = ui.checkbox(
+            if kanso::widgets::labeled_toggle(
+                ui,
+                "Start at login",
                 &mut self.autostart_enabled,
                 "Launch hyprcorrect when I log in",
-            );
-            if resp.changed() {
-                self.clear_status();
-            }
-            ui.add_space(6.0);
-            caption_with_code(
-                ui,
                 "Drops a `hyprcorrect.desktop` into `~/.config/autostart/` \
                  so the daemon starts with your session. Takes effect on save.",
-            );
+            )
+            .changed()
+            {
+                self.clear_status();
+            }
             ui.add_space(SETTING_BLOCK_SPACING);
         }
 
-        field_label(ui, "Review popup");
-        ui.add_space(4.0);
-        if ui
-            .checkbox(
-                &mut self.config.behavior.review_starts_in_vim,
-                "Open in vim mode",
-            )
-            .changed()
-        {
-            self.clear_status();
-        }
-        ui.add_space(6.0);
-        caption_with_code(
+        if kanso::widgets::labeled_toggle(
             ui,
+            "Review popup",
+            &mut self.config.behavior.review_starts_in_vim,
+            "Open in vim mode",
             "Start the review popup in vim mode — modal editing of the whole \
              sentence — instead of word-edit (Tab) mode. `Ctrl+E` toggles between \
              the two either way, so with this on it flips to word-edit.",
-        );
-        ui.add_space(SETTING_BLOCK_SPACING);
-
-        field_label(ui, "Provider fallback");
-        ui.add_space(4.0);
-        if ui
-            .checkbox(
-                &mut self.config.behavior.fallback_to_languagetool,
-                "Try LanguageTool before Spellbook",
-            )
-            .changed()
+        )
+        .changed()
         {
             self.clear_status();
         }
-        ui.add_space(6.0);
-        caption(
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        if kanso::widgets::labeled_toggle(
             ui,
+            "Provider fallback",
+            &mut self.config.behavior.fallback_to_languagetool,
+            "Try LanguageTool before Spellbook",
             "When a fix routed to the LLM can't run — no API key, an unsupported \
              backend, or the call fails — try your LanguageTool server before \
              dropping to the offline Spellbook. Only takes effect when LanguageTool \
              is enabled with a URL in Providers; otherwise fixes fall straight \
              through to Spellbook.",
-        );
+        )
+        .changed()
+        {
+            self.clear_status();
+        }
         ui.add_space(SETTING_BLOCK_SPACING);
 
         field_label(ui, "Word definitions");
         ui.add_space(4.0);
         {
             use hyprcorrect_core::DefinitionSource as DS;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let cur = &mut self.config.behavior.definitions;
-                changed |= ui.selectable_value(cur, DS::Local, "Offline").clicked();
-                changed |= ui.selectable_value(cur, DS::Online, "Online").clicked();
-                changed |= ui.selectable_value(cur, DS::Off, "Off").clicked();
-            });
+            let cur = &mut self.config.behavior.definitions;
+            let changed = kanso::widgets::segmented(
+                ui,
+                cur,
+                &[
+                    (DS::Local, "Offline"),
+                    (DS::Online, "Online"),
+                    (DS::Off, "Off"),
+                ],
+            );
             if changed {
                 self.clear_status();
             }
@@ -1611,10 +1581,10 @@ impl PrefsApp {
              characters after a fix lands.",
         );
         ui.add_space(6.0);
-        let response = ui.add(
-            egui::Slider::new(&mut self.config.behavior.pause_per_backspace_ms, 0..=30)
-                .suffix(" ms"),
-        );
+        let response =
+            kanso::widgets::Slider::new(&mut self.config.behavior.pause_per_backspace_ms, 0..=30)
+                .suffix(" ms")
+                .show(ui);
         if response.changed() {
             self.clear_status();
         }
@@ -1885,24 +1855,27 @@ impl PrefsApp {
     }
 
     fn about_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("About hyprcorrect");
-        ui.add_space(14.0);
-
-        ui.label(
-            egui::RichText::new(format!("Version {}", hyprcorrect_core::version()))
-                .size(15.0)
-                .strong(),
+        // The shared About hero: centered logo + name + version + blurb +
+        // links. hyprcorrect's old left-aligned, logo-less pane folds into
+        // it; Source/License become entries in the links column.
+        let logo = self.logo_texture(ui.ctx()).cloned();
+        let version = hyprcorrect_core::version();
+        kanso::widgets::about_pane(
+            ui,
+            kanso::widgets::AboutInfo {
+                logo: logo.as_ref().map(egui::Image::new),
+                name: "hyprcorrect",
+                version,
+                blurb: Some("Keyboard-driven spelling and typo correction for the whole desktop."),
+                links: &[
+                    ("Repository", "https://github.com/jondkinney/hyprcorrect"),
+                    (
+                        "License (MIT OR Apache-2.0)",
+                        "https://github.com/jondkinney/hyprcorrect#license",
+                    ),
+                ],
+            },
         );
-        ui.add_space(8.0);
-        ui.label("Keyboard-driven spelling and typo correction for the whole desktop.");
-        ui.add_space(SETTING_BLOCK_SPACING);
-
-        field_label(ui, "Source");
-        ui.hyperlink("https://github.com/jondkinney/hyprcorrect");
-        ui.add_space(SETTING_BLOCK_SPACING);
-
-        field_label(ui, "License");
-        caption(ui, "MIT OR Apache-2.0");
     }
 }
 
@@ -1951,20 +1924,26 @@ fn provider_radio(
     selection: &mut ProviderId,
     llm_tooltip: Option<&str>,
 ) -> bool {
-    let before = *selection;
     // Order: simplest → most complex, and offline → potentially-online.
     // Spellbook is always offline (bundled dictionary). LanguageTool is
     // offline when self-hosted at localhost; the URL field next door
     // is where its locality is configured. LLM is always a network call.
     ui.horizontal(|ui| {
-        ui.radio_value(selection, ProviderId::Spellbook, "Spellbook (offline)");
-        ui.radio_value(selection, ProviderId::LanguageTool, "LanguageTool");
-        ui.radio_value(selection, ProviderId::Llm, "LLM");
+        let changed = kanso::widgets::radio_group_horizontal(
+            ui,
+            selection,
+            &[
+                (ProviderId::Spellbook, "Spellbook (offline)"),
+                (ProviderId::LanguageTool, "LanguageTool"),
+                (ProviderId::Llm, "LLM"),
+            ],
+        );
         if let Some(tip) = llm_tooltip {
             info_icon(ui).on_hover_text(tip);
         }
-    });
-    *selection != before
+        changed
+    })
+    .inner
 }
 
 /// Paint a small circle-with-`i` info icon at the current cursor
@@ -2087,7 +2066,7 @@ fn not_wired_note(ui: &mut egui::Ui, backend: &str) {
         ))
         .size(CAPTION_SIZE)
         .line_height(Some(CAPTION_LINE_HEIGHT))
-        .color(egui::Color32::from_rgb(220, 160, 50)),
+        .color(kanso::palette::WARN),
     );
 }
 
@@ -2204,7 +2183,7 @@ fn placeholder_app_icon(ui: &mut egui::Ui) {
 fn active_dot(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
     ui.painter()
-        .circle_filled(rect.center(), 4.0, egui::Color32::from_rgb(110, 200, 130));
+        .circle_filled(rect.center(), 4.0, kanso::palette::OK);
 }
 
 /// A combo-box drop button: a real egui button frame (so its height,
@@ -2538,7 +2517,10 @@ impl PrefsApp {
             )
             .changed();
             save_clicked = ui
-                .add_enabled(can_add, egui::Button::new("Save provider"))
+                .add_enabled_ui(can_add, |ui| {
+                    kanso::widgets::primary_button(ui, "Save provider")
+                })
+                .inner
                 .clicked();
         });
         ui.add_space(4.0);
@@ -2641,24 +2623,13 @@ fn bordered_text_edit(ui: &mut egui::Ui, te: egui::TextEdit<'_>) -> egui::Respon
 /// Single-line text input with consistent inner padding so fields
 /// don't collapse to ~16 px tall at the body font size.
 fn padded_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
-    bordered_text_edit(
-        ui,
-        egui::TextEdit::singleline(text)
-            .margin(egui::Margin::symmetric(8, 6))
-            .desired_width(f32::INFINITY),
-    )
+    kanso::widgets::padded_text_edit(ui, text)
 }
 
 /// Single-line *password* input with the same padding as
 /// [`padded_text_edit`]. The contents render as bullets.
 fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
-    bordered_text_edit(
-        ui,
-        egui::TextEdit::singleline(text)
-            .password(true)
-            .margin(egui::Margin::symmetric(8, 6))
-            .desired_width(f32::INFINITY),
-    )
+    kanso::widgets::password_field(ui, text)
 }
 
 /// Bold-ish label introducing a setting. Slightly larger than the
@@ -2688,7 +2659,7 @@ fn field_label_with_note(ui: &mut egui::Ui, label: &str, note: &str) {
         ui.label(
             egui::RichText::new(format!("({note})"))
                 .size(CAPTION_SIZE)
-                .color(egui::Color32::from_gray(170)),
+                .color(kanso::palette::TEXT_MUTED),
         );
     });
 }
@@ -2729,142 +2700,6 @@ const TEXT_EDIT_MARGIN_X: f32 = 16.0;
 /// `TextEdit::min_size` so they all match in every state.
 const CONTROL_HEIGHT: f32 = 30.0;
 
-/// The Hyprland/Omarchy logo glyph in the bundled `omarchy.ttf`.
-/// Renders as a blank tofu box if the font isn't installed — we
-/// guard with [`OMARCHY_FONT_AVAILABLE`] before using it.
-const OMARCHY_LOGO: char = '\u{e900}';
-
-static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Register the fonts the chord chip needs into a dedicated
-/// `shortcut` font family:
-///
-///   shortcut = [ omarchy.ttf ? , sans-with-modifier-glyphs ? ,
-///                default Proportional ]
-///
-/// The chain order means egui draws each character with the first
-/// font that has it. Omarchy gives us the Hyprland logo at
-/// `\u{e900}`; a system sans font with `⌃ ⇧ ⌥ ⌘` covers the
-/// standard modifier glyphs; the default proportional font handles
-/// plain letters. If no symbol font is found we fall back to the
-/// default, and `chord_glyphs` will show ASCII names through
-/// [`OMARCHY_FONT_AVAILABLE`] — but the symbol font search rarely
-/// fails on a desktop Linux system.
-///
-/// Mirrors `vernier`'s `install_glyph_fonts` pattern.
-pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-
-    let mut fonts = egui::FontDefinitions::default();
-    let mut shortcut_chain: Vec<String> = Vec::new();
-
-    // -- Highest priority: the bundled sans with the modifier glyphs --
-    // Adwaita Sans Regular ships with the app under `crates/
-    // hyprcorrect-ui/assets/`. It covers ASCII plus the macOS-style
-    // key glyphs (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣ ↑↓←→), so the chip renders
-    // identically on any system without depending on whatever
-    // fonts happen to be installed.
-    // The font bytes come from the shared design system (single source) —
-    // hyprcorrect no longer bundles its own copy.
-    const ADWAITA_SANS: &[u8] = kanso::fonts::ADWAITA_SANS;
-    fonts.font_data.insert(
-        "shortcut_symbols".into(),
-        Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
-    );
-    shortcut_chain.push("shortcut_symbols".into());
-
-    // -- Then the egui defaults ---------------------------------------
-    if let Some(default_chain) = fonts.families.get(&egui::FontFamily::Proportional) {
-        shortcut_chain.extend(default_chain.iter().cloned());
-    }
-
-    // -- Last: Omarchy, used only for codepoints no earlier font has
-    // — that's the Hyprland logo at U+E900. We push it last because
-    // Omarchy's cmap claims most ASCII codepoints with empty glyphs,
-    // so putting it earlier would silently drop letters like 'c' / 'o'
-    // from the chip's text.
-    let mut omarchy_candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut p = std::path::PathBuf::from(home);
-        p.push(".local/share/fonts/omarchy.ttf");
-        omarchy_candidates.push(p);
-    }
-    omarchy_candidates.push("/usr/share/fonts/omarchy.ttf".into());
-    for path in omarchy_candidates {
-        if let Ok(bytes) = std::fs::read(&path) {
-            let mut data = egui::FontData::from_owned(bytes);
-            // The omarchy glyph fills its full em square; at scale=1
-            // it towers over the Adwaita letters / modifier symbols
-            // at the same point size. 0.85 lands the logo at the
-            // letters' visual cap height; positive y_offset_factor
-            // nudges it DOWN so it sits on the same baseline as the F.
-            // Mirrors vernier's tweak.
-            data.tweak = egui::FontTweak {
-                scale: 0.75,
-                y_offset_factor: 0.09,
-                ..Default::default()
-            };
-            fonts.font_data.insert("omarchy".into(), Arc::new(data));
-            shortcut_chain.push("omarchy".into());
-            OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
-            break;
-        }
-    }
-
-    fonts
-        .families
-        .insert(egui::FontFamily::Name("shortcut".into()), shortcut_chain);
-    ctx.set_fonts(fonts);
-}
-
-/// Replace `+`-separated modifier tokens with Unicode glyphs the
-/// reader recognizes from native menus. Used to display the stored
-/// accelerator string on the chord chip.
-fn chord_glyphs(stored: &str) -> String {
-    use std::sync::atomic::Ordering;
-    let omarchy = OMARCHY_FONT_AVAILABLE.load(Ordering::Relaxed);
-    stored
-        .split('+')
-        .filter(|t| !t.trim().is_empty())
-        .map(|tok| match tok.trim().to_ascii_uppercase().as_str() {
-            "SUPER" | "META" | "CMD" | "COMMAND" | "WIN" | "WINDOWS" => {
-                if omarchy {
-                    OMARCHY_LOGO.to_string()
-                } else {
-                    "⌘".to_string()
-                }
-            }
-            "CTRL" | "CONTROL" => "⌃".to_string(),
-            "SHIFT" => "⇧".to_string(),
-            "ALT" | "OPTION" => "⌥".to_string(),
-            "RETURN" | "ENTER" => "↵".to_string(),
-            "TAB" => "⇥".to_string(),
-            "ESCAPE" | "ESC" => "⎋".to_string(),
-            "BACKSPACE" => "⌫".to_string(),
-            "DELETE" => "⌦".to_string(),
-            "SPACE" => "␣".to_string(),
-            "UP" => "↑".to_string(),
-            "DOWN" => "↓".to_string(),
-            "LEFT" => "←".to_string(),
-            "RIGHT" => "→".to_string(),
-            "PRIOR" => "PgUp".to_string(),
-            "NEXT" => "PgDn".to_string(),
-            // Punctuation that chord-capture spells out so the
-            // saved string can't collide with the `+` modifier
-            // separator. Render them as the ASCII characters
-            // they represent.
-            "PLUS" => "+".to_string(),
-            "MINUS" => "-".to_string(),
-            "EQUAL" => "=".to_string(),
-            "UNDERSCORE" => "_".to_string(),
-            other => other.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Render one row of the Hotkeys panel: a chord-capture chip whose
 /// label reflects `value` (or a "Press…" / "Click to set" prompt
 /// depending on capture state). Returns `true` when the row was
@@ -2876,46 +2711,11 @@ fn hotkey_chord_row(
     capturing: Option<HotkeyTarget>,
 ) -> bool {
     let is_capturing_this = capturing == Some(target);
-    let display = if is_capturing_this {
-        "Press a shortcut…".to_string()
-    } else if value.is_empty() {
-        "Click to set".to_string()
-    } else {
-        chord_glyphs(value)
-    };
-    chord_chip(ui, &display, is_capturing_this).clicked()
-}
-
-/// Render the chord-capture chip — a wide, click-to-record button
-/// that displays the current accelerator or a prompt while recording.
-/// Uses the `shortcut` font family registered by
-/// [`install_glyph_fonts`] so modifier glyphs (⌃ ⇧ ⌥ ⌘ / Omarchy
-/// logo) render even when egui's default proportional font lacks
-/// them.
-fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Response {
-    let chip_size = egui::vec2(280.0, 32.0);
-    let resp = ui.allocate_response(chip_size, egui::Sense::click());
-    let bg = if capturing {
-        egui::Color32::from_rgb(50, 90, 140)
-    } else if resp.hovered() {
-        egui::Color32::from_gray(74)
-    } else {
-        egui::Color32::from_gray(56)
-    };
-    ui.painter()
-        .rect_filled(resp.rect, egui::CornerRadius::same(6), bg);
-    ui.painter().text(
-        resp.rect.center(),
-        egui::Align2::CENTER_CENTER,
-        display,
-        shortcut_font(17.0),
-        egui::Color32::WHITE,
-    );
-    resp
-}
-
-fn shortcut_font(size: f32) -> egui::FontId {
-    egui::FontId::new(size, egui::FontFamily::Name("shortcut".into()))
+    // The shared capture chip owns the glyph rendering (modifier symbols
+    // + the Omarchy SUPER logo via kanso's SHORTCUT_FAMILY), the
+    // "Press a shortcut…" / "Click to set" prompts, and the record/hover
+    // states — so hyprcorrect no longer hand-paints its own chip.
+    kanso::widgets::shortcut_capture_chip(ui, value, is_capturing_this).clicked()
 }
 
 /// Build a user-facing message for a chord-capture IPC failure.
@@ -2939,8 +2739,8 @@ fn apply_style(ctx: &egui::Context) {
     // Type scale, spacing, the solid scrollbar, and corner radius all come
     // from the shared design system now; control_visuals adds the
     // input/button border (color-matched at rest, colored on hover/press,
-    // never expanding). Fonts are installed once at startup by
-    // install_glyph_fonts (shared with the review popup), so this stays
+    // never expanding). Fonts are installed once at startup via
+    // kanso::fonts::install (also done by the review popup), so this stays
     // font-free and cheap to call per frame.
     kanso::theme::apply_styles(ctx);
     ctx.style_mut(|style| kanso::theme::control_visuals(&mut style.visuals));
@@ -3258,7 +3058,13 @@ pub(crate) fn run() {
         "hyprcorrect — Preferences",
         options,
         Box::new(move |cc| {
-            install_glyph_fonts(&cc.egui_ctx);
+            kanso::fonts::install(
+                &cc.egui_ctx,
+                &kanso::fonts::FontOptions {
+                    shortcut_family: true,
+                    ..Default::default()
+                },
+            );
             Ok(Box::new(PrefsApp::new(
                 saved,
                 saved_llm_keys,

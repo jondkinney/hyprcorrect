@@ -69,7 +69,13 @@ pub(crate) fn run() {
         "hyprcorrect — Review",
         options,
         Box::new(move |cc| {
-            crate::prefs::install_glyph_fonts(&cc.egui_ctx);
+            kanso::fonts::install(
+                &cc.egui_ctx,
+                &kanso::fonts::FontOptions {
+                    shortcut_family: true,
+                    ..Default::default()
+                },
+            );
             Ok(Box::new(ReviewApp::new(request)))
         }),
     );
@@ -1266,7 +1272,9 @@ impl eframe::App for ReviewApp {
                             // ⎋ (Esc) from the bundled symbol font — the
                             // default body font may lack the key glyph.
                             egui::RichText::new("Cancel  ⎋")
-                                .family(egui::FontFamily::Name("shortcut".into()))
+                                .family(egui::FontFamily::Name(
+                                    kanso::fonts::SHORTCUT_FAMILY.into(),
+                                ))
                                 .size(15.0),
                         )
                         .clicked()
@@ -1302,7 +1310,9 @@ impl eframe::App for ReviewApp {
                         let apply = egui::Button::new(
                             // ↵ (Enter) from the bundled symbol font.
                             egui::RichText::new("Apply  ↵")
-                                .family(egui::FontFamily::Name("shortcut".into()))
+                                .family(egui::FontFamily::Name(
+                                    kanso::fonts::SHORTCUT_FAMILY.into(),
+                                ))
                                 .size(15.0)
                                 .strong()
                                 .color(egui::Color32::from_rgb(228, 245, 233)),
