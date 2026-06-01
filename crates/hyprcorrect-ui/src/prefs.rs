@@ -2147,96 +2147,6 @@ fn active_dot(ui: &mut egui::Ui) {
         .circle_filled(rect.center(), 4.0, kanso::palette::OK);
 }
 
-/// A combo-box drop button: a real egui button frame (so its height,
-/// rounding, and hover match the text field next to it and the other
-/// buttons) with a downward chevron painted on top — the bundled fonts
-/// lack the Geometric-Shapes glyphs, which tofu'd. `height` matches the
-/// adjacent field's height.
-fn combo_arrow_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
-    // `min_size` (not `add_sized`) so the button fills the full 30px cell —
-    // add_sized centers the empty button and left ~4px of dead space on the
-    // right, pushing the visible edge in past the 20px content margin.
-    let resp = ui.add(egui::Button::new("").min_size(egui::vec2(30.0, height)));
-    let c = resp.rect.center();
-    let stroke = egui::Stroke::new(1.6, egui::Color32::from_gray(200));
-    ui.painter().line_segment(
-        [c + egui::vec2(-4.0, -2.0), c + egui::vec2(0.0, 2.5)],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 2.5)],
-        stroke,
-    );
-    resp
-}
-
-/// An editable combo box: a typeable single-line field plus a chevron
-/// button that drops a menu of `options`. Picking an option overwrites
-/// the field. Returns whether `text` changed this frame (typed or
-/// picked). Mirrors egui's own `ComboBox` popup wiring.
-fn editable_combo(
-    ui: &mut egui::Ui,
-    id_salt: &str,
-    text: &mut String,
-    options: &[&str],
-    hint: &str,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let btn_w = 30.0;
-        // egui renders a TextEdit `desired_width + margin.sum().x` wide (the
-        // 8px-each-side margin is added ON TOP of desired_width), so reserve
-        // that 16px too — otherwise field + spacing + button overflow the
-        // row and the chevron clips off the right edge.
-        let field_w = (ui.available_width() - btn_w - 4.0 - TEXT_EDIT_MARGIN_X).max(80.0);
-        let edit = bordered_text_edit(
-            ui,
-            egui::TextEdit::singleline(text)
-                .hint_text(hint)
-                .margin(egui::Margin::symmetric(8, 6))
-                .desired_width(field_w),
-        );
-        changed |= edit.changed();
-        let btn = combo_arrow_button(ui, edit.rect.height());
-        // The whole field is the dropdown trigger: clicking the field OR the
-        // chevron toggles the menu (you can still type to enter a custom
-        // value). Anchor it to the field (not the narrow chevron, which made
-        // egui clamp the menu to a sliver), exactly the field's width, and a
-        // few px below so it clears the field's focus border.
-        // The popup's menu frame adds `menu_margin` (6px) on each side, so
-        // subtract 12 to make the popup's outer width match the field.
-        let popup_w = (edit.rect.width() - 12.0).max(80.0);
-        let toggled = edit.clicked() || btn.clicked();
-        egui::Popup::menu(&btn)
-            .anchor(&edit)
-            .gap(4.0)
-            .open_memory(toggled.then_some(egui::SetOpenCommand::Toggle))
-            .id(ui.make_persistent_id((id_salt, "popup")))
-            .width(popup_w)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-            .show(|ui| {
-                // Pin to exactly the field width every frame (`.width()` only
-                // seeds Area::default_width, and egui then remembers a stale
-                // size) and stop labels wrapping.
-                ui.set_min_width(popup_w);
-                ui.set_max_width(popup_w);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                if options.is_empty() {
-                    ui.add_enabled(false, egui::Button::new("(none available)").frame(false));
-                } else {
-                    for opt in options {
-                        if ui.selectable_label(text.as_str() == *opt, *opt).clicked() {
-                            *text = (*opt).to_string();
-                            changed = true;
-                        }
-                    }
-                }
-            });
-    });
-    changed
-}
-
 impl PrefsApp {
     /// The tabbed multi-provider LLM editor under the Providers panel's
     /// "LLM" heading. The active provider (list index 0) is the leftmost
@@ -2346,9 +2256,9 @@ impl PrefsApp {
         ui.add_space(SETTING_BLOCK_SPACING);
         field_label(ui, "Model");
         ui.add_space(4.0);
-        touched |= editable_combo(
+        touched |= kanso::widgets::editable_combo(
             ui,
-            &format!("model_{backend}"),
+            format!("model_{backend}"),
             &mut self.config.providers.llms[idx].model,
             models_for_backend(backend),
             "Pick or type a model",
@@ -2411,7 +2321,7 @@ impl PrefsApp {
         field_label(ui, "Provider");
         ui.add_space(4.0);
         let before = self.llm_draft.backend.clone();
-        if editable_combo(
+        if kanso::widgets::editable_combo(
             ui,
             "add_backend",
             &mut self.llm_draft.backend,
@@ -2433,7 +2343,7 @@ impl PrefsApp {
         field_label(ui, "Model");
         ui.add_space(4.0);
         let models = models_for_backend(&self.llm_draft.backend);
-        touched |= editable_combo(
+        touched |= kanso::widgets::editable_combo(
             ui,
             "add_model",
             &mut self.llm_draft.model,
