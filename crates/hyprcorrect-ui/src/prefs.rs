@@ -1709,118 +1709,43 @@ impl PrefsApp {
             .collect();
 
         // Resolve each candidate to its display name + icon ahead of the
-        // closure so we don't borrow `self` twice.
+        // picker so we aren't borrowing `self.app_registry` while the picker
+        // borrows `self.selected_app` / `self.app_filter`.
         let candidates: Vec<crate::apps::AppMeta> = candidate_ids
             .iter()
             .map(|id| self.app_registry.lookup(ui.ctx(), id))
             .collect();
 
-        ui.horizontal(|ui| {
-            let selected_display = self
-                .selected_app
-                .as_deref()
-                .and_then(|id| candidates.iter().find(|c| c.identifier == id))
-                .map(|c| c.display_name.clone())
-                .unwrap_or_else(|| {
-                    if candidates.is_empty() {
-                        "(no running apps detected)".to_string()
-                    } else {
-                        "Choose an app…".to_string()
+        if candidates.is_empty() {
+            caption(ui, "(no running apps detected)");
+        } else {
+            // kanso owns the searchable icon list; hyprcorrect supplies the
+            // candidates and their resolved `.desktop` icon textures.
+            let entries: Vec<kanso::widgets::AppEntry> = candidates
+                .iter()
+                .map(|c| {
+                    let entry =
+                        kanso::widgets::AppEntry::new(c.identifier.clone(), c.display_name.clone());
+                    match &c.icon {
+                        Some(icon) => entry.with_icon(icon.id()),
+                        None => entry,
                     }
-                });
-            let selected_ref = &mut self.selected_app;
-            let filter = &mut self.app_filter;
-            // `ComboBox::width` is the button's *outer* width, whereas the
-            // "by class name" text field below sets `desired_width` plus an
-            // 8px symmetric margin (outer = width + 16). Subtract 64 (= 80 - 16)
-            // so the combo's outer width matches that field's and the two "Add"
-            // buttons line up 20px from the edge.
-            let combo_w = (ui.available_width() - 64.0).max(120.0);
-            egui::ComboBox::from_id_salt("blocklist_app_picker")
-                .selected_text(selected_display)
-                .width(combo_w)
-                .show_ui(ui, |ui| {
-                    // Match the combo width, plus a hair of top space so the
-                    // search field isn't flush against the combo button.
-                    ui.set_min_width(combo_w);
-                    ui.add_space(2.0);
-                    ui.add(
-                        egui::TextEdit::singleline(filter)
-                            .hint_text("Search")
-                            .margin(egui::Margin::symmetric(8, 4))
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.separator();
-                    let needle = filter.to_ascii_lowercase();
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        // Full width so the scrollbar sits at the right edge,
-                        // not floating in the middle behind narrow rows.
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for c in &candidates {
-                                if !needle.is_empty()
-                                    && !c.display_name.to_ascii_lowercase().contains(&needle)
-                                    && !c.identifier.to_ascii_lowercase().contains(&needle)
-                                {
-                                    continue;
-                                }
-                                let is_selected =
-                                    selected_ref.as_deref() == Some(c.identifier.as_str());
-                                // Full-width clickable row: icon (or placeholder
-                                // tile) + name with a tight gap, and a
-                                // selection/hover highlight spanning the row.
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 26.0),
-                                    egui::Sense::click(),
-                                );
-                                if ui.is_rect_visible(rect) {
-                                    let vis = ui.style().interact_selectable(&resp, is_selected);
-                                    if is_selected || resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            egui::CornerRadius::same(4),
-                                            vis.bg_fill,
-                                        );
-                                    }
-                                    let icon_rect = egui::Rect::from_min_size(
-                                        egui::pos2(rect.left() + 4.0, rect.center().y - 10.0),
-                                        egui::vec2(20.0, 20.0),
-                                    );
-                                    if let Some(handle) = &c.icon {
-                                        egui::Image::new(handle).paint_at(ui, icon_rect);
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            icon_rect.shrink(1.0),
-                                            egui::CornerRadius::same(4),
-                                            egui::Color32::from_gray(58),
-                                        );
-                                    }
-                                    ui.painter().text(
-                                        egui::pos2(icon_rect.right() + 6.0, rect.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        &c.display_name,
-                                        egui::TextStyle::Body.resolve(ui.style()),
-                                        vis.text_color(),
-                                    );
-                                }
-                                if resp.clicked() {
-                                    *selected_ref = Some(c.identifier.clone());
-                                }
-                            }
-                        });
-                });
-            let can_add = self.selected_app.as_ref().is_some_and(|s| {
-                !s.is_empty() && !already_blocked.contains(&s.to_ascii_lowercase())
-            });
-            if ui.add_enabled(can_add, egui::Button::new("Add")).clicked()
-                && let Some(class) = self.selected_app.take()
-            {
-                self.config.privacy.app_blocklist.push(class);
-                self.app_filter.clear();
-                self.clear_status();
-            }
-        });
+                })
+                .collect();
+            kanso::widgets::app_picker(ui, &entries, &mut self.selected_app, &mut self.app_filter);
+        }
+        ui.add_space(8.0);
+        let can_add = self
+            .selected_app
+            .as_ref()
+            .is_some_and(|s| !s.is_empty() && !already_blocked.contains(&s.to_ascii_lowercase()));
+        if ui.add_enabled(can_add, egui::Button::new("Add")).clicked()
+            && let Some(class) = self.selected_app.take()
+        {
+            self.config.privacy.app_blocklist.push(class);
+            self.app_filter.clear();
+            self.clear_status();
+        }
 
         ui.add_space(SETTING_BLOCK_SPACING);
 
