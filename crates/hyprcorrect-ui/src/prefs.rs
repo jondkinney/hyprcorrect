@@ -584,6 +584,7 @@ impl PrefsApp {
 
 impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        kanso::scroll::scroll_momentum(ctx);
         apply_style(ctx);
         self.refresh_stale_check();
         self.poll_docker_op(ctx);
@@ -749,22 +750,20 @@ impl eframe::App for PrefsApp {
                 }),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Scrollbar sits flush at the edge. Reserve only 10px
-                        // here: the solid scrollbar already takes ~10px
-                        // (bar_inner_margin 4 + bar_width 6), so total right
-                        // padding (gap + scrollbar) ≈ 20px, matching the left.
-                        ui.set_max_width((ui.available_width() - 10.0).max(0.0));
-                        match self.section {
-                            Section::Hotkeys => self.hotkeys_panel(ui),
-                            Section::Providers => self.providers_panel(ui),
-                            Section::Behavior => self.behavior_panel(ui),
-                            Section::Privacy => self.privacy_panel(ui),
-                            Section::About => self.about_panel(ui),
-                        }
-                    });
+                kanso::scroll::scroll_view(ui, "prefs_content", |ui| {
+                    // Scrollbar sits flush at the edge. Reserve only 10px
+                    // here: the solid scrollbar already takes ~10px
+                    // (bar_inner_margin 4 + bar_width 6), so total right
+                    // padding (gap + scrollbar) ≈ 20px, matching the left.
+                    ui.set_max_width((ui.available_width() - 10.0).max(0.0));
+                    match self.section {
+                        Section::Hotkeys => self.hotkeys_panel(ui),
+                        Section::Providers => self.providers_panel(ui),
+                        Section::Behavior => self.behavior_panel(ui),
+                        Section::Privacy => self.privacy_panel(ui),
+                        Section::About => self.about_panel(ui),
+                    }
+                });
             });
 
         if quit_requested {
@@ -1732,7 +1731,16 @@ impl PrefsApp {
                     }
                 })
                 .collect();
-            kanso::widgets::app_picker(ui, &entries, &mut self.selected_app, &mut self.app_filter);
+            // Collapsed combo (search inside) so it stays one row tall until
+            // opened, instead of an always-visible list.
+            kanso::widgets::app_picker_combo(
+                ui,
+                "blocklist_app_picker",
+                &entries,
+                &mut self.selected_app,
+                &mut self.app_filter,
+                "Choose an app…",
+            );
         }
         ui.add_space(8.0);
         let can_add = self
