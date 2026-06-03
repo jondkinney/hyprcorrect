@@ -582,8 +582,60 @@ impl PrefsApp {
     }
 }
 
+/// Daemon-stale relaunch overlay: a prominent, opaque-backed call-to-action laid
+/// over the right of the action footer (covering Save/Cancel) so the user
+/// relaunches the new build before doing anything else there. Returns whether the
+/// relaunch button was clicked. Drawn on a foreground layer from the footer
+/// panel's rect, so it sits above — and swallows clicks to — the footer widgets
+/// beneath it.
+fn relaunch_overlay(ctx: &egui::Context, footer: egui::Rect) -> bool {
+    let mut clicked = false;
+    // Cover the right portion of the footer, anchored to the bottom-right corner.
+    let width = (footer.width() * 0.5).clamp(260.0, footer.width());
+    let rect =
+        egui::Rect::from_min_max(egui::pos2(footer.right() - width, footer.top()), footer.max);
+    egui::Area::new(egui::Id::new("relaunch_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.left_top())
+        .show(ctx, |ui| {
+            ui.expand_to_include_rect(rect);
+            // Opaque backdrop hiding the footer widgets behind it, with a thin
+            // accent edge separating it from the Quit side.
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(200));
+            ui.painter().vline(
+                rect.left(),
+                rect.y_range(),
+                egui::Stroke::new(1.0, kanso::palette::WARN),
+            );
+            // Swallow any click on the backdrop so the hidden Save/Cancel can't
+            // be triggered through it.
+            ui.allocate_rect(rect, egui::Sense::click());
+            // The relaunch CTA, spanning the overlay minus padding.
+            let pad = 20.0;
+            let btn_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + pad, rect.center().y - 15.0),
+                egui::pos2(rect.right() - pad, rect.center().y + 15.0),
+            );
+            let label =
+                egui::RichText::new("Relaunch daemon (new build)").color(kanso::palette::WARN);
+            if ui
+                .put(btn_rect, egui::Button::new(label))
+                .on_hover_text(
+                    "The on-disk binary is newer than the running daemon. \
+                     Click to quit the old daemon and spawn the new one.",
+                )
+                .clicked()
+            {
+                clicked = true;
+            }
+        });
+    clicked
+}
+
 impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        kanso::scroll::scroll_momentum(ctx);
         apply_style(ctx);
         self.refresh_stale_check();
         self.poll_docker_op(ctx);
@@ -663,30 +715,11 @@ impl eframe::App for PrefsApp {
             .resizable(false)
             .default_width(200.0)
             .show(ctx, |ui| {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    if let Some(handle) = &logo {
-                        // The icon's SVG is cropped tight (so it
-                        // fills the tray slot), which makes its
-                        // content reach the very top of a flush
-                        // 28×28 widget — visually higher than the
-                        // heading's baseline. Allocate a slightly
-                        // taller rect and paint the image into the
-                        // lower 28 px so it lines up with the
-                        // "hyprcorrect" cap height.
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(28.0, 34.0), egui::Sense::hover());
-                        let icon_rect = egui::Rect::from_min_size(
-                            rect.left_top() + egui::vec2(0.0, 6.0),
-                            egui::vec2(28.0, 28.0),
-                        );
-                        egui::Image::new(handle).paint_at(ui, icon_rect);
-                        ui.add_space(8.0);
-                    }
-                    ui.heading("hyprcorrect");
-                });
-                ui.add_space(14.0);
+                kanso::widgets::sidebar_header(
+                    ui,
+                    logo.as_ref().map(egui::Image::new),
+                    "hyprcorrect",
+                );
                 ui.separator();
                 ui.add_space(8.0);
                 for section in Section::all() {
@@ -701,7 +734,7 @@ impl eframe::App for PrefsApp {
         let mut quit_requested = false;
         let mut relaunch_requested = false;
 
-        egui::TopBottomPanel::bottom("actions")
+        let actions = egui::TopBottomPanel::bottom("actions")
             .resizable(false)
             .min_height(54.0)
             // 20px horizontal padding to line the action row up with the
@@ -714,21 +747,9 @@ impl eframe::App for PrefsApp {
                 ui.horizontal_centered(|ui| {
                     // 20px between buttons.
                     ui.spacing_mut().item_spacing.x = 20.0;
-                    let quit_label = egui::RichText::new("Quit hyprcorrect")
-                        .color(egui::Color32::from_rgb(220, 90, 90));
+                    let quit_label = egui::RichText::new("Quit").color(kanso::palette::ERROR);
                     if ui.add(egui::Button::new(quit_label)).clicked() {
                         quit_requested = true;
-                    }
-                    if self.daemon_stale {
-                        let relaunch_label = egui::RichText::new("Relaunch daemon (new build)")
-                            .color(egui::Color32::from_rgb(220, 160, 50));
-                        let resp = ui.add(egui::Button::new(relaunch_label)).on_hover_text(
-                            "The on-disk binary is newer than the running daemon. \
-                                 Click to quit the old daemon and spawn the new one.",
-                        );
-                        if resp.clicked() {
-                            relaunch_requested = true;
-                        }
                     }
 
                     if !self.status.text.is_empty() {
@@ -740,23 +761,28 @@ impl eframe::App for PrefsApp {
                         ui.colored_label(color, &self.status.text);
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 20.0;
-                        if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Save"))
-                            .clicked()
-                        {
-                            self.save();
-                        }
-                        if ui
-                            .add_enabled(self.dirty(), egui::Button::new("Cancel"))
-                            .clicked()
-                        {
-                            self.cancel();
-                        }
-                    });
+                    // The shared design system's settings action bar. Our
+                    // dirty state is multi-source (config + llm_keys +
+                    // autostart), so feed the precomputed flag via
+                    // `from_dirty`; kanso paints the unsaved dot + Cancel/Save.
+                    match kanso::widgets::DirtyFooter::from_dirty(self.dirty())
+                        .revert_label("Cancel")
+                        .show(ui)
+                    {
+                        kanso::widgets::FooterAction::Save => self.save(),
+                        kanso::widgets::FooterAction::Revert => self.cancel(),
+                        kanso::widgets::FooterAction::None => {}
+                    }
                 });
             });
+
+        // A stale daemon is the thing to fix first: instead of an inline
+        // button competing with Save/Cancel, overlay the relaunch across the
+        // right of the footer on an opaque backdrop, covering (and blocking)
+        // those actions so it reads as the required step before anything else.
+        if self.daemon_stale {
+            relaunch_requested = relaunch_overlay(ctx, actions.response.rect);
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -767,26 +793,34 @@ impl eframe::App for PrefsApp {
                     left: 20,
                     right: 0,
                     top: 18,
-                    bottom: 18,
+                    // Match the 20px side padding (was 18, a touch short).
+                    bottom: 20,
                 }),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Scrollbar sits flush at the edge. Reserve only 10px
-                        // here: the solid scrollbar already takes ~10px
-                        // (bar_inner_margin 4 + bar_width 6), so total right
-                        // padding (gap + scrollbar) ≈ 20px, matching the left.
-                        ui.set_max_width((ui.available_width() - 10.0).max(0.0));
-                        match self.section {
-                            Section::Hotkeys => self.hotkeys_panel(ui),
-                            Section::Providers => self.providers_panel(ui),
-                            Section::Behavior => self.behavior_panel(ui),
-                            Section::Privacy => self.privacy_panel(ui),
-                            Section::About => self.about_panel(ui),
-                        }
-                    });
+                // Reset the scroll to the top whenever the section changes, so a
+                // new section always opens at the top instead of inheriting the
+                // prior section's offset (which left a shorter section scrolled
+                // off-screen). Previous section tracked in egui memory.
+                let shown_id = ui.make_persistent_id("prefs_section_shown");
+                if ui.data(|d| d.get_temp::<Section>(shown_id)) != Some(self.section) {
+                    kanso::scroll::scroll_view_reset(ui, "prefs_content");
+                    ui.data_mut(|d| d.insert_temp(shown_id, self.section));
+                }
+                kanso::scroll::scroll_view(ui, "prefs_content", |ui| {
+                    // Scrollbar sits flush at the edge. Reserve only 10px
+                    // here: the solid scrollbar already takes ~10px
+                    // (bar_inner_margin 4 + bar_width 6), so total right
+                    // padding (gap + scrollbar) ≈ 20px, matching the left.
+                    ui.set_max_width((ui.available_width() - 10.0).max(0.0));
+                    match self.section {
+                        Section::Hotkeys => self.hotkeys_panel(ui),
+                        Section::Providers => self.providers_panel(ui),
+                        Section::Behavior => self.behavior_panel(ui),
+                        Section::Privacy => self.privacy_panel(ui),
+                        Section::About => self.about_panel(ui),
+                    }
+                });
             });
 
         if quit_requested {
@@ -1119,7 +1153,7 @@ impl PrefsApp {
             // "checking…" message instead of flashing a wrong state.
             if probe_in_flight {
                 ui.colored_label(
-                    egui::Color32::from_gray(170),
+                    kanso::palette::TEXT_MUTED,
                     "Checking for a running LanguageTool server…",
                 );
             }
@@ -1130,10 +1164,7 @@ impl PrefsApp {
             LanguageToolStatus::Reachable {
                 managed_container_running,
             } => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(110, 200, 130),
-                    format!("Reachable at {url}"),
-                );
+                ui.colored_label(kanso::palette::OK, format!("Reachable at {url}"));
                 ui.add_space(8.0);
                 if managed_container_running {
                     // This is our container — give the user the same
@@ -1213,11 +1244,13 @@ impl PrefsApp {
                     } else {
                         format!("Downloading {:.1} GB…", done as f64 / GB)
                     };
-                    ui.add(egui::ProgressBar::new(frac).text(text));
+                    kanso::widgets::progress(ui, frac, &text);
                 }
                 // Done/Failed/Cancelled are consumed by poll_ngram_download.
                 _ => {
-                    ui.add(egui::ProgressBar::new(1.0).text("Unzipping (~16 GB)…"));
+                    kanso::widgets::ProgressBar::indeterminate()
+                        .text("Unzipping (~16 GB)…")
+                        .show(ui);
                 }
             }
             ui.add_space(4.0);
@@ -1245,7 +1278,7 @@ impl PrefsApp {
         // the "Remove downloaded data" control lives in the field below.
         if self.lt_ngrams == Some(true) {
             ui.colored_label(
-                egui::Color32::from_rgb(110, 200, 130),
+                kanso::palette::OK,
                 "Loaded — real-word confusions are caught (their/there, its/it's, then/than).",
             );
             if downloaded.is_none()
@@ -1319,14 +1352,13 @@ impl PrefsApp {
 
         // No data anywhere → the one-click download.
         if ui
-            .add_enabled(
-                !op_in_flight && base.is_some(),
-                egui::Button::new("Download n-grams (~8.4 GB)"),
-            )
-            .on_hover_text(
-                "Downloads LanguageTool's English n-gram data to the app's data \
-                 folder and enables it. Needs ~24 GB free while unzipping.",
-            )
+            .add_enabled_ui(!op_in_flight && base.is_some(), |ui| {
+                kanso::widgets::primary_button(ui, "Download n-grams (~8.4 GB)").on_hover_text(
+                    "Downloads LanguageTool's English n-gram data to the app's data \
+                     folder and enables it. Needs ~24 GB free while unzipping.",
+                )
+            })
+            .inner
             .clicked()
             && let Some(d) = base.clone()
         {
@@ -1356,25 +1388,24 @@ impl PrefsApp {
                     "Nothing answers at {url}, and Docker isn't installed — \
                      install Docker or point the URL at an existing server."
                 ),
-                egui::Color32::from_gray(170),
+                kanso::palette::TEXT_MUTED,
             ),
-            DockerState::DockerUnavailable(msg) => (
-                format!("Docker unavailable: {msg}"),
-                egui::Color32::from_rgb(220, 160, 50),
-            ),
+            DockerState::DockerUnavailable(msg) => {
+                (format!("Docker unavailable: {msg}"), kanso::palette::WARN)
+            }
             DockerState::AbsentContainer => {
-                ("Not installed.".to_string(), egui::Color32::from_gray(170))
+                ("Not installed.".to_string(), kanso::palette::TEXT_MUTED)
             }
             DockerState::ContainerStopped => (
                 format!("Our container exists but is stopped. Start it to reach {url}."),
-                egui::Color32::from_rgb(220, 160, 50),
+                kanso::palette::WARN,
             ),
             DockerState::ContainerRunning => (
                 format!(
                     "Our container is running but {url} doesn't answer — \
                      likely a port-mapping mismatch."
                 ),
-                egui::Color32::from_rgb(220, 160, 50),
+                kanso::palette::WARN,
             ),
             DockerState::ForeignContainer { name, running } => (
                 if *running {
@@ -1389,7 +1420,7 @@ impl PrefsApp {
                          Start it manually (`docker start {name}`) or install ours."
                     )
                 },
-                egui::Color32::from_rgb(220, 160, 50),
+                kanso::palette::WARN,
             ),
         };
         ui.colored_label(status_color, status_text);
@@ -1429,8 +1460,11 @@ impl PrefsApp {
                         .to_string(),
                 };
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Install with Docker"))
-                    .on_hover_text(hover)
+                    .add_enabled_ui(enabled, |ui| {
+                        kanso::widgets::primary_button(ui, "Install with Docker")
+                            .on_hover_text(hover)
+                    })
+                    .inner
                     .clicked()
                     && let Some(port) = port
                 {
@@ -1484,7 +1518,7 @@ impl PrefsApp {
             // Tighten inline spacing so "Pulls the <link> image" reads as
             // one sentence rather than three widgets with default gaps.
             ui.spacing_mut().item_spacing.x = 0.0;
-            let muted = egui::Color32::from_gray(170);
+            let muted = kanso::palette::TEXT_MUTED;
             ui.label(
                 egui::RichText::new("Pulls the ")
                     .size(CAPTION_SIZE)
@@ -1516,78 +1550,67 @@ impl PrefsApp {
 
         #[cfg(target_os = "linux")]
         {
-            field_label(ui, "Start at login");
-            ui.add_space(4.0);
-            let resp = ui.checkbox(
+            if kanso::widgets::labeled_toggle(
+                ui,
+                "Start at login",
                 &mut self.autostart_enabled,
                 "Launch hyprcorrect when I log in",
-            );
-            if resp.changed() {
-                self.clear_status();
-            }
-            ui.add_space(6.0);
-            caption_with_code(
-                ui,
                 "Drops a `hyprcorrect.desktop` into `~/.config/autostart/` \
                  so the daemon starts with your session. Takes effect on save.",
-            );
+            )
+            .changed()
+            {
+                self.clear_status();
+            }
             ui.add_space(SETTING_BLOCK_SPACING);
         }
 
-        field_label(ui, "Review popup");
-        ui.add_space(4.0);
-        if ui
-            .checkbox(
-                &mut self.config.behavior.review_starts_in_vim,
-                "Open in vim mode",
-            )
-            .changed()
-        {
-            self.clear_status();
-        }
-        ui.add_space(6.0);
-        caption_with_code(
+        if kanso::widgets::labeled_toggle(
             ui,
+            "Review popup",
+            &mut self.config.behavior.review_starts_in_vim,
+            "Open in vim mode",
             "Start the review popup in vim mode — modal editing of the whole \
              sentence — instead of word-edit (Tab) mode. `Ctrl+E` toggles between \
              the two either way, so with this on it flips to word-edit.",
-        );
-        ui.add_space(SETTING_BLOCK_SPACING);
-
-        field_label(ui, "Provider fallback");
-        ui.add_space(4.0);
-        if ui
-            .checkbox(
-                &mut self.config.behavior.fallback_to_languagetool,
-                "Try LanguageTool before Spellbook",
-            )
-            .changed()
+        )
+        .changed()
         {
             self.clear_status();
         }
-        ui.add_space(6.0);
-        caption(
+        ui.add_space(SETTING_BLOCK_SPACING);
+
+        if kanso::widgets::labeled_toggle(
             ui,
+            "Provider fallback",
+            &mut self.config.behavior.fallback_to_languagetool,
+            "Try LanguageTool before Spellbook",
             "When a fix routed to the LLM can't run — no API key, an unsupported \
              backend, or the call fails — try your LanguageTool server before \
              dropping to the offline Spellbook. Only takes effect when LanguageTool \
              is enabled with a URL in Providers; otherwise fixes fall straight \
              through to Spellbook.",
-        );
+        )
+        .changed()
+        {
+            self.clear_status();
+        }
         ui.add_space(SETTING_BLOCK_SPACING);
 
         field_label(ui, "Word definitions");
         ui.add_space(4.0);
         {
             use hyprcorrect_core::DefinitionSource as DS;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let cur = &mut self.config.behavior.definitions;
-                changed |= ui.selectable_value(cur, DS::Local, "Offline").clicked();
-                changed |= ui.selectable_value(cur, DS::Online, "Online").clicked();
-                changed |= ui.selectable_value(cur, DS::Off, "Off").clicked();
-            });
+            let cur = &mut self.config.behavior.definitions;
+            let changed = kanso::widgets::segmented(
+                ui,
+                cur,
+                &[
+                    (DS::Local, "Offline"),
+                    (DS::Online, "Online"),
+                    (DS::Off, "Off"),
+                ],
+            );
             if changed {
                 self.clear_status();
             }
@@ -1614,10 +1637,10 @@ impl PrefsApp {
              characters after a fix lands.",
         );
         ui.add_space(6.0);
-        let response = ui.add(
-            egui::Slider::new(&mut self.config.behavior.pause_per_backspace_ms, 0..=30)
-                .suffix(" ms"),
-        );
+        let response =
+            kanso::widgets::Slider::new(&mut self.config.behavior.pause_per_backspace_ms, 0..=30)
+                .suffix(" ms")
+                .show(ui);
         if response.changed() {
             self.clear_status();
         }
@@ -1742,118 +1765,52 @@ impl PrefsApp {
             .collect();
 
         // Resolve each candidate to its display name + icon ahead of the
-        // closure so we don't borrow `self` twice.
+        // picker so we aren't borrowing `self.app_registry` while the picker
+        // borrows `self.selected_app` / `self.app_filter`.
         let candidates: Vec<crate::apps::AppMeta> = candidate_ids
             .iter()
             .map(|id| self.app_registry.lookup(ui.ctx(), id))
             .collect();
 
-        ui.horizontal(|ui| {
-            let selected_display = self
-                .selected_app
-                .as_deref()
-                .and_then(|id| candidates.iter().find(|c| c.identifier == id))
-                .map(|c| c.display_name.clone())
-                .unwrap_or_else(|| {
-                    if candidates.is_empty() {
-                        "(no running apps detected)".to_string()
-                    } else {
-                        "Choose an app…".to_string()
+        if candidates.is_empty() {
+            caption(ui, "(no running apps detected)");
+        } else {
+            // kanso owns the searchable icon list; hyprcorrect supplies the
+            // candidates and their resolved `.desktop` icon textures.
+            let entries: Vec<kanso::widgets::AppEntry> = candidates
+                .iter()
+                .map(|c| {
+                    let entry =
+                        kanso::widgets::AppEntry::new(c.identifier.clone(), c.display_name.clone());
+                    match &c.icon {
+                        Some(icon) => entry.with_icon(icon.id()),
+                        None => entry,
                     }
-                });
-            let selected_ref = &mut self.selected_app;
-            let filter = &mut self.app_filter;
-            // `ComboBox::width` is the button's *outer* width, whereas the
-            // "by class name" text field below sets `desired_width` plus an
-            // 8px symmetric margin (outer = width + 16). Subtract 64 (= 80 - 16)
-            // so the combo's outer width matches that field's and the two "Add"
-            // buttons line up 20px from the edge.
-            let combo_w = (ui.available_width() - 64.0).max(120.0);
-            egui::ComboBox::from_id_salt("blocklist_app_picker")
-                .selected_text(selected_display)
-                .width(combo_w)
-                .show_ui(ui, |ui| {
-                    // Match the combo width, plus a hair of top space so the
-                    // search field isn't flush against the combo button.
-                    ui.set_min_width(combo_w);
-                    ui.add_space(2.0);
-                    ui.add(
-                        egui::TextEdit::singleline(filter)
-                            .hint_text("Search")
-                            .margin(egui::Margin::symmetric(8, 4))
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.separator();
-                    let needle = filter.to_ascii_lowercase();
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        // Full width so the scrollbar sits at the right edge,
-                        // not floating in the middle behind narrow rows.
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for c in &candidates {
-                                if !needle.is_empty()
-                                    && !c.display_name.to_ascii_lowercase().contains(&needle)
-                                    && !c.identifier.to_ascii_lowercase().contains(&needle)
-                                {
-                                    continue;
-                                }
-                                let is_selected =
-                                    selected_ref.as_deref() == Some(c.identifier.as_str());
-                                // Full-width clickable row: icon (or placeholder
-                                // tile) + name with a tight gap, and a
-                                // selection/hover highlight spanning the row.
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 26.0),
-                                    egui::Sense::click(),
-                                );
-                                if ui.is_rect_visible(rect) {
-                                    let vis = ui.style().interact_selectable(&resp, is_selected);
-                                    if is_selected || resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            egui::CornerRadius::same(4),
-                                            vis.bg_fill,
-                                        );
-                                    }
-                                    let icon_rect = egui::Rect::from_min_size(
-                                        egui::pos2(rect.left() + 4.0, rect.center().y - 10.0),
-                                        egui::vec2(20.0, 20.0),
-                                    );
-                                    if let Some(handle) = &c.icon {
-                                        egui::Image::new(handle).paint_at(ui, icon_rect);
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            icon_rect.shrink(1.0),
-                                            egui::CornerRadius::same(4),
-                                            egui::Color32::from_gray(58),
-                                        );
-                                    }
-                                    ui.painter().text(
-                                        egui::pos2(icon_rect.right() + 6.0, rect.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        &c.display_name,
-                                        egui::TextStyle::Body.resolve(ui.style()),
-                                        vis.text_color(),
-                                    );
-                                }
-                                if resp.clicked() {
-                                    *selected_ref = Some(c.identifier.clone());
-                                }
-                            }
-                        });
-                });
-            let can_add = self.selected_app.as_ref().is_some_and(|s| {
-                !s.is_empty() && !already_blocked.contains(&s.to_ascii_lowercase())
-            });
-            if ui.add_enabled(can_add, egui::Button::new("Add")).clicked()
-                && let Some(class) = self.selected_app.take()
-            {
-                self.config.privacy.app_blocklist.push(class);
-                self.app_filter.clear();
-                self.clear_status();
-            }
-        });
+                })
+                .collect();
+            // Collapsed combo (search inside) so it stays one row tall until
+            // opened, instead of an always-visible list.
+            kanso::widgets::app_picker_combo(
+                ui,
+                "blocklist_app_picker",
+                &entries,
+                &mut self.selected_app,
+                &mut self.app_filter,
+                "Choose an app…",
+            );
+        }
+        ui.add_space(8.0);
+        let can_add = self
+            .selected_app
+            .as_ref()
+            .is_some_and(|s| !s.is_empty() && !already_blocked.contains(&s.to_ascii_lowercase()));
+        if ui.add_enabled(can_add, egui::Button::new("Add")).clicked()
+            && let Some(class) = self.selected_app.take()
+        {
+            self.config.privacy.app_blocklist.push(class);
+            self.app_filter.clear();
+            self.clear_status();
+        }
 
         ui.add_space(SETTING_BLOCK_SPACING);
 
@@ -1888,24 +1845,27 @@ impl PrefsApp {
     }
 
     fn about_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("About hyprcorrect");
-        ui.add_space(14.0);
-
-        ui.label(
-            egui::RichText::new(format!("Version {}", hyprcorrect_core::version()))
-                .size(15.0)
-                .strong(),
+        // The shared About hero: centered logo + name + version + blurb +
+        // links. hyprcorrect's old left-aligned, logo-less pane folds into
+        // it; Source/License become entries in the links column.
+        let logo = self.logo_texture(ui.ctx()).cloned();
+        let version = hyprcorrect_core::version();
+        kanso::widgets::about_pane(
+            ui,
+            kanso::widgets::AboutInfo {
+                logo: logo.as_ref().map(egui::Image::new),
+                name: "hyprcorrect",
+                version,
+                blurb: Some("Keyboard-driven spelling and typo correction for the whole desktop."),
+                links: &[
+                    ("Repository", "https://github.com/jondkinney/hyprcorrect"),
+                    (
+                        "License (MIT OR Apache-2.0)",
+                        "https://github.com/jondkinney/hyprcorrect#license",
+                    ),
+                ],
+            },
         );
-        ui.add_space(8.0);
-        ui.label("Keyboard-driven spelling and typo correction for the whole desktop.");
-        ui.add_space(SETTING_BLOCK_SPACING);
-
-        field_label(ui, "Source");
-        ui.hyperlink("https://github.com/jondkinney/hyprcorrect");
-        ui.add_space(SETTING_BLOCK_SPACING);
-
-        field_label(ui, "License");
-        caption(ui, "MIT OR Apache-2.0");
     }
 }
 
@@ -1954,59 +1914,26 @@ fn provider_radio(
     selection: &mut ProviderId,
     llm_tooltip: Option<&str>,
 ) -> bool {
-    let before = *selection;
     // Order: simplest → most complex, and offline → potentially-online.
     // Spellbook is always offline (bundled dictionary). LanguageTool is
     // offline when self-hosted at localhost; the URL field next door
     // is where its locality is configured. LLM is always a network call.
     ui.horizontal(|ui| {
-        ui.radio_value(selection, ProviderId::Spellbook, "Spellbook (offline)");
-        ui.radio_value(selection, ProviderId::LanguageTool, "LanguageTool");
-        ui.radio_value(selection, ProviderId::Llm, "LLM");
+        let changed = kanso::widgets::radio_group_horizontal(
+            ui,
+            selection,
+            &[
+                (ProviderId::Spellbook, "Spellbook (offline)"),
+                (ProviderId::LanguageTool, "LanguageTool"),
+                (ProviderId::Llm, "LLM"),
+            ],
+        );
         if let Some(tip) = llm_tooltip {
-            info_icon(ui).on_hover_text(tip);
+            kanso::widgets::info_icon(ui, tip);
         }
-    });
-    *selection != before
-}
-
-/// Paint a small circle-with-`i` info icon at the current cursor
-/// in `ui`, sized to the row height. Drawn with the egui painter
-/// directly so we don't have to bundle an icon font or SVG just
-/// for one glyph — the bundled Adwaita Sans doesn't include the
-/// Unicode ⓘ codepoint and falls back to a tofu box otherwise.
-/// Caller chains `.on_hover_text(...)` on the returned response
-/// to attach a tooltip.
-fn info_icon(ui: &mut egui::Ui) -> egui::Response {
-    // Size the icon to the body text height so it sits flush
-    // with the "LLM" label next to it, not the larger radio
-    // hit-box.
-    let font_size = egui::TextStyle::Body.resolve(ui.style()).size;
-    let size = font_size;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-    let visuals = ui.visuals();
-    let stroke_color = if response.hovered() {
-        visuals.strong_text_color()
-    } else {
-        visuals.weak_text_color()
-    };
-    let painter = ui.painter();
-    let center = rect.center();
-    let radius = (size * 0.5) - 1.0;
-    painter.circle_stroke(center, radius, egui::Stroke::new(1.0, stroke_color));
-    // The "i" — drawn slightly above center because the glyph
-    // baseline sits low in most fonts.
-    painter.text(
-        center + egui::vec2(0.0, -0.5),
-        egui::Align2::CENTER_CENTER,
-        "i",
-        egui::FontId::proportional(size * 0.75),
-        stroke_color,
-    );
-    response
+        changed
+    })
+    .inner
 }
 
 /// Hosted LLM backends offered in the Add-provider dropdown. The combo is
@@ -2090,7 +2017,7 @@ fn not_wired_note(ui: &mut egui::Ui, backend: &str) {
         ))
         .size(CAPTION_SIZE)
         .line_height(Some(CAPTION_LINE_HEIGHT))
-        .color(egui::Color32::from_rgb(220, 160, 50)),
+        .color(kanso::palette::WARN),
     );
 }
 
@@ -2207,97 +2134,7 @@ fn placeholder_app_icon(ui: &mut egui::Ui) {
 fn active_dot(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
     ui.painter()
-        .circle_filled(rect.center(), 4.0, egui::Color32::from_rgb(110, 200, 130));
-}
-
-/// A combo-box drop button: a real egui button frame (so its height,
-/// rounding, and hover match the text field next to it and the other
-/// buttons) with a downward chevron painted on top — the bundled fonts
-/// lack the Geometric-Shapes glyphs, which tofu'd. `height` matches the
-/// adjacent field's height.
-fn combo_arrow_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
-    // `min_size` (not `add_sized`) so the button fills the full 30px cell —
-    // add_sized centers the empty button and left ~4px of dead space on the
-    // right, pushing the visible edge in past the 20px content margin.
-    let resp = ui.add(egui::Button::new("").min_size(egui::vec2(30.0, height)));
-    let c = resp.rect.center();
-    let stroke = egui::Stroke::new(1.6, egui::Color32::from_gray(200));
-    ui.painter().line_segment(
-        [c + egui::vec2(-4.0, -2.0), c + egui::vec2(0.0, 2.5)],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 2.5)],
-        stroke,
-    );
-    resp
-}
-
-/// An editable combo box: a typeable single-line field plus a chevron
-/// button that drops a menu of `options`. Picking an option overwrites
-/// the field. Returns whether `text` changed this frame (typed or
-/// picked). Mirrors egui's own `ComboBox` popup wiring.
-fn editable_combo(
-    ui: &mut egui::Ui,
-    id_salt: &str,
-    text: &mut String,
-    options: &[&str],
-    hint: &str,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let btn_w = 30.0;
-        // egui renders a TextEdit `desired_width + margin.sum().x` wide (the
-        // 8px-each-side margin is added ON TOP of desired_width), so reserve
-        // that 16px too — otherwise field + spacing + button overflow the
-        // row and the chevron clips off the right edge.
-        let field_w = (ui.available_width() - btn_w - 4.0 - TEXT_EDIT_MARGIN_X).max(80.0);
-        let edit = bordered_text_edit(
-            ui,
-            egui::TextEdit::singleline(text)
-                .hint_text(hint)
-                .margin(egui::Margin::symmetric(8, 6))
-                .desired_width(field_w),
-        );
-        changed |= edit.changed();
-        let btn = combo_arrow_button(ui, edit.rect.height());
-        // The whole field is the dropdown trigger: clicking the field OR the
-        // chevron toggles the menu (you can still type to enter a custom
-        // value). Anchor it to the field (not the narrow chevron, which made
-        // egui clamp the menu to a sliver), exactly the field's width, and a
-        // few px below so it clears the field's focus border.
-        // The popup's menu frame adds `menu_margin` (6px) on each side, so
-        // subtract 12 to make the popup's outer width match the field.
-        let popup_w = (edit.rect.width() - 12.0).max(80.0);
-        let toggled = edit.clicked() || btn.clicked();
-        egui::Popup::menu(&btn)
-            .anchor(&edit)
-            .gap(4.0)
-            .open_memory(toggled.then_some(egui::SetOpenCommand::Toggle))
-            .id(ui.make_persistent_id((id_salt, "popup")))
-            .width(popup_w)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-            .show(|ui| {
-                // Pin to exactly the field width every frame (`.width()` only
-                // seeds Area::default_width, and egui then remembers a stale
-                // size) and stop labels wrapping.
-                ui.set_min_width(popup_w);
-                ui.set_max_width(popup_w);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                if options.is_empty() {
-                    ui.add_enabled(false, egui::Button::new("(none available)").frame(false));
-                } else {
-                    for opt in options {
-                        if ui.selectable_label(text.as_str() == *opt, *opt).clicked() {
-                            *text = (*opt).to_string();
-                            changed = true;
-                        }
-                    }
-                }
-            });
-    });
-    changed
+        .circle_filled(rect.center(), 4.0, kanso::palette::OK);
 }
 
 impl PrefsApp {
@@ -2409,9 +2246,9 @@ impl PrefsApp {
         ui.add_space(SETTING_BLOCK_SPACING);
         field_label(ui, "Model");
         ui.add_space(4.0);
-        touched |= editable_combo(
+        touched |= kanso::widgets::editable_combo(
             ui,
-            &format!("model_{backend}"),
+            format!("model_{backend}"),
             &mut self.config.providers.llms[idx].model,
             models_for_backend(backend),
             "Pick or type a model",
@@ -2474,7 +2311,7 @@ impl PrefsApp {
         field_label(ui, "Provider");
         ui.add_space(4.0);
         let before = self.llm_draft.backend.clone();
-        if editable_combo(
+        if kanso::widgets::editable_combo(
             ui,
             "add_backend",
             &mut self.llm_draft.backend,
@@ -2496,7 +2333,7 @@ impl PrefsApp {
         field_label(ui, "Model");
         ui.add_space(4.0);
         let models = models_for_backend(&self.llm_draft.backend);
-        touched |= editable_combo(
+        touched |= kanso::widgets::editable_combo(
             ui,
             "add_model",
             &mut self.llm_draft.model,
@@ -2541,7 +2378,10 @@ impl PrefsApp {
             )
             .changed();
             save_clicked = ui
-                .add_enabled(can_add, egui::Button::new("Save provider"))
+                .add_enabled_ui(can_add, |ui| {
+                    kanso::widgets::primary_button(ui, "Save provider")
+                })
+                .inner
                 .clicked();
         });
         ui.add_space(4.0);
@@ -2624,28 +2464,7 @@ impl PrefsApp {
 /// we want a rounded, contained pill. Allocates a click-sized rect
 /// and paints the selection backdrop + label ourselves.
 fn sidebar_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    let height = 32.0;
-    let response = ui.allocate_response(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::click(),
-    );
-    let visuals = ui.style().interact_selectable(&response, selected);
-    if selected || response.hovered() {
-        ui.painter().rect_filled(
-            response.rect.expand(-2.0),
-            egui::CornerRadius::same(6),
-            visuals.bg_fill,
-        );
-    }
-    let text_pos = response.rect.left_center() + egui::vec2(12.0, 0.0);
-    ui.painter().text(
-        text_pos,
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(14.0),
-        visuals.text_color(),
-    );
-    response
+    kanso::widgets::nav_item(ui, selected, label)
 }
 
 /// Add a [`egui::TextEdit`] with a visible border in its *non-focused*
@@ -2665,30 +2484,19 @@ fn bordered_text_edit(ui: &mut egui::Ui, te: egui::TextEdit<'_>) -> egui::Respon
 /// Single-line text input with consistent inner padding so fields
 /// don't collapse to ~16 px tall at the body font size.
 fn padded_text_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
-    bordered_text_edit(
-        ui,
-        egui::TextEdit::singleline(text)
-            .margin(egui::Margin::symmetric(8, 6))
-            .desired_width(f32::INFINITY),
-    )
+    kanso::widgets::padded_text_edit(ui, text)
 }
 
 /// Single-line *password* input with the same padding as
 /// [`padded_text_edit`]. The contents render as bullets.
 fn padded_password_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
-    bordered_text_edit(
-        ui,
-        egui::TextEdit::singleline(text)
-            .password(true)
-            .margin(egui::Margin::symmetric(8, 6))
-            .desired_width(f32::INFINITY),
-    )
+    kanso::widgets::password_field(ui, text)
 }
 
 /// Bold-ish label introducing a setting. Slightly larger than the
 /// caption text below the input.
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).strong().size(15.0));
+    kanso::widgets::field_label(ui, text);
 }
 
 /// A [`field_label`] with a trailing `(i)` info icon whose tooltip
@@ -2698,7 +2506,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 fn field_label_with_info(ui: &mut egui::Ui, label: &str, tip: &str) {
     ui.horizontal(|ui| {
         field_label(ui, label);
-        info_icon(ui).on_hover_text(tip);
+        kanso::widgets::info_icon(ui, tip);
     });
 }
 
@@ -2712,7 +2520,7 @@ fn field_label_with_note(ui: &mut egui::Ui, label: &str, note: &str) {
         ui.label(
             egui::RichText::new(format!("({note})"))
                 .size(CAPTION_SIZE)
-                .color(egui::Color32::from_gray(170)),
+                .color(kanso::palette::TEXT_MUTED),
         );
     });
 }
@@ -2724,12 +2532,9 @@ const CAPTION_SIZE: f32 = 13.5;
 const CAPTION_LINE_HEIGHT: f32 = 20.0;
 
 fn caption(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(CAPTION_SIZE)
-            .line_height(Some(CAPTION_LINE_HEIGHT))
-            .color(egui::Color32::from_gray(170)),
-    );
+    // kanso's caption renders plain muted text and parses `backtick` spans
+    // into inline code pills — a superset of this one.
+    kanso::widgets::caption(ui, text);
 }
 
 /// Like [`caption`] but renders backtick-delimited spans as inline code
@@ -2738,108 +2543,9 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 /// a tight y-range hugging the glyph metrics (not the full row height) so
 /// they sit centered on the text rather than riding high.
 fn caption_with_code(ui: &mut egui::Ui, text: &str) {
-    use egui::text::LayoutJob;
-    // `valign: Center` keeps the (smaller, monospace) code glyphs centered
-    // on the plain text's line instead of sitting on its baseline.
-    let plain = egui::TextFormat {
-        font_id: egui::FontId::proportional(CAPTION_SIZE),
-        color: egui::Color32::from_gray(170),
-        line_height: Some(CAPTION_LINE_HEIGHT),
-        valign: egui::Align::Center,
-        ..Default::default()
-    };
-    let code = egui::TextFormat {
-        font_id: egui::FontId::monospace(CAPTION_SIZE - 1.0),
-        color: egui::Color32::from_gray(225),
-        line_height: Some(CAPTION_LINE_HEIGHT),
-        valign: egui::Align::Center,
-        ..Default::default()
-    };
-    // A no-break space inside each pill pads the backdrop a glyph-width
-    // past the code text on each side without opening a wrap point.
-    const NBSP: char = '\u{00A0}';
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = ui.available_width();
-    let mut in_code = false;
-    let mut buf = String::new();
-    let flush = |job: &mut LayoutJob, buf: &mut String, in_code: bool| {
-        if buf.is_empty() {
-            return;
-        }
-        if in_code {
-            job.append(&format!("{NBSP}{buf}{NBSP}"), 0.0, code.clone());
-        } else {
-            job.append(buf, 0.0, plain.clone());
-        }
-        buf.clear();
-    };
-    for c in text.chars() {
-        if c == '`' {
-            flush(&mut job, &mut buf, in_code);
-            in_code = !in_code;
-        } else {
-            buf.push(c);
-        }
-    }
-    flush(&mut job, &mut buf, in_code);
-
-    let galley = ui.fonts(|f| f.layout_job(job));
-    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
-    let origin = rect.min;
-    let painter = ui.painter();
-    let bg_color = egui::Color32::from_gray(48);
-    // Code spans are marked by the NBSP padding injected above.
-    type CodeRun = (f32, f32, f32, f32); // (x0, x1, y_min, y_max)
-    for row in &galley.rows {
-        let row_rect = row.rect();
-        let mut run: Option<CodeRun> = None;
-        let mut in_run = false;
-        let flush_run = |run: &mut Option<CodeRun>| {
-            if let Some((x0, x1, y_min, y_max)) = run.take()
-                && y_min.is_finite()
-                && y_max.is_finite()
-            {
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x0 + 1.0, y_min - 2.0),
-                        egui::pos2(x1 - 1.0, y_max + 1.0),
-                    ),
-                    3.0,
-                    bg_color,
-                );
-            }
-        };
-        for glyph in &row.glyphs {
-            let x0 = origin.x + row_rect.min.x + glyph.pos.x;
-            let x1 = x0 + glyph.size().x;
-            let baseline = origin.y + row_rect.min.y + glyph.pos.y;
-            let gy_min = baseline - glyph.font_ascent;
-            let gy_max = baseline + (glyph.font_height - glyph.font_ascent);
-            if glyph.chr == NBSP {
-                match run {
-                    Some((_, ref mut x_end, _, _)) => *x_end = x1,
-                    None => run = Some((x0, x1, f32::INFINITY, f32::NEG_INFINITY)),
-                }
-                if in_run {
-                    in_run = false;
-                    flush_run(&mut run);
-                } else {
-                    in_run = true;
-                }
-            } else if in_run {
-                match run {
-                    Some((_, ref mut x_end, ref mut y_min, ref mut y_max)) => {
-                        *x_end = x1;
-                        *y_min = y_min.min(gy_min);
-                        *y_max = y_max.max(gy_max);
-                    }
-                    None => run = Some((x0, x1, gy_min, gy_max)),
-                }
-            }
-        }
-        flush_run(&mut run);
-    }
-    painter.galley(origin, galley, egui::Color32::PLACEHOLDER);
+    // Was a ~90-line glyph-metric pill painter, byte-for-byte vernier's;
+    // now the shared design system owns it.
+    kanso::widgets::caption(ui, text);
 }
 
 const SETTING_BLOCK_SPACING: f32 = 22.0;
@@ -2855,140 +2561,6 @@ const TEXT_EDIT_MARGIN_X: f32 = 16.0;
 /// `TextEdit::min_size` so they all match in every state.
 const CONTROL_HEIGHT: f32 = 30.0;
 
-/// The Hyprland/Omarchy logo glyph in the bundled `omarchy.ttf`.
-/// Renders as a blank tofu box if the font isn't installed — we
-/// guard with [`OMARCHY_FONT_AVAILABLE`] before using it.
-const OMARCHY_LOGO: char = '\u{e900}';
-
-static OMARCHY_FONT_AVAILABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Register the fonts the chord chip needs into a dedicated
-/// `shortcut` font family:
-///
-///   shortcut = [ omarchy.ttf ? , sans-with-modifier-glyphs ? ,
-///                default Proportional ]
-///
-/// The chain order means egui draws each character with the first
-/// font that has it. Omarchy gives us the Hyprland logo at
-/// `\u{e900}`; a system sans font with `⌃ ⇧ ⌥ ⌘` covers the
-/// standard modifier glyphs; the default proportional font handles
-/// plain letters. If no symbol font is found we fall back to the
-/// default, and `chord_glyphs` will show ASCII names through
-/// [`OMARCHY_FONT_AVAILABLE`] — but the symbol font search rarely
-/// fails on a desktop Linux system.
-///
-/// Mirrors `vernier`'s `install_glyph_fonts` pattern.
-pub(crate) fn install_glyph_fonts(ctx: &egui::Context) {
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-
-    let mut fonts = egui::FontDefinitions::default();
-    let mut shortcut_chain: Vec<String> = Vec::new();
-
-    // -- Highest priority: the bundled sans with the modifier glyphs --
-    // Adwaita Sans Regular ships with the app under `crates/
-    // hyprcorrect-ui/assets/`. It covers ASCII plus the macOS-style
-    // key glyphs (⌃ ⇧ ⌥ ⌘ ⎋ ↵ ⇥ ⌫ ⌦ ␣ ↑↓←→), so the chip renders
-    // identically on any system without depending on whatever
-    // fonts happen to be installed.
-    const ADWAITA_SANS: &[u8] = include_bytes!("../assets/AdwaitaSans-Regular.ttf");
-    fonts.font_data.insert(
-        "shortcut_symbols".into(),
-        Arc::new(egui::FontData::from_static(ADWAITA_SANS)),
-    );
-    shortcut_chain.push("shortcut_symbols".into());
-
-    // -- Then the egui defaults ---------------------------------------
-    if let Some(default_chain) = fonts.families.get(&egui::FontFamily::Proportional) {
-        shortcut_chain.extend(default_chain.iter().cloned());
-    }
-
-    // -- Last: Omarchy, used only for codepoints no earlier font has
-    // — that's the Hyprland logo at U+E900. We push it last because
-    // Omarchy's cmap claims most ASCII codepoints with empty glyphs,
-    // so putting it earlier would silently drop letters like 'c' / 'o'
-    // from the chip's text.
-    let mut omarchy_candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut p = std::path::PathBuf::from(home);
-        p.push(".local/share/fonts/omarchy.ttf");
-        omarchy_candidates.push(p);
-    }
-    omarchy_candidates.push("/usr/share/fonts/omarchy.ttf".into());
-    for path in omarchy_candidates {
-        if let Ok(bytes) = std::fs::read(&path) {
-            let mut data = egui::FontData::from_owned(bytes);
-            // The omarchy glyph fills its full em square; at scale=1
-            // it towers over the Adwaita letters / modifier symbols
-            // at the same point size. 0.85 lands the logo at the
-            // letters' visual cap height; positive y_offset_factor
-            // nudges it DOWN so it sits on the same baseline as the F.
-            // Mirrors vernier's tweak.
-            data.tweak = egui::FontTweak {
-                scale: 0.75,
-                y_offset_factor: 0.09,
-                ..Default::default()
-            };
-            fonts.font_data.insert("omarchy".into(), Arc::new(data));
-            shortcut_chain.push("omarchy".into());
-            OMARCHY_FONT_AVAILABLE.store(true, Ordering::Relaxed);
-            break;
-        }
-    }
-
-    fonts
-        .families
-        .insert(egui::FontFamily::Name("shortcut".into()), shortcut_chain);
-    ctx.set_fonts(fonts);
-}
-
-/// Replace `+`-separated modifier tokens with Unicode glyphs the
-/// reader recognizes from native menus. Used to display the stored
-/// accelerator string on the chord chip.
-fn chord_glyphs(stored: &str) -> String {
-    use std::sync::atomic::Ordering;
-    let omarchy = OMARCHY_FONT_AVAILABLE.load(Ordering::Relaxed);
-    stored
-        .split('+')
-        .filter(|t| !t.trim().is_empty())
-        .map(|tok| match tok.trim().to_ascii_uppercase().as_str() {
-            "SUPER" | "META" | "CMD" | "COMMAND" | "WIN" | "WINDOWS" => {
-                if omarchy {
-                    OMARCHY_LOGO.to_string()
-                } else {
-                    "⌘".to_string()
-                }
-            }
-            "CTRL" | "CONTROL" => "⌃".to_string(),
-            "SHIFT" => "⇧".to_string(),
-            "ALT" | "OPTION" => "⌥".to_string(),
-            "RETURN" | "ENTER" => "↵".to_string(),
-            "TAB" => "⇥".to_string(),
-            "ESCAPE" | "ESC" => "⎋".to_string(),
-            "BACKSPACE" => "⌫".to_string(),
-            "DELETE" => "⌦".to_string(),
-            "SPACE" => "␣".to_string(),
-            "UP" => "↑".to_string(),
-            "DOWN" => "↓".to_string(),
-            "LEFT" => "←".to_string(),
-            "RIGHT" => "→".to_string(),
-            "PRIOR" => "PgUp".to_string(),
-            "NEXT" => "PgDn".to_string(),
-            // Punctuation that chord-capture spells out so the
-            // saved string can't collide with the `+` modifier
-            // separator. Render them as the ASCII characters
-            // they represent.
-            "PLUS" => "+".to_string(),
-            "MINUS" => "-".to_string(),
-            "EQUAL" => "=".to_string(),
-            "UNDERSCORE" => "_".to_string(),
-            other => other.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Render one row of the Hotkeys panel: a chord-capture chip whose
 /// label reflects `value` (or a "Press…" / "Click to set" prompt
 /// depending on capture state). Returns `true` when the row was
@@ -3000,46 +2572,11 @@ fn hotkey_chord_row(
     capturing: Option<HotkeyTarget>,
 ) -> bool {
     let is_capturing_this = capturing == Some(target);
-    let display = if is_capturing_this {
-        "Press a shortcut…".to_string()
-    } else if value.is_empty() {
-        "Click to set".to_string()
-    } else {
-        chord_glyphs(value)
-    };
-    chord_chip(ui, &display, is_capturing_this).clicked()
-}
-
-/// Render the chord-capture chip — a wide, click-to-record button
-/// that displays the current accelerator or a prompt while recording.
-/// Uses the `shortcut` font family registered by
-/// [`install_glyph_fonts`] so modifier glyphs (⌃ ⇧ ⌥ ⌘ / Omarchy
-/// logo) render even when egui's default proportional font lacks
-/// them.
-fn chord_chip(ui: &mut egui::Ui, display: &str, capturing: bool) -> egui::Response {
-    let chip_size = egui::vec2(280.0, 32.0);
-    let resp = ui.allocate_response(chip_size, egui::Sense::click());
-    let bg = if capturing {
-        egui::Color32::from_rgb(50, 90, 140)
-    } else if resp.hovered() {
-        egui::Color32::from_gray(74)
-    } else {
-        egui::Color32::from_gray(56)
-    };
-    ui.painter()
-        .rect_filled(resp.rect, egui::CornerRadius::same(6), bg);
-    ui.painter().text(
-        resp.rect.center(),
-        egui::Align2::CENTER_CENTER,
-        display,
-        shortcut_font(17.0),
-        egui::Color32::WHITE,
-    );
-    resp
-}
-
-fn shortcut_font(size: f32) -> egui::FontId {
-    egui::FontId::new(size, egui::FontFamily::Name("shortcut".into()))
+    // The shared capture chip owns the glyph rendering (modifier symbols
+    // + the Omarchy SUPER logo via kanso's SHORTCUT_FAMILY), the
+    // "Press a shortcut…" / "Click to set" prompts, and the record/hover
+    // states — so hyprcorrect no longer hand-paints its own chip.
+    kanso::widgets::shortcut_capture_chip(ui, value, is_capturing_this).clicked()
 }
 
 /// Build a user-facing message for a chord-capture IPC failure.
@@ -3060,58 +2597,14 @@ fn chord_record_error(err: &ClientError) -> String {
 /// Apply hyprcorrect's egui style — larger fonts and more generous
 /// spacing than egui's defaults, mirroring `vernier`'s prefs window.
 fn apply_style(ctx: &egui::Context) {
-    use egui::FontFamily::Proportional;
-    use egui::TextStyle::{Body, Button, Heading, Monospace, Small};
-    ctx.style_mut(|style| {
-        style.text_styles = [
-            (Heading, egui::FontId::new(21.0, Proportional)),
-            (Body, egui::FontId::new(14.0, Proportional)),
-            (
-                Monospace,
-                egui::FontId::new(13.0, egui::FontFamily::Monospace),
-            ),
-            (Button, egui::FontId::new(14.0, Proportional)),
-            (Small, egui::FontId::new(12.0, Proportional)),
-        ]
-        .into();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-        style.spacing.indent = 14.0;
-        // Button height floors to interact_size.y; we force a TextEdit's to
-        // the same value via min_size, so all controls share CONTROL_HEIGHT.
-        style.spacing.interact_size = egui::vec2(40.0, CONTROL_HEIGHT);
-        style.spacing.icon_width = 18.0;
-        style.spacing.icon_spacing = 6.0;
-        // Solid (space-reserving) scrollbar instead of egui's default
-        // floating one, which overlays content — full-width fields and the
-        // combo-box drop buttons were being clipped under the float lane.
-        // Zero the track opacities so the bar area blends into the panel
-        // (only the handle shows).
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
-        style.spacing.scroll.dormant_background_opacity = 0.0;
-        style.spacing.scroll.active_background_opacity = 0.0;
-        style.spacing.scroll.interact_background_opacity = 0.0;
-        // Every interactive control carries a 1px border at all times (only
-        // its color changes between states) and never expands — so inputs,
-        // buttons, and combo chevrons stay exactly CONTROL_HEIGHT in every
-        // state, with no hover/focus growth.
-        let r = egui::CornerRadius::same(4);
-        let w = &mut style.visuals.widgets;
-        w.noninteractive.corner_radius = r;
-        w.noninteractive.expansion = 0.0;
-        w.inactive.corner_radius = r;
-        w.inactive.expansion = 0.0;
-        w.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(72));
-        w.hovered.corner_radius = r;
-        w.hovered.expansion = 0.0;
-        w.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
-        w.active.corner_radius = r;
-        w.active.expansion = 0.0;
-        w.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
-        w.open.corner_radius = r;
-        w.open.expansion = 0.0;
-        w.open.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
-    });
+    // Type scale, spacing, the solid scrollbar, and corner radius all come
+    // from the shared design system now; control_visuals adds the
+    // input/button border (color-matched at rest, colored on hover/press,
+    // never expanding). Fonts are installed once at startup via
+    // kanso::fonts::install (also done by the review popup), so this stays
+    // font-free and cheap to call per frame.
+    kanso::theme::apply_styles(ctx);
+    ctx.style_mut(|style| kanso::theme::control_visuals(&mut style.visuals));
 }
 
 /// `true` when the daemon's on-disk binary has been replaced since the
@@ -3426,7 +2919,13 @@ pub(crate) fn run() {
         "hyprcorrect — Preferences",
         options,
         Box::new(move |cc| {
-            install_glyph_fonts(&cc.egui_ctx);
+            kanso::fonts::install(
+                &cc.egui_ctx,
+                &kanso::fonts::FontOptions {
+                    shortcut_family: true,
+                    ..Default::default()
+                },
+            );
             Ok(Box::new(PrefsApp::new(
                 saved,
                 saved_llm_keys,

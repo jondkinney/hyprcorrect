@@ -69,7 +69,13 @@ pub(crate) fn run() {
         "hyprcorrect — Review",
         options,
         Box::new(move |cc| {
-            crate::prefs::install_glyph_fonts(&cc.egui_ctx);
+            kanso::fonts::install(
+                &cc.egui_ctx,
+                &kanso::fonts::FontOptions {
+                    shortcut_family: true,
+                    ..Default::default()
+                },
+            );
             Ok(Box::new(ReviewApp::new(request)))
         }),
     );
@@ -565,7 +571,7 @@ impl ReviewApp {
                     ui.label(
                         egui::RichText::new("Checking…  (Esc to cancel)")
                             .size(15.0)
-                            .color(egui::Color32::from_gray(170)),
+                            .color(kanso::palette::TEXT_MUTED),
                     );
                 });
             });
@@ -1179,7 +1185,7 @@ impl ReviewApp {
                         egui::RichText::new(cmd)
                             .monospace()
                             .size(11.0)
-                            .color(egui::Color32::from_gray(170)),
+                            .color(kanso::palette::TEXT_MUTED),
                     );
                     ui.label(
                         egui::RichText::new(desc)
@@ -1194,6 +1200,14 @@ impl ReviewApp {
 
 impl eframe::App for ReviewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        kanso::scroll::scroll_momentum(ctx);
+        // Bring the review popup under the shared kanso theme — type scale,
+        // spacing, solid scrollbar, corner radius (apply_styles) plus the
+        // input/button control border (control_visuals) — so it matches the
+        // prefs window instead of riding egui's raw defaults. Fonts are
+        // installed once at startup; this is font-free and cheap per frame.
+        kanso::theme::apply_styles(ctx);
+        ctx.style_mut(|style| kanso::theme::control_visuals(&mut style.visuals));
         // Fold in any online definition results that arrived since last frame.
         self.drain_definitions();
         // A daemon-initiated re-process (the review-llm chord) flips the
@@ -1266,7 +1280,9 @@ impl eframe::App for ReviewApp {
                             // ⎋ (Esc) from the bundled symbol font — the
                             // default body font may lack the key glyph.
                             egui::RichText::new("Cancel  ⎋")
-                                .family(egui::FontFamily::Name("shortcut".into()))
+                                .family(egui::FontFamily::Name(
+                                    kanso::fonts::SHORTCUT_FAMILY.into(),
+                                ))
                                 .size(15.0),
                         )
                         .clicked()
@@ -1299,15 +1315,20 @@ impl eframe::App for ReviewApp {
                     // Apply is the primary action — filled, pinned to the right.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0); // inset from the right edge
+                        // Apply is the kanso primary: filled with the same
+                        // selection teal primary_button uses (so it matches
+                        // the cohort's CTAs), keeping the ↵ glyph from the
+                        // shortcut font.
                         let apply = egui::Button::new(
-                            // ↵ (Enter) from the bundled symbol font.
                             egui::RichText::new("Apply  ↵")
-                                .family(egui::FontFamily::Name("shortcut".into()))
+                                .family(egui::FontFamily::Name(
+                                    kanso::fonts::SHORTCUT_FAMILY.into(),
+                                ))
                                 .size(15.0)
                                 .strong()
-                                .color(egui::Color32::from_rgb(228, 245, 233)),
+                                .color(ui.visuals().selection.stroke.color),
                         )
-                        .fill(egui::Color32::from_rgb(46, 102, 64));
+                        .fill(ui.visuals().selection.bg_fill);
                         if ui.add(apply).clicked() {
                             do_apply = true;
                         }
@@ -1475,9 +1496,12 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
 }
 
 const SQUIGGLE_RED: egui::Color32 = egui::Color32::from_rgb(232, 92, 92);
-const SQUIGGLE_BLUE: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
-const CARD_BG: egui::Color32 = egui::Color32::from_gray(34);
-const TEXT_FG: egui::Color32 = egui::Color32::from_gray(225);
+// Byte-identical to the kanso tokens — alias them so the review popup and
+// the design system can't drift. (SQUIGGLE_RED has no exact kanso match, so
+// it stays a local literal.)
+const SQUIGGLE_BLUE: egui::Color32 = kanso::palette::INFO;
+const CARD_BG: egui::Color32 = kanso::palette::CARD;
+const TEXT_FG: egui::Color32 = kanso::palette::TEXT;
 
 /// The prose font for the Original / Proposed text, shared by the
 /// static words and the editable fields so they keep one baseline.
@@ -1485,17 +1509,11 @@ fn prose_font() -> egui::FontId {
     egui::FontId::proportional(16.0)
 }
 
-/// A rounded, padded container for a block of review text.
+/// A rounded, padded container for a block of review text — the shared
+/// kanso card surface (fill, [`kanso::palette::CARD_STROKE`] border, 10px
+/// rounding, symmetric padding).
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(CARD_BG)
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add(ui)
-        })
-        .inner
+    kanso::widgets::card(ui, add)
 }
 
 /// The "Original" card: the user's text with a red squiggle under each
@@ -1517,7 +1535,7 @@ fn original_card(
                 ui,
                 original,
                 &ranges,
-                egui::Color32::from_gray(170),
+                kanso::palette::TEXT_MUTED,
                 SQUIGGLE_RED,
             );
         }
@@ -1535,7 +1553,7 @@ fn paint_aligned_original(
     layout: &worddiff::AlignLayout,
 ) {
     let font = mono_font();
-    let fg = egui::Color32::from_gray(170);
+    let fg = kanso::palette::TEXT_MUTED;
     let (orig_words, orig_seps) = words_and_seps(original);
     let (corr_words, _) = words_and_seps(corrected);
 
@@ -1912,7 +1930,7 @@ fn render_suggestion_dropdown(
                 egui::RichText::new(format!("Other options for  {current}"))
                     .size(12.0)
                     .strong()
-                    .color(egui::Color32::from_gray(150)),
+                    .color(kanso::palette::TEXT_FAINT),
             );
             ui.add_space(4.0);
             for (i, opt) in options.iter().enumerate() {
