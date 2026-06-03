@@ -66,6 +66,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Bake macOS-style touch-to-stop into the prebuilt (hyprcorrect-bin) only:
+      # vendored forks add the Wayland hold gesture so kinetic scroll stops on a
+      # finger-rest. Source / crates.io builds omit this patch and degrade
+      # gracefully (kanso reads a flag that's simply never written). Pinned by
+      # rev. Drop once upstreamed — rust-windowing/winit#4585, emilk/egui#8223.
+      - name: Bake in touchpad hold-to-stop (prebuilt only)
+        run: |
+          {
+            echo ''
+            echo '[patch.crates-io]'
+            echo 'winit = { git = "https://github.com/jondkinney/winit-cohort", rev = "ee951c3aa13036b104cb54788465c63c5f8d22a0" }'
+            echo 'egui-winit = { git = "https://github.com/jondkinney/egui-winit-cohort", rev = "8299c3826a66384b39dbbca545dc5a5d311bb331" }'
+          } >> Cargo.toml
+
       - name: Build release binary
         env:
           # Strip workspace + cargo paths out of the binary so
@@ -150,6 +164,18 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # Bake macOS-style touch-to-stop into the prebuilt (hyprcorrect-bin) only —
+      # see the x86_64 job above. Pinned by rev; drop once upstreamed
+      # (rust-windowing/winit#4585, emilk/egui#8223).
+      - name: Bake in touchpad hold-to-stop (prebuilt only)
+        run: |
+          {
+            echo ''
+            echo '[patch.crates-io]'
+            echo 'winit = { git = "https://github.com/jondkinney/winit-cohort", rev = "ee951c3aa13036b104cb54788465c63c5f8d22a0" }'
+            echo 'egui-winit = { git = "https://github.com/jondkinney/egui-winit-cohort", rev = "8299c3826a66384b39dbbca545dc5a5d311bb331" }'
+          } >> Cargo.toml
 
       - name: Build release binary
         env:
