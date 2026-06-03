@@ -34,6 +34,28 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.2.2" date="2026-06-03">
+      <description>
+        <p>Other:</p>
+        <ul>
+          <li>rustfmt the prefs footer overlay</li>
+          <li>depend on published kanso 0.1.0 instead of the path dep</li>
+          <li>reset section scroll to top on navigation</li>
+          <li>rework the action footer — &quot;Quit&quot; + stale-daemon relaunch overlay</li>
+          <li>pad the content bottom to match the sides</li>
+          <li>kinetic scroll momentum</li>
+          <li>kinetic scroll_view + searchable app-picker combo</li>
+          <li>route running-app blocklist picker through kanso app_picker</li>
+          <li>route editable_combo through kanso</li>
+          <li>route info_icon through kanso::widgets::info_icon</li>
+          <li>bring the review popup under the kanso theme</li>
+          <li>adopt kanso widgets + decouple font install</li>
+          <li>styles+scrollbar, font dedup, dirty footer</li>
+          <li>use kanso&#x27;s control treatment for inputs/buttons</li>
+          <li>delegate text/nav helpers to the design system</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-05-31">
       <description>
         <p>Fixed:</p>
