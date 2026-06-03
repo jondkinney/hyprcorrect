@@ -746,7 +746,8 @@ impl eframe::App for PrefsApp {
                     left: 20,
                     right: 0,
                     top: 18,
-                    bottom: 18,
+                    // Match the 20px side padding (was 18, a touch short).
+                    bottom: 20,
                 }),
             )
             .show(ctx, |ui| {
