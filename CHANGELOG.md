@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/jondkinney/hyprcorrect/compare/v0.2.1...v0.2.2) - 2026-06-03
+
+### Other
+
+- rustfmt the prefs footer overlay
+- depend on published kanso 0.1.0 instead of the path dep
+- *(prefs)* reset section scroll to top on navigation
+- *(prefs)* rework the action footer — "Quit" + stale-daemon relaunch overlay
+- *(prefs)* pad the content bottom to match the sides
+- *(review)* kinetic scroll momentum
+- *(prefs)* kinetic scroll_view + searchable app-picker combo
+- *(prefs)* route running-app blocklist picker through kanso app_picker
+- *(prefs)* route editable_combo through kanso
+- *(prefs)* route info_icon through kanso::widgets::info_icon
+- *(review)* bring the review popup under the kanso theme
+- *(prefs)* adopt kanso widgets + decouple font install
+- *(kanso)* styles+scrollbar, font dedup, dirty footer
+- *(kanso)* use kanso's control treatment for inputs/buttons
+- *(kanso)* delegate text/nav helpers to the design system
+
 ## [0.2.1](https://github.com/jondkinney/hyprcorrect/compare/v0.2.0...v0.2.1) - 2026-05-31
 
 ### Fixed
