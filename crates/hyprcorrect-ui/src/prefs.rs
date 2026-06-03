@@ -592,10 +592,8 @@ fn relaunch_overlay(ctx: &egui::Context, footer: egui::Rect) -> bool {
     let mut clicked = false;
     // Cover the right portion of the footer, anchored to the bottom-right corner.
     let width = (footer.width() * 0.5).clamp(260.0, footer.width());
-    let rect = egui::Rect::from_min_max(
-        egui::pos2(footer.right() - width, footer.top()),
-        footer.max,
-    );
+    let rect =
+        egui::Rect::from_min_max(egui::pos2(footer.right() - width, footer.top()), footer.max);
     egui::Area::new(egui::Id::new("relaunch_overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.left_top())
