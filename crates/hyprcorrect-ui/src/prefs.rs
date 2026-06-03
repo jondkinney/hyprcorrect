@@ -582,6 +582,59 @@ impl PrefsApp {
     }
 }
 
+/// Daemon-stale relaunch overlay: a prominent, opaque-backed call-to-action laid
+/// over the right of the action footer (covering Save/Cancel) so the user
+/// relaunches the new build before doing anything else there. Returns whether the
+/// relaunch button was clicked. Drawn on a foreground layer from the footer
+/// panel's rect, so it sits above — and swallows clicks to — the footer widgets
+/// beneath it.
+fn relaunch_overlay(ctx: &egui::Context, footer: egui::Rect) -> bool {
+    let mut clicked = false;
+    // Cover the right portion of the footer, anchored to the bottom-right corner.
+    let width = (footer.width() * 0.5).clamp(260.0, footer.width());
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(footer.right() - width, footer.top()),
+        footer.max,
+    );
+    egui::Area::new(egui::Id::new("relaunch_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.left_top())
+        .show(ctx, |ui| {
+            ui.expand_to_include_rect(rect);
+            // Opaque backdrop hiding the footer widgets behind it, with a thin
+            // accent edge separating it from the Quit side.
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(200));
+            ui.painter().vline(
+                rect.left(),
+                rect.y_range(),
+                egui::Stroke::new(1.0, kanso::palette::WARN),
+            );
+            // Swallow any click on the backdrop so the hidden Save/Cancel can't
+            // be triggered through it.
+            ui.allocate_rect(rect, egui::Sense::click());
+            // The relaunch CTA, spanning the overlay minus padding.
+            let pad = 20.0;
+            let btn_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + pad, rect.center().y - 15.0),
+                egui::pos2(rect.right() - pad, rect.center().y + 15.0),
+            );
+            let label =
+                egui::RichText::new("Relaunch daemon (new build)").color(kanso::palette::WARN);
+            if ui
+                .put(btn_rect, egui::Button::new(label))
+                .on_hover_text(
+                    "The on-disk binary is newer than the running daemon. \
+                     Click to quit the old daemon and spawn the new one.",
+                )
+                .clicked()
+            {
+                clicked = true;
+            }
+        });
+    clicked
+}
+
 impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         kanso::scroll::scroll_momentum(ctx);
@@ -683,7 +736,7 @@ impl eframe::App for PrefsApp {
         let mut quit_requested = false;
         let mut relaunch_requested = false;
 
-        egui::TopBottomPanel::bottom("actions")
+        let actions = egui::TopBottomPanel::bottom("actions")
             .resizable(false)
             .min_height(54.0)
             // 20px horizontal padding to line the action row up with the
@@ -696,21 +749,9 @@ impl eframe::App for PrefsApp {
                 ui.horizontal_centered(|ui| {
                     // 20px between buttons.
                     ui.spacing_mut().item_spacing.x = 20.0;
-                    let quit_label =
-                        egui::RichText::new("Quit hyprcorrect").color(kanso::palette::ERROR);
+                    let quit_label = egui::RichText::new("Quit").color(kanso::palette::ERROR);
                     if ui.add(egui::Button::new(quit_label)).clicked() {
                         quit_requested = true;
-                    }
-                    if self.daemon_stale {
-                        let relaunch_label = egui::RichText::new("Relaunch daemon (new build)")
-                            .color(kanso::palette::WARN);
-                        let resp = ui.add(egui::Button::new(relaunch_label)).on_hover_text(
-                            "The on-disk binary is newer than the running daemon. \
-                                 Click to quit the old daemon and spawn the new one.",
-                        );
-                        if resp.clicked() {
-                            relaunch_requested = true;
-                        }
                     }
 
                     if !self.status.text.is_empty() {
@@ -736,6 +777,14 @@ impl eframe::App for PrefsApp {
                     }
                 });
             });
+
+        // A stale daemon is the thing to fix first: instead of an inline
+        // button competing with Save/Cancel, overlay the relaunch across the
+        // right of the footer on an opaque backdrop, covering (and blocking)
+        // those actions so it reads as the required step before anything else.
+        if self.daemon_stale {
+            relaunch_requested = relaunch_overlay(ctx, actions.response.rect);
+        }
 
         egui::CentralPanel::default()
             .frame(
