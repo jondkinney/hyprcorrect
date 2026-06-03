@@ -800,6 +800,15 @@ impl eframe::App for PrefsApp {
                 }),
             )
             .show(ctx, |ui| {
+                // Reset the scroll to the top whenever the section changes, so a
+                // new section always opens at the top instead of inheriting the
+                // prior section's offset (which left a shorter section scrolled
+                // off-screen). Previous section tracked in egui memory.
+                let shown_id = ui.make_persistent_id("prefs_section_shown");
+                if ui.data(|d| d.get_temp::<Section>(shown_id)) != Some(self.section) {
+                    kanso::scroll::scroll_view_reset(ui, "prefs_content");
+                    ui.data_mut(|d| d.insert_temp(shown_id, self.section));
+                }
                 kanso::scroll::scroll_view(ui, "prefs_content", |ui| {
                     // Scrollbar sits flush at the edge. Reserve only 10px
                     // here: the solid scrollbar already takes ~10px
