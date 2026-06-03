@@ -13,8 +13,8 @@ hyprcorrect-core.workspace = true
 hyprcorrect-platform.workspace = true
 eframe.workspace = true
 egui.workspace = true
-# Shared egui design system (path dep during the adoption trial).
-kanso = { path = "../../../kanso/crates/kanso" }
+# Shared egui design system, published to crates.io.
+kanso = "0.1"
 resvg.workspace = true
 tiny-skia.workspace = true
 usvg.workspace = true
