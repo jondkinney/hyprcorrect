@@ -1200,6 +1200,7 @@ impl ReviewApp {
 
 impl eframe::App for ReviewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        kanso::scroll::scroll_momentum(ctx);
         // Bring the review popup under the shared kanso theme — type scale,
         // spacing, solid scrollbar, corner radius (apply_styles) plus the
         // input/button control border (control_visuals) — so it matches the
