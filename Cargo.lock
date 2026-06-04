@@ -1796,9 +1796,9 @@ dependencies = [
 
 [[package]]
 name = "kanso"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffadc7cc47d55c5663ec01798f14158122c57a740f0a7258358ca457f7daaf87"
+checksum = "d836c24b2f08d5447982f47daedb5e4025b3f5a8cfc3a05419554f57135a75bb"
 dependencies = [
  "egui",
 ]
