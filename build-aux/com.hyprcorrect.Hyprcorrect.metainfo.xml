@@ -34,6 +34,15 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.2.4" date="2026-06-04">
+      <description>
+        <p>Other:</p>
+        <ul>
+          <li>update Cargo.lock dependencies</li>
+          <li>bump kanso to 0.1.2 (fixes the prefs scroll frame-rate leak)</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.3" date="2026-06-04">
       <description>
         <p>Other:</p>
