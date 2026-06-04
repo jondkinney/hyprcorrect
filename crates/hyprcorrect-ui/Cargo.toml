@@ -14,7 +14,7 @@ hyprcorrect-platform.workspace = true
 eframe.workspace = true
 egui.workspace = true
 # Shared egui design system, published to crates.io.
-kanso = "0.1.3"
+kanso = "0.1.4"
 resvg.workspace = true
 tiny-skia.workspace = true
 usvg.workspace = true
