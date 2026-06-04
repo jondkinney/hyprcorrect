@@ -34,6 +34,18 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.2.6" date="2026-06-04">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>mouse wheel no longer triggers kinetic over-scroll</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>update Cargo.lock dependencies</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.5" date="2026-06-04">
       <description>
         <p>Fixed:</p>
