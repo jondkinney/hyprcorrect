@@ -2912,7 +2912,11 @@ pub(crate) fn run() {
             .with_title("hyprcorrect — Preferences")
             .with_inner_size([640.0, 480.0])
             .with_min_inner_size([520.0, 360.0]),
-        vsync: false, // matches vernier — better Wayland responsiveness
+        // vsync ON: caps the render rate at the refresh. With it off, the kinetic
+        // scroll's per-frame repaint drives the GPU to thousands of fps during a
+        // fling (the monitor never shows them) — pure heat/fan. The ≤1-frame
+        // latency cost is imperceptible for a prefs window.
+        vsync: true,
         ..Default::default()
     };
     let _ = eframe::run_native(
