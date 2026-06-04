@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/jondkinney/hyprcorrect/compare/v0.2.4...v0.2.5) - 2026-06-04
+
+### Fixed
+
+- *(prefs)* enable vsync to cap the kinetic-scroll render rate
+
+### Other
+
+- update Cargo.lock dependencies
+- bump kanso to 0.1.3 (over-scroll fixes + final tune)
+
 ## [0.2.4](https://github.com/jondkinney/hyprcorrect/compare/v0.2.3...v0.2.4) - 2026-06-04
 
 ### Other
