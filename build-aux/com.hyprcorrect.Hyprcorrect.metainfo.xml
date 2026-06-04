@@ -34,6 +34,19 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.2.5" date="2026-06-04">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>enable vsync to cap the kinetic-scroll render rate</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>update Cargo.lock dependencies</li>
+          <li>bump kanso to 0.1.3 (over-scroll fixes + final tune)</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.4" date="2026-06-04">
       <description>
         <p>Other:</p>
