@@ -242,6 +242,21 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
+      - name: Restore packaging tooling for tag backfill
+        # workflow_dispatch can target a tag cut before packaging/macos/
+        # landed (e.g. v0.4.0, where the macOS .app/DMG packaging arrived
+        # in a later commit). The binary still builds from the tag's own
+        # source; pull just the packaging scripts + macOS icon from the
+        # ref this run was dispatched from so the package step can run.
+        # No-op on a normal release whose tag already carries them.
+        if: hashFiles('packaging/macos/package.sh') == ''
+        run: |
+          echo "packaging/macos absent at ${{ steps.tag.outputs.tag }}; restoring from ${{ github.sha }}"
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout ${{ github.sha }} -- \
+            packaging/macos \
+            crates/hyprcorrect-ui/assets/icons/svg/hyprcorrect-macos.svg
+
       - name: Install packaging tools
         # create-dmg drives hdiutil + AppleScript to lay out the
         # drag-to-Applications window. librsvg gives us a clean
