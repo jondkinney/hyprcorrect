@@ -49,12 +49,20 @@ pub(crate) fn run() {
         }
     };
 
-    // Size generously up front — the popup is spawned in the short
-    // "Checking…" state before the correction (and its inline suggestion
-    // list) is known, and resizing a floating window afterward isn't
-    // honored reliably.
+    // Size to fit the whole popup up front — heading, both cards, and the
+    // inline suggestion dropdown (now known: with deferred spawn the daemon
+    // resolves the correction before launching us on the fast path). Resizing
+    // afterward isn't viable: the popup is a *centered* floating window and
+    // Hyprland won't re-center it after a grow. Capped at the usable screen
+    // height by the estimator.
+    let definitions_on = !matches!(
+        hyprcorrect_core::Config::load()
+            .map(|c| c.behavior.definitions)
+            .unwrap_or_default(),
+        hyprcorrect_core::DefinitionSource::Off
+    );
     let width = estimate_window_width(&request);
-    let estimated_height = (estimate_window_height(&request) + 210.0).min(MAX_WINDOW_HEIGHT);
+    let estimated_height = estimate_window_height(&request, definitions_on);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
@@ -1465,24 +1473,81 @@ fn estimate_window_width(request: &ReviewRequest) -> f32 {
     content.clamp(MIN_WINDOW_WIDTH.min(cap), cap)
 }
 
-/// Pick a window height that fits the original + proposed text
-/// without truncation. Lightweight estimate; the surrounding
-/// `ScrollArea` covers any miss.
-fn estimate_window_height(request: &ReviewRequest) -> f32 {
-    const CHARS_PER_LINE: usize = 60;
-    const LINE_HEIGHT: f32 = 24.0;
-    // heading + section labels + two card paddings + the hint lines +
-    // the bottom action row + paint margins.
-    const CHROME: f32 = 270.0;
-    let lines = |s: &str| -> usize {
+/// Pick a window height that fits the *whole* popup — heading, both cards,
+/// and the inline suggestion dropdown (definition line + options) — so nothing
+/// is cut off, capped at the monitor's usable height (below the waybar). We
+/// size up front rather than resize live because the popup is a *centered*
+/// floating window: Hyprland won't re-center it after a post-open resize, so a
+/// live grow would slide off the bottom. The inner `ScrollArea` still covers
+/// any residual overflow (e.g. an unusually long online definition).
+///
+/// `definitions_on` reserves room for the async definition line, which the
+/// popup fetches after opening (so its length is unknown here).
+fn estimate_window_height(request: &ReviewRequest, definitions_on: bool) -> f32 {
+    // Per-element heights in logical points — generous (≥ the real rendered
+    // size) so the window opens tall enough on the first frame.
+    const TEXT_LINE: f32 = 24.0; // a wrapped line of sentence text
+    const CARD_PAD: f32 = 44.0; // a card's border + inner padding (top + bottom)
+    const HEADING: f32 = 56.0; // "Review correction" + its 16px gap
+    const SECTION_LABEL: f32 = 34.0; // a section label line + its gap
+    const SECTION_GAP: f32 = 18.0; // gap between the cards
+    const SUGG_CHROME: f32 = 78.0; // dropdown frame + "Other options" header + hint + gaps
+    const SUGG_ROW: f32 = 28.0; // one option row in the dropdown
+    const DEF_LINE: f32 = 20.0; // a wrapped line of definition text (size 12.5)
+    const DEF_RESERVE_LINES: f32 = 3.0; // room kept for the variable-length definition
+    const FOOTER: f32 = 92.0; // Cancel/Ask/Apply row + its margins
+    const PANEL_MARGIN: f32 = 44.0; // central panel inner_margin (22 top + 22 bottom)
+
+    // ~chars per line at the popup's width (monospace ≈ 10pt/char, minus margins).
+    let cols = (((estimate_window_width(request) - 96.0) / 10.0) as usize).max(20);
+    let lines = |s: &str| -> f32 {
         s.lines()
-            .map(|line| line.chars().count().max(1).div_ceil(CHARS_PER_LINE))
+            .map(|line| line.chars().count().max(1).div_ceil(cols))
             .sum::<usize>()
-            .max(1)
+            .max(1) as f32
     };
-    let total_lines = lines(&request.original) + lines(&request.corrected);
-    let body_height = total_lines as f32 * LINE_HEIGHT;
-    (CHROME + body_height).clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT)
+
+    let orig_card = CARD_PAD + lines(&request.original) * TEXT_LINE;
+    let prop_card = CARD_PAD + lines(&request.corrected) * TEXT_LINE;
+
+    // Suggestion dropdown: size for the *most* options any one changed word
+    // offers — Tab moves focus between words and the window can't resize, so it
+    // must already fit the tallest list. When the correction is still pending
+    // (slow LLM, result unknown), reserve for a typical dropdown so the result
+    // fits when it lands.
+    let max_options = if request.pending {
+        5
+    } else {
+        request
+            .suggestions
+            .iter()
+            .map(|s| s.options.len())
+            .max()
+            .unwrap_or(0)
+    };
+    let dropdown = if max_options > 0 {
+        let def = if definitions_on {
+            DEF_RESERVE_LINES * DEF_LINE
+        } else {
+            0.0
+        };
+        SUGG_CHROME + def + max_options as f32 * SUGG_ROW
+    } else {
+        0.0
+    };
+
+    let content =
+        HEADING + SECTION_LABEL + orig_card + SECTION_GAP + SECTION_LABEL + prop_card + dropdown;
+    let total = PANEL_MARGIN + content + FOOTER;
+
+    // Cap at the monitor's usable height when known (so the popup can grow
+    // right up to the waybar), else the fixed fallback.
+    let cap = if request.screen_height > 1.0 {
+        request.screen_height
+    } else {
+        MAX_WINDOW_HEIGHT
+    };
+    total.clamp(MIN_WINDOW_HEIGHT, cap)
 }
 
 fn section_label(ui: &mut egui::Ui, text: &str) {

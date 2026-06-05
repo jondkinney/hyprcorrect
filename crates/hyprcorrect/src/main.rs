@@ -720,6 +720,9 @@ fn fix_last_word(
         "hyprcorrect: word-fix emit — chars_from_end={chars_from_end}, backspace {word_chars} chars, insert {:?}",
         plan.fix
     );
+    // Lock focus to the (already-focused) target window for the emit so a mouse
+    // move can't divert keystrokes mid-retype. Restored when `_lock` drops.
+    let _lock = FocusLock::engage();
     match emit::anchored_replace_with_delay(
         chars_from_end,
         word_chars,
@@ -1454,67 +1457,150 @@ fn start_review(
     // original and polls for the finished request) so a slow provider —
     // an LLM round-trip especially — doesn't leave the chord feeling
     // dead. Then correct and write the finished request.
-    let screen_width = focused_monitor_width();
+    let (screen_width, screen_height) = focused_monitor_size();
     let llm_available = llm.is_some();
-    let pending = ReviewRequest {
-        original: at.sentence.clone(),
-        corrected: at.sentence.clone(),
-        trailing: at.trailing.clone(),
-        chars_before_caret: at.chars_before_caret,
-        chars_after_caret: at.chars_after_caret,
-        window_address: address.to_string(),
-        suggestions: Vec::new(),
-        pending: true,
-        screen_width,
-        llm_available,
-        // Unknown until the correction lands; the button stays available
-        // through the brief "Checking…" state.
-        from_llm: false,
-    };
-    if let Err(e) = write_review_request(&pending) {
-        eprintln!("hyprcorrect: could not write pending review request: {e}");
-        return;
-    }
-    spawn_review_window();
 
-    let (corrected, used_provider, suggestions) = correct_sentence_with_suggestions(
-        &at.sentence,
-        smart,
-        llm,
-        languagetool,
-        provider,
-        lt_fallback,
-    );
-    if corrected == at.sentence {
-        eprintln!("hyprcorrect: review-build — no changes; popup will close");
-    } else {
-        eprintln!(
-            "hyprcorrect: review-build — corrected ({} chars): {:?}, {} suggestion set(s)",
-            corrected.chars().count(),
-            corrected,
-            suggestions.len(),
+    // Build the finished (pending: false) request for a correction result.
+    // Shared by the fast path (resolved before any popup opens) and the slow
+    // path (resolved after "Checking…"), so both construct it identically.
+    let finished =
+        |corrected: String,
+         used_provider: hyprcorrect_core::ProviderId,
+         suggestions: Vec<hyprcorrect_core::runtime::WordSuggestions>| {
+            ReviewRequest {
+                original: at.sentence.clone(),
+                corrected,
+                trailing: at.trailing.clone(),
+                chars_before_caret: at.chars_before_caret,
+                chars_after_caret: at.chars_after_caret,
+                window_address: address.to_string(),
+                suggestions,
+                pending: false,
+                screen_width,
+                screen_height,
+                llm_available,
+                // Hide "Ask LLM" when the LLM itself produced this — but not when
+                // an LLM miss fell back to LanguageTool/Spellbook (still escalatable).
+                from_llm: used_provider == hyprcorrect_core::ProviderId::Llm,
+            }
+        };
+    // Toast shown when there's nothing to correct — mirrors the word/sentence
+    // chords so a no-op never just flashes (or silently swallows) the popup.
+    let toast_nothing = |used_provider| {
+        notify_info(
+            "Nothing to correct",
+            &format!(
+                "{} thinks the sentence is fine.",
+                provider_label(used_provider)
+            ),
         );
-    }
-    // Always write the finished request (pending: false) — even on a
-    // no-op, so the popup stops "Checking…" and closes itself.
-    let request = ReviewRequest {
-        original: at.sentence,
-        corrected,
-        trailing: at.trailing,
-        chars_before_caret: at.chars_before_caret,
-        chars_after_caret: at.chars_after_caret,
-        window_address: address.to_string(),
-        suggestions,
-        pending: false,
-        screen_width,
-        llm_available,
-        // Hide "Ask LLM" when the LLM itself produced this — but not when
-        // an LLM miss fell back to LanguageTool/Spellbook (still escalatable).
-        from_llm: used_provider == hyprcorrect_core::ProviderId::Llm,
     };
-    if let Err(e) = write_review_request(&request) {
-        eprintln!("hyprcorrect: could not write finished review request: {e}");
-    }
+
+    // Correct on a worker thread so the "Checking…" popup opens *only* when the
+    // provider is slow. A fast/offline result that needs no change then shows a
+    // toast with no window flash; a slow LLM still gets the instant "Checking…"
+    // so the chord never feels dead. Scoped thread → it can borrow the
+    // providers without cloning them.
+    let sentence = at.sentence.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = tx.send(correct_sentence_with_suggestions(
+                &sentence,
+                smart,
+                llm,
+                languagetool,
+                provider,
+                lt_fallback,
+            ));
+        });
+
+        // Grace window for a fast provider to answer before we fall back to the
+        // eager popup. Long enough for the offline spellbook / a snappy
+        // LanguageTool; short enough that an LLM round-trip still pops
+        // "Checking…" almost immediately.
+        const FAST_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+
+        match rx.recv_timeout(FAST_GRACE) {
+            Ok((corrected, used_provider, suggestions)) => {
+                // Resolved fast — decide before opening anything.
+                if corrected == at.sentence {
+                    eprintln!("hyprcorrect: review-build — no changes; toast, no popup");
+                    toast_nothing(used_provider);
+                    return;
+                }
+                eprintln!(
+                    "hyprcorrect: review-build — corrected ({} chars): {:?}, {} suggestion set(s)",
+                    corrected.chars().count(),
+                    corrected,
+                    suggestions.len(),
+                );
+                if let Err(e) =
+                    write_review_request(&finished(corrected, used_provider, suggestions))
+                {
+                    eprintln!("hyprcorrect: could not write finished review request: {e}");
+                    return;
+                }
+                spawn_review_window();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Slow provider (LLM): show "Checking…" now so the chord doesn't
+                // feel dead, then finish when the worker returns.
+                let pending = ReviewRequest {
+                    original: at.sentence.clone(),
+                    corrected: at.sentence.clone(),
+                    trailing: at.trailing.clone(),
+                    chars_before_caret: at.chars_before_caret,
+                    chars_after_caret: at.chars_after_caret,
+                    window_address: address.to_string(),
+                    suggestions: Vec::new(),
+                    pending: true,
+                    screen_width,
+                    screen_height,
+                    llm_available,
+                    // Unknown until the correction lands; the button stays
+                    // available through the brief "Checking…" state.
+                    from_llm: false,
+                };
+                if let Err(e) = write_review_request(&pending) {
+                    eprintln!("hyprcorrect: could not write pending review request: {e}");
+                    return;
+                }
+                spawn_review_window();
+
+                let (corrected, used_provider, suggestions) = match rx.recv() {
+                    Ok(result) => result,
+                    Err(_) => {
+                        eprintln!("hyprcorrect: review worker vanished before returning");
+                        return;
+                    }
+                };
+                if corrected == at.sentence {
+                    // The popup is already up; the finished no-op request below
+                    // closes it, and the toast explains why.
+                    eprintln!("hyprcorrect: review-build — no changes; popup will close");
+                    toast_nothing(used_provider);
+                } else {
+                    eprintln!(
+                        "hyprcorrect: review-build — corrected ({} chars): {:?}, {} suggestion set(s)",
+                        corrected.chars().count(),
+                        corrected,
+                        suggestions.len(),
+                    );
+                }
+                // Always write the finished request (pending: false) — even on a
+                // no-op, so the popup stops "Checking…" and closes itself.
+                if let Err(e) =
+                    write_review_request(&finished(corrected, used_provider, suggestions))
+                {
+                    eprintln!("hyprcorrect: could not write finished review request: {e}");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("hyprcorrect: review worker disconnected before sending");
+            }
+        }
+    });
 }
 
 /// Handle the `review-llm` action: re-run the *open* review's original
@@ -1582,31 +1668,121 @@ fn reprocess_review_with_llm(
 }
 
 /// Logical width (points) of the focused Hyprland monitor — its pixel
-/// width divided by its scale — so the review popup can size itself up to
-/// half the screen. Returns `0.0` when hyprctl is unavailable or the
-/// output can't be parsed; the popup then uses a fixed fallback cap.
+/// width and *usable* height in logical points — physical size divided by
+/// scale, with the height minus the monitor's reserved areas (e.g. a top
+/// waybar). The review popup sizes itself up to half the screen wide and up
+/// to the usable height tall, so it never slides under the bar. Returns
+/// `(0.0, 0.0)` when hyprctl is unavailable or the output can't be parsed;
+/// the popup then uses fixed fallback caps.
 #[cfg(target_os = "linux")]
-fn focused_monitor_width() -> f32 {
+fn focused_monitor_size() -> (f32, f32) {
     use std::process::Command;
     let Ok(out) = Command::new("hyprctl").args(["monitors", "-j"]).output() else {
-        return 0.0;
+        return (0.0, 0.0);
     };
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return 0.0;
+        return (0.0, 0.0);
     };
     let Some(monitors) = json.as_array() else {
-        return 0.0;
+        return (0.0, 0.0);
     };
     let monitor = monitors
         .iter()
         .find(|m| m["focused"].as_bool() == Some(true))
         .or_else(|| monitors.first());
     let Some(monitor) = monitor else {
-        return 0.0;
+        return (0.0, 0.0);
     };
     let width = monitor["width"].as_f64().unwrap_or(0.0) as f32;
+    let height = monitor["height"].as_f64().unwrap_or(0.0) as f32;
     let scale = monitor["scale"].as_f64().unwrap_or(1.0) as f32;
-    if scale > 0.0 { width / scale } else { width }
+    // `reserved` is [left, top, right, bottom] in *logical* points (it matches
+    // the waybar's configured logical height), unlike width/height which are
+    // physical — so divide the size by scale but subtract reserved as-is.
+    let reserved = monitor["reserved"].as_array();
+    let reserved_at = |i: usize| {
+        reserved
+            .and_then(|r| r.get(i))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32
+    };
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let logical_width = width / scale;
+    let usable_height = (height / scale - reserved_at(1) - reserved_at(3)).max(0.0);
+    (logical_width, usable_height)
+}
+
+/// Read the current `input:follow_mouse` value via hyprctl, as a string (e.g.
+/// `"1"`). `None` if hyprctl is unavailable or the value can't be parsed.
+#[cfg(target_os = "linux")]
+fn read_follow_mouse() -> Option<String> {
+    use std::process::Command;
+    let out = Command::new("hyprctl")
+        .args(["getoption", "input:follow_mouse", "-j"])
+        .output()
+        .ok()?;
+    let json = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
+    json["int"].as_i64().map(|n| n.to_string())
+}
+
+/// Set `input:follow_mouse` via hyprctl. Returns whether it succeeded.
+#[cfg(target_os = "linux")]
+fn set_follow_mouse(value: &str) -> bool {
+    use std::process::Command;
+    Command::new("hyprctl")
+        .args(["keyword", "input:follow_mouse", value])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Give keyboard focus to the window with this Hyprland address. Addresses are
+/// stored normalized — lowercase hex without the `0x` prefix — and `focuswindow`
+/// wants it back. Best-effort; the natural post-popup refocus is the fallback.
+#[cfg(target_os = "linux")]
+fn focus_window_by_address(address: &str) {
+    use std::process::Command;
+    let _ = Command::new("hyprctl")
+        .args(["dispatch", "focuswindow", &format!("address:0x{address}")])
+        .output();
+}
+
+/// Pins keyboard focus for the duration of a multi-keystroke emit so a stray
+/// mouse move can't hand half the retyped correction to another window.
+/// Disables focus-follows-mouse (`input:follow_mouse 0`) on creation and
+/// restores the user's previous value on drop — covering early returns and
+/// panics alike. A no-op when follow-mouse is already off (no race to guard) or
+/// hyprctl is unavailable, so it never changes behavior on non-Hyprland setups.
+///
+/// Note: a hard kill (SIGKILL) *during* an emit would leave follow_mouse at 0
+/// until the next Hyprland config reload; the RAII restore covers every normal
+/// exit path, and an emit is short, so this is a negligible edge.
+#[cfg(target_os = "linux")]
+struct FocusLock {
+    /// The value to restore on drop — `None` when we changed nothing.
+    restore: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl FocusLock {
+    fn engage() -> Self {
+        let restore = match read_follow_mouse() {
+            // Already off → no race to guard, and nothing to restore.
+            Some(v) if v == "0" => None,
+            Some(v) => set_follow_mouse("0").then_some(v),
+            None => None,
+        };
+        Self { restore }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FocusLock {
+    fn drop(&mut self) {
+        if let Some(v) = self.restore.take() {
+            set_follow_mouse(&v);
+        }
+    }
 }
 
 /// Install per-class Hyprland windowrules so the review popup
@@ -1698,6 +1874,14 @@ fn apply_review(
     let Ok(Some(req)) = read_review_request() else {
         return;
     };
+    // Pin keyboard focus to the originating window for the whole emit: disable
+    // focus-follows-mouse first (so a mouse move mid-retype can't split the
+    // correction across windows), then refocus the source window by address —
+    // the popup just closed and Hyprland normally refocuses it, but make it
+    // explicit and deterministic. `_lock` restores follow_mouse when this
+    // function returns.
+    let _lock = FocusLock::engage();
+    focus_window_by_address(&req.window_address);
     // Extra settle pause before the emit. The popup just closed and
     // Hyprland is delivering the focus event to the source window;
     // the receiving app (terminal TUIs especially) needs a beat to
@@ -1857,6 +2041,13 @@ fn fix_last_sentence(
     );
     if corrected == at.sentence {
         eprintln!("hyprcorrect: sentence-fix — provider returned the same text, nothing to emit");
+        notify_info(
+            "Nothing to correct",
+            &format!(
+                "{} thinks the sentence is fine.",
+                provider_label(used_provider)
+            ),
+        );
         return;
     }
     eprintln!(
@@ -1866,6 +2057,9 @@ fn fix_last_sentence(
     let backspaces = at.chars_before_caret + at.trailing.chars().count();
     let deletes = at.chars_after_caret;
     let insert = format!("{corrected}{}", at.trailing);
+    // Lock focus to the (already-focused) target window for the emit so a mouse
+    // move can't divert the retype mid-stream. Restored when `_lock` drops.
+    let _lock = FocusLock::engage();
     match emit::replace_around_caret_with_delay(
         backspaces,
         deletes,

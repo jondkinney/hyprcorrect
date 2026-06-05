@@ -108,6 +108,12 @@ pub struct ReviewRequest {
     /// Zero when unknown — the popup then falls back to a fixed cap.
     #[serde(default)]
     pub screen_width: f32,
+    /// Usable logical height (points) of that monitor — the full height
+    /// minus any reserved areas (e.g. a top waybar). Lets the popup grow
+    /// to fit its content up to the screen without ever sliding under the
+    /// bar. Zero when unknown — the popup then falls back to a fixed cap.
+    #[serde(default)]
+    pub screen_height: f32,
     /// Whether the daemon has an LLM provider configured. The popup shows
     /// its "Ask LLM" escalation button only when this is true.
     #[serde(default)]
