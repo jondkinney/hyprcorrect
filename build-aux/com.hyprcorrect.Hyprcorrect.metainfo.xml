@@ -34,6 +34,14 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.3.0" date="2026-06-05">
+      <description>
+        <p>Fixed:</p>
+        <ul>
+          <li>harden correction emit + review popup UX</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.6" date="2026-06-04">
       <description>
         <p>Fixed:</p>
