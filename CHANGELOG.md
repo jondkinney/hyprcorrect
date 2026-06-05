@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/jondkinney/hyprcorrect/compare/v0.2.6...v0.3.0) - 2026-06-05
+
+### Fixed
+
+- harden correction emit + review popup UX
+
 ## [0.2.6](https://github.com/jondkinney/hyprcorrect/compare/v0.2.5...v0.2.6) - 2026-06-04
 
 ### Fixed
