@@ -13,9 +13,27 @@ rust-version.workspace = true
 [dependencies]
 hyprcorrect-core.workspace = true
 thiserror.workspace = true
+log = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
 xkbcommon = "0.9.0"
 ksni = { version = "0.3", features = ["blocking"] }
 signal-hook = "0.3"
+
+# macOS backend (milestone M2). objc2 stack mirrors the sibling
+# `vernier` project: AppKit for the menu-bar item, Core Graphics for
+# the listen-only CGEventTap capture + synthetic-input emit, Carbon
+# `RegisterEventHotKey` (declared inline via `#[link]`) for the global
+# trigger. `signal-hook` carries the same SIGUSR1/SIGUSR2/SIGHUP/SIGTERM
+# protocol as Linux; `libc` is for `raise()` from the Carbon callback.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+signal-hook = "0.3"
+libc = "0.2"

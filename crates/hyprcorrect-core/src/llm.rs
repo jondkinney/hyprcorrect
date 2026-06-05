@@ -106,6 +106,7 @@ pub fn key_name(backend: &str) -> String {
 }
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const GEMINI_URL_PREFIX: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
@@ -359,6 +360,56 @@ impl LlmProvider {
 
 /// Shared HTTP agent with the per-request timeout we expect of an LLM
 /// round-trip.
+/// Check whether `key` is accepted by `backend` with a minimal
+/// authenticated GET to the backend's models endpoint. `Ok(())` means the
+/// key authenticated; `Err` means it was rejected (invalid key) or the
+/// endpoint was unreachable. Powers the prefs key-status dot — it makes a
+/// real network call, so run it off the UI thread (and debounce it).
+pub fn validate_key(backend: &str, base_url: Option<&str>, key: &str) -> Result<(), LlmError> {
+    let resolved = resolve_backend(backend, base_url)
+        .ok_or_else(|| LlmError::UnsupportedBackend(backend.to_string()))?;
+    let key = key.trim();
+    match resolved {
+        Backend::Anthropic => validate_get(
+            ANTHROPIC_MODELS_URL,
+            &[("x-api-key", key), ("anthropic-version", ANTHROPIC_VERSION)],
+        ),
+        Backend::Gemini => validate_get(GEMINI_URL_PREFIX, &[("x-goog-api-key", key)]),
+        Backend::OpenAiCompatible {
+            base_url,
+            requires_key,
+            ..
+        } => {
+            let url = format!("{base_url}/models");
+            if key.is_empty() {
+                if requires_key {
+                    return Err(LlmError::NoApiKey);
+                }
+                // Local endpoint (Ollama/LM Studio): reachable == usable.
+                validate_get(&url, &[])
+            } else {
+                validate_get(&url, &[("authorization", &format!("Bearer {key}"))])
+            }
+        }
+    }
+}
+
+/// GET `url` with `headers`; `Ok` on 2xx, `Err` on a 4xx (rejected key) or
+/// transport failure.
+fn validate_get(url: &str, headers: &[(&str, &str)]) -> Result<(), LlmError> {
+    let mut req = agent().get(url);
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    match req.call() {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
+            Err(LlmError::Request(format!("key rejected (HTTP {code})")))
+        }
+        Err(e) => Err(LlmError::Request(e.to_string())),
+    }
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))

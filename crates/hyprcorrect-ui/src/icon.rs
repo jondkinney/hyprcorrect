@@ -8,6 +8,11 @@
 use std::sync::OnceLock;
 
 const APP_ICON_SVG: &[u8] = include_bytes!("../assets/icons/svg/hyprcorrect.svg");
+/// macOS window/app icon: the "Ab" mark in a squircle on the prefs-window
+/// dark background. Used only for the eframe window icon on macOS; Linux
+/// and the tray keep the flat transparent mark above.
+#[cfg(target_os = "macos")]
+const MACOS_APP_ICON_SVG: &[u8] = include_bytes!("../assets/icons/svg/hyprcorrect-macos.svg");
 /// Brand blue from the bundled SVG. Recolor uses this as the search
 /// token so the tray can swap to white without a second asset file.
 const BRAND_FILL: &str = "#4a86c0";
@@ -89,6 +94,13 @@ fn rgba_to_argb_with_alpha(rgba: &[u8], paused: bool) -> Vec<u8> {
 /// prefs sidebar gracefully falls back to the bare heading.
 pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
     render_svg_bytes_rgba(APP_ICON_SVG, size)
+}
+
+/// macOS squircle app icon (prefs-dark background + blue "Ab"), for the
+/// eframe window / app-switcher icon.
+#[cfg(target_os = "macos")]
+pub fn render_macos_app_icon_rgba(size: u32) -> Vec<u8> {
+    render_svg_bytes_rgba(MACOS_APP_ICON_SVG, size)
 }
 
 /// Shared rasterizer used by both the brand-color and recolored

@@ -47,7 +47,7 @@ const WTYPE_INTER_KEY_DELAY_MS: u32 = 8;
 ///
 /// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
 pub fn replace(backspaces: usize, text: &str) -> Result<(), EmitError> {
-    replace_with_delay(backspaces, text, 8)
+    replace_with_delay(backspaces, text, 8, 8)
 }
 
 /// Like [`replace`], but lets the caller set the pause-per-backspace
@@ -72,8 +72,15 @@ pub fn replace_with_delay(
     backspaces: usize,
     text: &str,
     pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
 ) -> Result<(), EmitError> {
-    replace_around_caret_with_delay(backspaces, 0, text, pause_per_backspace_ms)
+    replace_around_caret_with_delay(
+        backspaces,
+        0,
+        text,
+        pause_per_backspace_ms,
+        pause_per_char_ms,
+    )
 }
 
 /// Like [`replace_with_delay`] but also emits Delete keys (right of
@@ -96,6 +103,7 @@ pub fn replace_around_caret_with_delay(
     deletes: usize,
     text: &str,
     pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
 ) -> Result<(), EmitError> {
     // Wait for the user to release the trigger chord before we
     // type anything. Many Wayland compositors deliver wtype's
@@ -139,7 +147,7 @@ pub fn replace_around_caret_with_delay(
         run(cmd)?;
         sleep_ms(pause_per_backspace_ms, total_backspaces);
     }
-    type_text(text)?;
+    type_text(text, pause_per_char_ms)?;
     Ok(())
 }
 
@@ -169,6 +177,7 @@ pub fn anchored_replace_with_delay(
     word_chars: usize,
     insert: &str,
     pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
 ) -> Result<(), EmitError> {
     let _ = capture::wait_mods_clear(Duration::from_millis(MODS_CLEAR_TIMEOUT_MS));
 
@@ -198,7 +207,7 @@ pub fn anchored_replace_with_delay(
         run(cmd)?;
         sleep_ms(pause_per_backspace_ms, word_chars);
     }
-    type_text(insert)?;
+    type_text(insert, pause_per_char_ms)?;
     Ok(())
 }
 
@@ -210,7 +219,16 @@ pub fn anchored_replace_with_delay(
 /// with a Shift+Enter key event between them; a string with no newline
 /// is a single burst, identical to the old behavior. Empty input is a
 /// no-op.
-fn type_text(text: &str) -> Result<(), EmitError> {
+///
+/// `pause_per_char_ms` (the "Pause per character" knob) sets wtype's
+/// inter-key delay for the typing burst directly — the user tunes it to
+/// their own apps/terminals. Note this is independent of the
+/// Backspace/arrow bursts, which keep the fixed
+/// [`WTYPE_INTER_KEY_DELAY_MS`] (a *deletion* reliability concern, where
+/// terminals drop keys under fast bursts — see that const's doc); the
+/// typing burst has no such requirement, so it follows the knob with no
+/// floor.
+fn type_text(text: &str, pause_per_char_ms: u32) -> Result<(), EmitError> {
     let mut first = true;
     for line in text.split('\n') {
         if !first {
@@ -221,7 +239,7 @@ fn type_text(text: &str) -> Result<(), EmitError> {
         first = false;
         if !line.is_empty() {
             let mut cmd = Command::new("wtype");
-            cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+            cmd.args(["-d", &pause_per_char_ms.to_string()]);
             cmd.arg("--").arg(line);
             run(cmd)?;
         }

@@ -1,38 +1,41 @@
-//! Running-app metadata: parse `.desktop` files, resolve icons,
-//! cache textures for the prefs Privacy picker.
+//! Running-app metadata for the prefs Privacy picker.
 //!
-//! The picker stores window-class strings (the on-disk blocklist's
-//! identifier); the registry maps those to display names + icons
-//! pulled from the system's freedesktop application database, so
-//! the user sees "Chromium" with a logo instead of
-//! `chrome-discord.com_channels_@me-Default`.
+//! The picker stores an identifier (the on-disk blocklist key) and the
+//! registry maps it to a display name + icon so the user sees "Safari"
+//! with a logo instead of a bare `com.apple.Safari`.
+//!
+//! - **Linux**: identifiers are window classes; names/icons come from
+//!   the freedesktop `.desktop` database.
+//! - **macOS**: identifiers are bundle ids; names/icons come from
+//!   `NSWorkspace` (running apps + `iconForFile`).
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 use eframe::egui;
 
 const ICON_SIZE_PX: u32 = 48;
 
-/// Resolved metadata for a single app: what to show in the picker
-/// and what to store in the config blocklist.
+/// Resolved metadata for a single app: what to show in the picker and
+/// what to store in the config blocklist.
 #[derive(Clone)]
 pub struct AppMeta {
-    /// The window class (or whatever identifier the platform uses) —
-    /// the actual blocklist key.
+    /// The identifier (window class on Linux, bundle id on macOS) — the
+    /// actual blocklist key.
     pub identifier: String,
-    /// Friendly display name; falls back to the identifier when no
-    /// `.desktop` entry matches.
+    /// Friendly display name; falls back to the identifier when nothing
+    /// matches.
     pub display_name: String,
-    /// 48×48 RGBA texture for the icon, when one was resolvable.
-    /// Built lazily by [`AppRegistry::lookup`].
+    /// 48×48 RGBA texture for the icon, when one was resolvable. Built
+    /// lazily by [`AppRegistry::lookup`].
     pub icon: Option<egui::TextureHandle>,
 }
 
 impl std::fmt::Debug for AppMeta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TextureHandle isn't Debug; we don't need to print it anyway.
         f.debug_struct("AppMeta")
             .field("identifier", &self.identifier)
             .field("display_name", &self.display_name)
@@ -41,8 +44,123 @@ impl std::fmt::Debug for AppMeta {
     }
 }
 
-/// One parsed `[Desktop Entry]` block — only the fields we care
-/// about for the picker.
+/// Build an egui texture from `size × size` unpremultiplied RGBA bytes,
+/// or `None` if the buffer is the wrong length. Shared by both backends.
+fn texture_from_rgba(
+    ctx: &egui::Context,
+    cache_key: &str,
+    rgba: &[u8],
+    size: u32,
+) -> Option<egui::TextureHandle> {
+    if rgba.len() != (size * size * 4) as usize {
+        return None;
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([size as usize, size as usize], rgba);
+    Some(ctx.load_texture(
+        format!("app-icon:{cache_key}"),
+        image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+// ============================================================================
+// macOS: NSWorkspace running apps + iconForFile
+// ============================================================================
+
+#[cfg(target_os = "macos")]
+struct MacApp {
+    bundle_id: String,
+    name: String,
+    bundle_path: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+pub struct AppRegistry {
+    /// Running apps, sorted by name. Refreshed on each picker tick.
+    apps: Vec<MacApp>,
+    /// Cached icon textures, keyed by lowercase bundle id. `None` means
+    /// "tried and failed" — avoids re-rasterizing every frame.
+    icon_cache: HashMap<String, Option<egui::TextureHandle>>,
+}
+
+#[cfg(target_os = "macos")]
+impl AppRegistry {
+    /// Enumerate the currently-running user-facing apps.
+    pub fn discover() -> Self {
+        let mut registry = Self {
+            apps: Vec::new(),
+            icon_cache: HashMap::new(),
+        };
+        registry.refresh();
+        registry
+    }
+
+    /// Re-enumerate running apps (cheap — names/paths only), preserving
+    /// the icon cache so already-rendered icons aren't rebuilt.
+    pub fn refresh(&mut self) {
+        self.apps = hyprcorrect_platform::macos::apps::list_running_apps()
+            .into_iter()
+            .map(|a| MacApp {
+                bundle_id: a.bundle_id,
+                name: a.name,
+                bundle_path: a.bundle_path,
+            })
+            .collect();
+    }
+
+    /// Bundle ids of the currently-known running apps (picker order).
+    pub fn running_ids(&self) -> Vec<String> {
+        self.apps.iter().map(|a| a.bundle_id.clone()).collect()
+    }
+
+    /// Display name + icon for `identifier` (a bundle id). Falls back to
+    /// the identifier itself when the app isn't currently running.
+    pub fn lookup(&mut self, ctx: &egui::Context, identifier: &str) -> AppMeta {
+        let found = self
+            .apps
+            .iter()
+            .find(|a| a.bundle_id.eq_ignore_ascii_case(identifier));
+        let display_name = found
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| identifier.to_string());
+        let bundle_path = found.and_then(|a| a.bundle_path.clone());
+        let icon = self.icon_for(ctx, identifier, bundle_path.as_deref());
+        AppMeta {
+            identifier: identifier.to_string(),
+            display_name,
+            icon,
+        }
+    }
+
+    fn icon_for(
+        &mut self,
+        ctx: &egui::Context,
+        bundle_id: &str,
+        bundle_path: Option<&str>,
+    ) -> Option<egui::TextureHandle> {
+        let cache_key = bundle_id.to_ascii_lowercase();
+        if let Some(slot) = self.icon_cache.get(&cache_key) {
+            return slot.clone();
+        }
+        // Resolve the icon by bundle id through LaunchServices — works for
+        // any installed app, including background agents that don't appear
+        // in the running-app list (e.g. 1Password). Fall back to the
+        // running app's own bundle path if LS can't resolve it.
+        use hyprcorrect_platform::macos::apps as macapps;
+        let rgba = macapps::icon_rgba_for_bundle_id(bundle_id, ICON_SIZE_PX)
+            .or_else(|| bundle_path.and_then(|p| macapps::app_icon_rgba(p, ICON_SIZE_PX)));
+        let texture = rgba.and_then(|r| texture_from_rgba(ctx, &cache_key, &r, ICON_SIZE_PX));
+        self.icon_cache.insert(cache_key, texture.clone());
+        texture
+    }
+}
+
+// ============================================================================
+// Linux: freedesktop .desktop database
+// ============================================================================
+
+/// One parsed `[Desktop Entry]` block — only the fields the picker uses.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default)]
 struct DesktopEntry {
     name: Option<String>,
@@ -53,25 +171,20 @@ struct DesktopEntry {
     no_display: bool,
 }
 
-/// Pre-parsed system app database, plus an on-the-fly icon cache.
+#[cfg(target_os = "linux")]
 pub struct AppRegistry {
-    /// Indexed by lowercase identifier — both the `StartupWMClass`
-    /// and the filename stem land here so a hyprctl class like
-    /// `firefox` matches a `firefox.desktop` whether or not it
-    /// declares `StartupWMClass=firefox`.
+    /// Indexed by lowercase identifier — both the `StartupWMClass` and
+    /// the filename stem land here.
     by_identifier: HashMap<String, Arc<DesktopEntry>>,
-    /// Cached icon textures, keyed by lowercase identifier. `None`
-    /// means "we tried and didn't find one" — avoids retrying every
-    /// frame.
+    /// Cached icon textures, keyed by lowercase identifier.
     icon_cache: HashMap<String, Option<egui::TextureHandle>>,
-    /// Standard freedesktop icon directories, resolved at startup.
+    /// Standard freedesktop icon directories.
     icon_dirs: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 impl AppRegistry {
     /// Build the registry by walking the standard application dirs.
-    /// Idempotent; safe to call again to pick up newly-installed
-    /// apps (we re-read every time).
     pub fn discover() -> Self {
         let mut by_identifier: HashMap<String, Arc<DesktopEntry>> = HashMap::new();
         for dir in desktop_dirs() {
@@ -111,8 +224,7 @@ impl AppRegistry {
     }
 
     /// Look up display name + icon for the given identifier. Always
-    /// returns something — falls back to the identifier itself when
-    /// no `.desktop` entry matches.
+    /// returns something — falls back to the identifier itself.
     pub fn lookup(&mut self, ctx: &egui::Context, identifier: &str) -> AppMeta {
         let key = identifier.to_ascii_lowercase();
         let entry = self.by_identifier.get(&key).cloned();
@@ -148,6 +260,7 @@ impl AppRegistry {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn desktop_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/usr/share/applications"),
@@ -158,7 +271,6 @@ fn desktop_dirs() -> Vec<PathBuf> {
         p.push(".local/share/applications");
         dirs.push(p);
     }
-    // Flatpak user + system app entries
     if let Some(home) = std::env::var_os("HOME") {
         let mut p = PathBuf::from(home);
         p.push(".local/share/flatpak/exports/share/applications");
@@ -168,6 +280,7 @@ fn desktop_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+#[cfg(target_os = "linux")]
 fn icon_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -187,6 +300,7 @@ fn icon_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+#[cfg(target_os = "linux")]
 fn parse_desktop(text: &str, path: &Path) -> Option<DesktopEntry> {
     let stem = path.file_stem().and_then(|s| s.to_str())?.to_string();
     let mut entry = DesktopEntry {
@@ -219,9 +333,8 @@ fn parse_desktop(text: &str, path: &Path) -> Option<DesktopEntry> {
     Some(entry)
 }
 
-/// Resolve an `Icon=` value against the freedesktop icon search
-/// path. Absolute paths are used verbatim; bare names are looked up
-/// across known theme directories at common sizes.
+/// Resolve an `Icon=` value against the freedesktop icon search path.
+#[cfg(target_os = "linux")]
 fn resolve_icon_path(icon: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let trimmed = icon.trim();
     if trimmed.is_empty() {
@@ -252,7 +365,6 @@ fn resolve_icon_path(icon: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
                 }
             }
         }
-        // `/usr/share/pixmaps/<icon>.{png,svg,xpm}`
         for ext in &exts {
             let mut p = PathBuf::from("/usr/share/pixmaps");
             p.push(format!("{trimmed}.{ext}"));
@@ -264,6 +376,7 @@ fn resolve_icon_path(icon: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn load_icon(ctx: &egui::Context, path: &Path, cache_key: &str) -> Option<egui::TextureHandle> {
     let bytes = std::fs::read(path).ok()?;
     let rgba = match path.extension().and_then(|e| e.to_str()) {
@@ -271,17 +384,10 @@ fn load_icon(ctx: &egui::Context, path: &Path, cache_key: &str) -> Option<egui::
         Some("png") => rasterize_png(&bytes, ICON_SIZE_PX),
         _ => None,
     }?;
-    let image = egui::ColorImage::from_rgba_unmultiplied(
-        [ICON_SIZE_PX as usize, ICON_SIZE_PX as usize],
-        &rgba,
-    );
-    Some(ctx.load_texture(
-        format!("app-icon:{cache_key}"),
-        image,
-        egui::TextureOptions::LINEAR,
-    ))
+    texture_from_rgba(ctx, cache_key, &rgba, ICON_SIZE_PX)
 }
 
+#[cfg(target_os = "linux")]
 fn rasterize_svg(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
     let opts = usvg::Options::default();
     let tree = usvg::Tree::from_data(bytes, &opts).ok()?;
@@ -295,12 +401,11 @@ fn rasterize_svg(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
     Some(pixmap.take())
 }
 
+#[cfg(target_os = "linux")]
 fn rasterize_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
     let scaled = img.resize(size, size, image::imageops::FilterType::Lanczos3);
     let rgba = scaled.to_rgba8();
-    // The resized image may be slightly smaller than `size`x`size`
-    // (preserved aspect); center it on a transparent canvas.
     let (w, h) = (rgba.width(), rgba.height());
     if w == size && h == size {
         return Some(rgba.into_raw());
@@ -318,7 +423,7 @@ fn rasterize_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
     Some(canvas)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

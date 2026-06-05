@@ -217,6 +217,26 @@ pub struct Behavior {
     /// Raise it if you still see leftover prefix characters.
     pub pause_per_backspace_ms: u32,
 
+    /// Inter-character pause (ms) while typing the replacement text —
+    /// the companion to [`pause_per_backspace_ms`], but for the
+    /// *typing* phase rather than the *deletion* phase.
+    ///
+    /// macOS injects the replacement one character at a time (Electron
+    /// apps like Slack and VS Code silently ignore a single event that
+    /// carries a whole multi-char string), and this is the sleep
+    /// between those per-character events. Raise it if a fast app drops
+    /// or coalesces characters; lower it toward 0 for snappier typing.
+    ///
+    /// On Linux the typing burst goes through `wtype` and this becomes
+    /// its inter-key delay directly. There is no floor on either
+    /// platform — the value is used as-is so users can dial it in for
+    /// their own apps/terminals. The *default* differs by platform
+    /// (see [`DEFAULT_PAUSE_PER_CHAR_MS`]): 1 ms on macOS, 8 ms on
+    /// Linux, where `wtype` starts at a more terminal-friendly delay.
+    /// (The deletion bursts keep their own fixed terminal-safe delay,
+    /// independent of this knob.)
+    pub pause_per_char_ms: u32,
+
     /// Which keys clear the per-window typing buffer when pressed.
     /// Useful trade-off: a reset is the safest response to a key
     /// we can't precisely track (so fix-word never lands at the
@@ -245,10 +265,19 @@ pub struct Behavior {
     /// dictionary; can be turned off or pointed at an online API.
     pub definitions: DefinitionSource,
 }
+
+/// Platform default for [`Behavior::pause_per_char_ms`]. macOS injects
+/// one character at a time and needs only a hair (1 ms) to keep Electron
+/// apps from dropping characters; Linux types via `wtype`, which starts
+/// at the more terminal-friendly 8 ms. Neither is a floor — users dial
+/// the value in from here.
+pub const DEFAULT_PAUSE_PER_CHAR_MS: u32 = if cfg!(target_os = "linux") { 8 } else { 1 };
+
 impl Default for Behavior {
     fn default() -> Self {
         Self {
             pause_per_backspace_ms: 8,
+            pause_per_char_ms: DEFAULT_PAUSE_PER_CHAR_MS,
             reset_keys: ResetKeys::default(),
             review_starts_in_vim: false,
             fallback_to_languagetool: true,
@@ -400,6 +429,7 @@ fix_word = "CTRL+J"
         assert_eq!(cfg.hotkeys.fix_word, "CTRL+J");
         // Untouched sections still hold defaults.
         assert_eq!(cfg.behavior.pause_per_backspace_ms, 8);
+        assert_eq!(cfg.behavior.pause_per_char_ms, DEFAULT_PAUSE_PER_CHAR_MS);
         assert_eq!(cfg.providers.default, ProviderId::Spellbook);
         assert!(cfg.privacy.app_blocklist.is_empty());
     }

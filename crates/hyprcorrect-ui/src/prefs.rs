@@ -16,6 +16,8 @@ use eframe::egui;
 use hyprcorrect_core::{Config, LlmConfig, ProviderId, runtime, secrets};
 #[cfg(target_os = "linux")]
 use hyprcorrect_platform::linux::chord_capture::{self, ChordRecording, ClientError};
+#[cfg(target_os = "macos")]
+use hyprcorrect_platform::macos::chord_capture::{self, ChordRecording, ClientError};
 
 use crate::apps::AppRegistry;
 #[cfg(target_os = "linux")]
@@ -23,7 +25,7 @@ use crate::autostart;
 use crate::docker::{self, DockerState, LanguageToolStatus, OpHandle, OpKind, StatusHandle};
 use crate::icon;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 type ChordRecorder = ChordRecording;
 
 const APP_ID: &str = "hyprcorrect-prefs";
@@ -142,13 +144,11 @@ struct PrefsApp {
     /// Which hotkey row, if any, is recording. The next non-modifier
     /// key press becomes the new chord for that target.
     capturing_chord: Option<HotkeyTarget>,
-    /// In-flight chord-capture IPC. egui-winit on Linux discards
-    /// Super, so all chord recording goes through the daemon's
-    /// evdev-based capture loop instead. `Some` while a recording
-    /// is in flight; `None` otherwise. Linux-only — the daemon's
-    /// chord-capture endpoint reads evdev; macOS will grow its own
-    /// recorder when the M2 macOS platform work lands.
-    #[cfg(target_os = "linux")]
+    /// In-flight chord-capture IPC. egui-winit drops Super/Cmd from its
+    /// `Modifiers`, so all chord recording goes through the daemon's
+    /// global capture loop instead (evdev on Linux, the CGEventTap on
+    /// macOS). `Some` while a recording is in flight; `None` otherwise.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     chord_recorder: Option<ChordRecorder>,
     /// Window classes detected on the desktop right now, sorted and
     /// deduplicated. Populated lazily and refreshed when the privacy
@@ -191,6 +191,29 @@ struct PrefsApp {
     /// `Some` while the background thread runs; cleared when the
     /// result is picked up and surfaced in [`Status`].
     docker_op: Option<OpHandle>,
+    /// Async LLM API-key validation, keyed by backend → (the exact key
+    /// value that was checked, its status). Drives the green/red key dot.
+    key_status: std::collections::HashMap<String, (String, KeyStatus)>,
+    /// Debounce for key validation: (backend, key, when-to-fire). Reset
+    /// whenever the selected key changes, so we only hit the network after
+    /// typing settles.
+    pending_key_check: Option<(String, String, Instant)>,
+    /// Results from background key-validation threads: (backend, key, valid).
+    key_check_rx: Receiver<(String, String, bool)>,
+    key_check_tx: Sender<(String, String, bool)>,
+    /// Persisted last-known validity, keyed by a non-reversible fingerprint
+    /// of (backend, key). Lets the dot show the previous result immediately
+    /// on open (green for a known-good key) instead of flashing while the
+    /// background re-check runs — it only flips if the re-check now fails.
+    key_cache: std::collections::HashMap<String, bool>,
+}
+
+/// Status of an async LLM API-key validation (the Providers key dot).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyStatus {
+    Checking,
+    Valid,
+    Invalid,
 }
 
 impl PrefsApp {
@@ -210,6 +233,7 @@ impl PrefsApp {
             .first()
             .map(|c| LlmTab::Provider(c.backend.clone()))
             .unwrap_or(LlmTab::Add);
+        let (key_check_tx, key_check_rx) = mpsc::channel();
         Self {
             config: saved.clone(),
             saved,
@@ -234,7 +258,7 @@ impl PrefsApp {
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
             capturing_chord: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             chord_recorder: None,
             running_apps: Vec::new(),
             last_apps_refresh: Instant::now() - Duration::from_secs(60),
@@ -249,6 +273,122 @@ impl PrefsApp {
             last_status_check: Instant::now() - Duration::from_secs(60),
             status_probe: None,
             docker_op: None,
+            key_status: std::collections::HashMap::new(),
+            pending_key_check: None,
+            key_check_rx,
+            key_check_tx,
+            key_cache: load_key_cache(),
+        }
+    }
+
+    /// Drive async validation of the *selected* provider's API key:
+    /// collect any finished checks, then (debounced) spawn a network check
+    /// for the current key if it hasn't been validated yet. The dot beside
+    /// the LLM heading reads the result. Cheap — at most one in-flight
+    /// check, and the same (backend, key) is never re-checked.
+    fn tick_key_validation(&mut self, ctx: &egui::Context) {
+        // Collect finished checks.
+        let mut cache_dirty = false;
+        while let Ok((backend, key, valid)) = self.key_check_rx.try_recv() {
+            let status = if valid {
+                KeyStatus::Valid
+            } else {
+                KeyStatus::Invalid
+            };
+            self.key_cache
+                .insert(key_fingerprint(&backend, &key), valid);
+            cache_dirty = true;
+            self.key_status.insert(backend, (key, status));
+        }
+        if cache_dirty {
+            save_key_cache(&self.key_cache);
+        }
+
+        // Only validate the currently-selected provider tab.
+        let LlmTab::Provider(backend) = self.llm_tab.clone() else {
+            return;
+        };
+        let key = self.llm_keys.get(&backend).cloned().unwrap_or_default();
+        // Empty key: nothing to validate (the dot shows "no key").
+        if key.trim().is_empty() {
+            self.pending_key_check = None;
+            return;
+        }
+        // Already have a result (or a check in flight) for this exact key.
+        if self
+            .key_status
+            .get(&backend)
+            .is_some_and(|(checked, _)| checked == &key)
+        {
+            self.pending_key_check = None;
+            return;
+        }
+
+        let base_url = self
+            .config
+            .providers
+            .llms
+            .iter()
+            .find(|c| c.backend == backend)
+            .and_then(|c| c.base_url.clone());
+
+        match &self.pending_key_check {
+            // Debounce window for this exact (backend, key) elapsed → check.
+            Some((b, k, due)) if b == &backend && k == &key => {
+                if Instant::now() >= *due {
+                    self.key_status
+                        .insert(backend.clone(), (key.clone(), KeyStatus::Checking));
+                    let tx = self.key_check_tx.clone();
+                    let (b2, k2, base2) = (backend.clone(), key.clone(), base_url);
+                    std::thread::spawn(move || {
+                        let valid =
+                            hyprcorrect_core::llm::validate_key(&b2, base2.as_deref(), &k2).is_ok();
+                        let _ = tx.send((b2, k2, valid));
+                    });
+                    self.pending_key_check = None;
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+            }
+            // New / changed key → (re)start the debounce.
+            _ => {
+                self.pending_key_check =
+                    Some((backend, key, Instant::now() + Duration::from_millis(700)));
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+        }
+    }
+
+    /// The validation status to show for the selected provider's key dot.
+    fn selected_key_status(&self) -> Option<KeyStatus> {
+        let LlmTab::Provider(backend) = &self.llm_tab else {
+            return None;
+        };
+        let key = self.llm_keys.get(backend)?;
+        if key.trim().is_empty() {
+            return None;
+        }
+        // Fresh result from this session, for THIS exact key, if any.
+        let fresh = self
+            .key_status
+            .get(backend)
+            .filter(|(checked, _)| checked == key)
+            .map(|(_, status)| *status);
+        // Persisted last-known result for this key, if any.
+        let cached = match self.key_cache.get(&key_fingerprint(backend, key)) {
+            Some(true) => Some(KeyStatus::Valid),
+            Some(false) => Some(KeyStatus::Invalid),
+            None => None,
+        };
+        match (fresh, cached) {
+            // A finished re-check wins — this is what flips a stale cache.
+            (Some(KeyStatus::Valid), _) => Some(KeyStatus::Valid),
+            (Some(KeyStatus::Invalid), _) => Some(KeyStatus::Invalid),
+            // Re-checking in the background: keep the cached colour so a
+            // known key doesn't flash amber on every open. Only a *new* key
+            // (no cache) shows amber while it's first validated.
+            (Some(KeyStatus::Checking), Some(c)) | (None, Some(c)) => Some(c),
+            (Some(KeyStatus::Checking), None) | (None, None) => Some(KeyStatus::Checking),
         }
     }
 
@@ -451,7 +591,18 @@ impl PrefsApp {
             return;
         }
         self.last_apps_refresh = Instant::now();
-        self.running_apps = list_running_classes();
+        // Linux pulls running window classes from the compositor; macOS
+        // re-enumerates NSWorkspace through the registry (which also owns
+        // the names/icons), so one source feeds both.
+        #[cfg(target_os = "linux")]
+        {
+            self.running_apps = list_running_classes();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.app_registry.refresh();
+            self.running_apps = self.app_registry.running_ids();
+        }
     }
 
     fn logo_texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
@@ -643,18 +794,17 @@ impl eframe::App for PrefsApp {
         self.poll_folder_pick(ctx);
         if self.section == Section::Providers {
             self.refresh_lt_status(ctx);
+            self.tick_key_validation(ctx);
         }
 
         // Chord recording happens through the daemon (see
-        // `hyprcorrect-platform/src/linux/chord_capture.rs`): egui
-        // on Linux discards Super out of its `Modifiers`, so we
-        // can't honestly record SUPER-containing chords here.
-        // Open the IPC the first frame after a row is clicked,
-        // then poll non-blockingly until the user releases a key.
-        // macOS gets its own recorder when the M2 platform work
-        // lands; until then chord rows just stay in "capture mode"
-        // until cancelled via Save / Cancel / Revert.
-        #[cfg(target_os = "linux")]
+        // `chord_capture.rs`): egui-winit drops Super/Cmd out of its
+        // `Modifiers`, so we can't honestly record SUPER-containing
+        // chords here. The daemon's global capture loop (evdev on Linux,
+        // the CGEventTap on macOS) records them instead. Open the IPC the
+        // first frame after a row is clicked, then poll non-blockingly
+        // until the user presses a key.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(target) = self.capturing_chord {
             if self.chord_recorder.is_none() {
                 match chord_capture::record_chord() {
@@ -976,7 +1126,15 @@ impl PrefsApp {
         ui.separator();
         ui.add_space(SETTING_BLOCK_SPACING);
 
-        ui.label(egui::RichText::new("LLM").size(16.0).strong());
+        // Status dot beside the LLM heading: green when the selected
+        // provider's API key validates against the vendor, amber while
+        // checking, red when it's missing or rejected.
+        let key_status = self.selected_key_status();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("LLM").size(16.0).strong());
+            ui.add_space(6.0);
+            status_dot(ui, key_status);
+        });
         ui.add_space(8.0);
         touched |= self.llm_providers_section(ui);
 
@@ -1655,6 +1813,36 @@ impl PrefsApp {
         );
         ui.add_space(SETTING_BLOCK_SPACING);
 
+        field_label(ui, "Pause per character");
+        caption(
+            ui,
+            "While typing the replacement, hyprcorrect waits this long \
+             between each character. The companion to the pause above, \
+             but for the typing phase instead of the deletion phase. \
+             Raise it if a fast app drops or merges characters as the \
+             correction is typed in.",
+        );
+        ui.add_space(6.0);
+        let response =
+            kanso::widgets::Slider::new(&mut self.config.behavior.pause_per_char_ms, 0..=30)
+                .suffix(" ms")
+                .show(ui);
+        if response.changed() {
+            self.clear_status();
+        }
+        ui.add_space(6.0);
+        caption(
+            ui,
+            "Defaults to 1 ms on macOS and 8 ms on Linux — both \
+             imperceptible. The macOS default is enough to keep Electron \
+             apps (Slack, VS Code, Discord) from dropping characters; \
+             Linux's wtype starts a touch higher for terminal reliability. \
+             Raise it if an app still loses characters mid-correction, or \
+             lower it toward 0 for the snappiest typing if your apps \
+             keep up.",
+        );
+        ui.add_space(SETTING_BLOCK_SPACING);
+
         field_label(ui, "Buffer reset keys");
         caption(
             ui,
@@ -1697,6 +1885,13 @@ impl PrefsApp {
         ui.add_space(14.0);
 
         field_label(ui, "App blocklist");
+        #[cfg(target_os = "macos")]
+        caption(
+            ui,
+            "Apps in this list never have their keys buffered. Match is \
+             case-insensitive against the app's bundle identifier.",
+        );
+        #[cfg(not(target_os = "macos"))]
         caption(
             ui,
             "Apps in this list never have their keys buffered. Match is \
@@ -1837,6 +2032,13 @@ impl PrefsApp {
             }
         });
         ui.add_space(4.0);
+        #[cfg(target_os = "macos")]
+        caption_with_code(
+            ui,
+            "Useful for apps that aren't open yet. Use the app's bundle \
+             identifier, e.g. `com.apple.Safari`.",
+        );
+        #[cfg(not(target_os = "macos"))]
         caption_with_code(
             ui,
             "Useful for apps that aren't open yet. The class is whatever \
@@ -2119,6 +2321,22 @@ fn pick_folder(initial: Option<&str>) -> Option<String> {
 /// A neutral 20×20 placeholder where an app icon would go, for apps with
 /// no discoverable `.desktop` icon — so the row still aligns and reads as
 /// "an app" rather than a blank gap.
+/// The hyprcorrect app icon as egui [`IconData`], for the window /
+/// app-switcher icon. macOS uses the squircle variant (so the Dock /
+/// app-switcher shows a native-looking icon); Linux keeps the flat mark.
+fn app_window_icon() -> egui::IconData {
+    const SIZE: u32 = 256;
+    #[cfg(target_os = "macos")]
+    let rgba = icon::render_macos_app_icon_rgba(SIZE);
+    #[cfg(not(target_os = "macos"))]
+    let rgba = icon::render_app_icon_rgba(SIZE);
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
 fn placeholder_app_icon(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
     ui.painter().rect_filled(
@@ -2128,19 +2346,84 @@ fn placeholder_app_icon(ui: &mut egui::Ui) {
     );
 }
 
-/// Paint a small filled dot — the "active provider" marker in the LLM
-/// tab bar. Drawn, not a glyph, so it can't fall back to a tofu box (the
-/// bundled fonts lack the Geometric-Shapes block, e.g. ●).
-fn active_dot(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), 4.0, kanso::palette::OK);
+/// Path to the persisted key-validation cache (next to `config.toml`).
+fn key_cache_path() -> Option<PathBuf> {
+    Config::path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("key-validation.cache")))
+}
+
+/// Non-reversible fingerprint of `(backend, key)` — so the cache never
+/// writes a raw API key to disk, only a hash of it.
+fn key_fingerprint(backend: &str, key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    backend.hash(&mut h);
+    0u8.hash(&mut h);
+    key.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Load the persisted validity cache (`fingerprint=0|1` per line).
+fn load_key_cache() -> std::collections::HashMap<String, bool> {
+    let mut m = std::collections::HashMap::new();
+    if let Some(p) = key_cache_path()
+        && let Ok(s) = std::fs::read_to_string(p)
+    {
+        for line in s.lines() {
+            if let Some((fp, v)) = line.split_once('=') {
+                m.insert(fp.trim().to_string(), v.trim() == "1");
+            }
+        }
+    }
+    m
+}
+
+/// Persist the validity cache (best-effort; capped so it can't grow
+/// without bound).
+fn save_key_cache(cache: &std::collections::HashMap<String, bool>) {
+    let Some(path) = key_cache_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body: String = cache
+        .iter()
+        .take(64)
+        .map(|(k, v)| format!("{k}={}\n", u8::from(*v)))
+        .collect();
+    let _ = std::fs::write(path, body);
+}
+
+/// Paint a small filled status dot beside the LLM heading from the
+/// selected provider's key-validation status: green = valid, amber =
+/// checking, red = missing or rejected. Drawn, not a glyph, so it can't
+/// fall back to a tofu box (the bundled fonts lack the Geometric-Shapes
+/// block, e.g. ●).
+fn status_dot(ui: &mut egui::Ui, status: Option<KeyStatus>) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::hover());
+    let (color, tip) = match status {
+        Some(KeyStatus::Valid) => (kanso::palette::OK, "API key is valid"),
+        Some(KeyStatus::Checking) => (kanso::palette::WARN, "Checking the API key…"),
+        Some(KeyStatus::Invalid) => (
+            kanso::palette::ERROR,
+            "API key was rejected by the provider",
+        ),
+        None => (
+            kanso::palette::ERROR,
+            "No API key for the selected provider",
+        ),
+    };
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+    resp.on_hover_text(tip);
 }
 
 impl PrefsApp {
     /// The tabbed multi-provider LLM editor under the Providers panel's
-    /// "LLM" heading. The active provider (list index 0) is the leftmost
-    /// tab, marked with a dot. Returns whether anything changed.
+    /// "LLM" heading. The active provider is list index 0 (the leftmost
+    /// tab); a status dot beside the heading shows whether the *selected*
+    /// tab has an API key. Returns whether anything changed.
     fn llm_providers_section(&mut self, ui: &mut egui::Ui) -> bool {
         let mut touched = false;
         let backends: Vec<String> = self
@@ -2170,12 +2453,8 @@ impl PrefsApp {
             let mut new_tab: Option<LlmTab> = None;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                for (i, backend) in backends.iter().enumerate() {
+                for backend in backends.iter() {
                     let selected = matches!(&self.llm_tab, LlmTab::Provider(b) if b == backend);
-                    // A green dot marks the active provider (always index 0).
-                    if i == 0 {
-                        active_dot(ui);
-                    }
                     if ui
                         .selectable_label(selected, backend_display(backend))
                         .clicked()
@@ -2582,7 +2861,7 @@ fn hotkey_chord_row(
 /// Build a user-facing message for a chord-capture IPC failure.
 /// Translates the rare-but-possible "daemon not running" case into
 /// a clear hint instead of a raw error string.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn chord_record_error(err: &ClientError) -> String {
     match err {
         ClientError::DaemonOffline => {
@@ -2685,12 +2964,13 @@ fn relaunch_daemon_now() {
     }
 }
 
-/// Enumerate currently-running windows' classes (Hyprland-specific
-/// for now — calls `hyprctl clients -j` and parses out unique
-/// `class` strings). Sorted alphabetically; case-insensitive dedup.
-/// Returns an empty Vec on non-Hyprland systems or if hyprctl fails.
+/// Enumerate currently-running windows' classes (Hyprland-specific —
+/// calls `hyprctl clients -j` and parses out unique `class` strings).
+/// Sorted alphabetically; case-insensitive dedup. Returns an empty Vec
+/// on non-Hyprland systems or if hyprctl fails. macOS uses the
+/// `AppRegistry` (NSWorkspace) instead — see `refresh_running_apps`.
+#[cfg(target_os = "linux")]
 fn list_running_classes() -> Vec<String> {
-    #[cfg(target_os = "linux")]
     {
         let Ok(output) = std::process::Command::new("hyprctl")
             .args(["clients", "-j"])
@@ -2732,10 +3012,6 @@ fn list_running_classes() -> Vec<String> {
         let mut out: Vec<String> = classes.into_values().collect();
         out.sort_by_key(|a| a.to_ascii_lowercase());
         out
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Vec::new()
     }
 }
 
@@ -2827,23 +3103,29 @@ fn focus_existing_prefs() {
     }
 }
 
-/// Linux: if the daemon's chord-capture socket isn't responding,
-/// spawn the daemon detached. The daemon's own singleton check
-/// (in `run_daemon`) prevents two daemons from racing; we just
-/// want one to be alive so prefs hotkey-record IPC works.
-#[cfg(target_os = "linux")]
+/// If the daemon's chord-capture socket isn't responding, spawn the
+/// daemon detached. The daemon's own singleton check (in `run_daemon`)
+/// prevents two daemons from racing; we just want one alive so prefs
+/// hotkey-record IPC works.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_daemon_running() {
     use hyprcorrect_core::runtime::chord_socket_path;
     if std::os::unix::net::UnixStream::connect(chord_socket_path()).is_ok() {
         return; // daemon up
     }
-    // Use `/proc/self/exe` first so a `cargo build`-replaced
-    // binary still works (matches the review-popup spawn fix).
+    // On Linux prefer `/proc/self/exe` so a `cargo build`-replaced binary
+    // still works; macOS has no such symlink, so fall back to current_exe.
+    #[cfg(target_os = "linux")]
     let exe = if std::path::PathBuf::from("/proc/self/exe").exists() {
         std::path::PathBuf::from("/proc/self/exe")
     } else if let Ok(p) = std::env::current_exe() {
         p
     } else {
+        eprintln!("hyprcorrect: can't find own executable to spawn daemon");
+        return;
+    };
+    #[cfg(not(target_os = "linux"))]
+    let Ok(exe) = std::env::current_exe() else {
         eprintln!("hyprcorrect: can't find own executable to spawn daemon");
         return;
     };
@@ -2869,7 +3151,7 @@ pub(crate) fn run() {
     // the AUR-installed `.desktop`) brings up a fully functional
     // app rather than just the prefs window with dead chords.
     // Matches vernier's `run_prefs_window` behavior.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     ensure_daemon_running();
     // The listener owns the socket file; keep it alive for the life
     // of this process. A separate thread holds it and exits when prefs
@@ -2910,7 +3192,17 @@ pub(crate) fn run() {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
             .with_title("hyprcorrect — Preferences")
-            .with_inner_size([640.0, 480.0])
+            // Set our own window/app icon so the app-switcher / Dock
+            // shows the hyprcorrect mark instead of egui's default "e".
+            .with_icon(app_window_icon())
+            // macOS opens tall enough to show the Hotkeys / Providers
+            // panels without scrolling; Linux/Wayland tiles the window so
+            // its requested open size is moot there.
+            .with_inner_size(if cfg!(target_os = "macos") {
+                [640.0, 822.0]
+            } else {
+                [640.0, 480.0]
+            })
             .with_min_inner_size([520.0, 360.0]),
         // vsync ON: caps the render rate at the refresh. With it off, the kinetic
         // scroll's per-frame repaint drives the GPU to thousands of fps during a

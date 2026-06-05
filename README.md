@@ -4,8 +4,10 @@ Keyboard-driven spelling and typo correction for the whole desktop.
 Press a chord and the word — or sentence — you just typed is checked
 and fixed in place, in whatever app has focus, terminals included.
 
-Hyprland-first on Linux; macOS is a sibling target ([`DESIGN.md`](DESIGN.md)
-covers the platform interface). Windows is a stub.
+Hyprland-first on Linux, with a sibling macOS backend (CGEventTap
+capture, `CGEvent` synthetic input, a Carbon global hotkey, and an
+`NSStatusItem` menu-bar item — see [`DESIGN.md`](DESIGN.md) for the
+platform interface). Windows is a stub.
 
 Site: <https://hyprcorrect.com>
 
@@ -79,11 +81,13 @@ cargo build --release
 cargo install --path crates/hyprcorrect
 ```
 
-You also need the runtime dependencies the AUR packages declare:
-`wtype`, `hyprland`, `libxkbcommon`, `libsecret`, `wayland`,
+On **Linux** you also need the runtime dependencies the AUR packages
+declare: `wtype`, `hyprland`, `libxkbcommon`, `libsecret`, `wayland`,
 `libglvnd`, `fontconfig`, `freetype2`. `wl-clipboard` is optional
-(enables the empty-buffer clipboard fallback). Rust 1.85+ is
-required.
+(enables the empty-buffer clipboard fallback). On **macOS** there are
+no extra runtime dependencies — capture/emit/hotkey/tray are built
+against the system frameworks (Core Graphics, AppKit, Carbon) — just
+the two TCC permissions below. Rust 1.85+ is required.
 
 ## Setup
 
@@ -105,6 +109,26 @@ required.
 3. **Press Ctrl+Shift+Alt+Super+F** in any window to fix the last
    word. The default chord is configurable in *Preferences →
    Hotkeys* (right-click the tray icon → *Open Preferences…*).
+
+### macOS
+
+Build and run the daemon the same way (`cargo build --release` then
+run `hyprcorrect`); it appears as a menu-bar item, not a Dock app.
+macOS needs two TCC permissions, both promptable from
+*System Settings → Privacy & Security*:
+
+- **Input Monitoring** — for the keystroke-capturing `CGEventTap`. The
+  daemon requests it on first launch; enable hyprcorrect (or, for a
+  `cargo run` dev build, the terminal that launched it) and **restart**
+  it — a freshly granted tap doesn't apply to the running process.
+- **Accessibility** — for synthesizing the correction keystrokes.
+
+The trigger chord's *Super* is ⌘; the default
+`Ctrl+Shift+Alt+Super+F` is `⌃⇧⌥⌘F`. Because the chord is a Carbon
+`RegisterEventHotKey`, the OS intercepts it, so it never leaks into the
+focused app. Focus is tracked at the **app** level (per-bundle-id
+buffers) on macOS, so the privacy blocklist takes bundle identifiers
+(`com.apple.Terminal`).
 
 ## Usage
 
@@ -188,9 +212,16 @@ shape — is in [`DESIGN.md`](DESIGN.md). Briefly:
   buffers via Hyprland IPC, `wtype` emit, `hyprctl keyword bind`
   for the chord (whose `exec` raises `SIGUSR1` on the daemon),
   `ksni` tray, `keyring` for secrets, egui prefs.
-- macOS is on the contract side of the Linux implementation: the
-  platform modules will mirror the same interface using
-  `CGEventTap`, `RegisterEventHotKey`, and `NSStatusItem`.
+- macOS mirrors that interface under
+  `crates/hyprcorrect-platform/src/macos/`: a listen-only `CGEventTap`
+  for capture (Input Monitoring), `CGEvent` +
+  `CGEventKeyboardSetUnicodeString` for emit (Accessibility), Carbon
+  `RegisterEventHotKey` for the trigger (which raises `SIGUSR1`, so the
+  signal protocol is shared), `NSWorkspace.frontmostApplication` for
+  app-level focus, and an `NSStatusItem` menu bar. AppKit runs on the
+  main thread (`bootstrap_main`) with the daemon loop on a worker. The
+  shared daemon (`main.rs`) is identical across both platforms via a
+  `backend` alias.
 
 ## License
 

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist keys the macOS `.app` bundle needs (milestone M6 packaging).
+  Merge these into the bundle's Info.plist (e.g. cargo-bundle's
+  `osx_info_plist_exts`, or by hand for an ad-hoc `.app`).
+
+  - LSUIElement makes hyprcorrect a menu-bar agent: no Dock icon, no
+    app menu — matching the runtime `setActivationPolicy(.accessory)`.
+  - NSAppSleepDisabled keeps App Nap from suspending the daemon (and
+    its CGEventTap) while it sits idle in the background.
+  - NSInputMonitoringUsageDescription is shown in the Input Monitoring
+    permission prompt the CGEventTap triggers. (Accessibility has no
+    Info.plist usage string on macOS — it is granted from System
+    Settings without a per-app description.)
+  - NSAppleEventsUsageDescription covers the `osascript` notifications
+    and any future app-activation Apple Events.
+-->
+<plist version="1.0">
+<dict>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSAppSleepDisabled</key>
+  <true/>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>hyprcorrect watches your keystrokes to keep a rolling buffer of recently typed text, so it can fix the last word or sentence in place when you press the trigger chord. The buffer stays in memory and is never written to disk.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>hyprcorrect uses Apple Events to post desktop notifications about correction results.</string>
+</dict>
+</plist>

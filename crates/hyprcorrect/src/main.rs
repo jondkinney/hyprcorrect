@@ -9,6 +9,15 @@
 
 use clap::{Parser, Subcommand};
 
+/// The per-OS platform backend. `crate::backend::{capture, emit, hotkey,
+/// focus, tray, chord_capture, clipboard}` resolve to the Linux or the
+/// macOS implementation; the shared daemon code below is identical across
+/// both — the whole point of milestone M2.
+#[cfg(target_os = "linux")]
+use hyprcorrect_platform::linux as backend;
+#[cfg(target_os = "macos")]
+use hyprcorrect_platform::macos as backend;
+
 /// Keyboard-driven spelling correction for the whole desktop.
 #[derive(Parser)]
 #[command(name = "hyprcorrect", version, about)]
@@ -39,7 +48,16 @@ fn main() {
     env_logger::init();
 
     match Cli::parse().command {
-        None => run_daemon(),
+        None => {
+            // macOS needs AppKit's run loop on the main thread (for the
+            // Carbon hotkey, NSStatusItem tray, and NSWorkspace focus
+            // observer), so the daemon body runs on a worker thread that
+            // `bootstrap_main` spawns; `bootstrap_main` never returns.
+            #[cfg(target_os = "macos")]
+            hyprcorrect_platform::macos::bootstrap_main(run_daemon);
+            #[cfg(not(target_os = "macos"))]
+            run_daemon();
+        }
         Some(Command::FixWord) => {
             eprintln!(
                 "hyprcorrect: run `hyprcorrect` with no subcommand — the daemon \
@@ -117,7 +135,7 @@ fn run_install_desktop() {
 /// capture keystrokes into per-window buffers, subscribe to focus
 /// events, publish the tray, and correct the focused window's last
 /// word on the chord.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_daemon() {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -125,8 +143,8 @@ fn run_daemon() {
     use std::sync::mpsc;
     use std::thread;
 
+    use crate::backend::{capture, chord_capture, focus, hotkey, tray};
     use hyprcorrect_core::{Buffer, Chord, Config, OfflineProvider};
-    use hyprcorrect_platform::linux::{capture, chord_capture, focus, hotkey, tray};
 
     // Daemon singleton: the chord-capture socket is bound by the
     // running daemon. If we can connect, another daemon owns it —
@@ -152,6 +170,7 @@ fn run_daemon() {
     let mut default_provider_id = initial_config.providers.default;
     let mut smart_provider_id = initial_config.providers.smart;
     let mut pause_per_backspace_ms = initial_config.behavior.pause_per_backspace_ms;
+    let mut pause_per_char_ms = initial_config.behavior.pause_per_char_ms;
     let mut lt_fallback = initial_config.behavior.fallback_to_languagetool;
     capture::set_reset_keys(reset_key_config(&initial_config.behavior.reset_keys));
     let mut chord = match effective_chord(&initial_config) {
@@ -178,7 +197,9 @@ fn run_daemon() {
     // via a marker in the XDG state dir; skipped inside Flatpak and
     // when an AUR / distro package already provides the entry. Run
     // `hyprcorrect install-desktop` to force a refresh — e.g. after a
-    // dev rebuild changes the icon.
+    // dev rebuild changes the icon. (XDG desktop entries are Linux-only;
+    // the macOS app-bundle install path is M6 packaging, not the daemon.)
+    #[cfg(target_os = "linux")]
     if let Ok(exe) = std::env::current_exe() {
         hyprcorrect_ui::autostart::ensure_first_launch(&exe.to_string_lossy());
     }
@@ -356,7 +377,9 @@ fn run_daemon() {
             DaemonEvent::Signal(hotkey::HotkeyEvent::Trigger) => {
                 let action = hyprcorrect_core::runtime::read_action();
                 match action.as_str() {
-                    "review-apply" => apply_review(&mut buffers, pause_per_backspace_ms),
+                    "review-apply" => {
+                        apply_review(&mut buffers, pause_per_backspace_ms, pause_per_char_ms)
+                    }
                     "review-cancel" => {
                         hyprcorrect_core::runtime::clear_review();
                     }
@@ -393,6 +416,7 @@ fn run_daemon() {
                                     llm.as_ref(),
                                     languagetool.as_ref(),
                                     pause_per_backspace_ms,
+                                    pause_per_char_ms,
                                     lt_fallback,
                                 ),
                                 _ => fix_last_word(
@@ -402,6 +426,7 @@ fn run_daemon() {
                                     languagetool.as_ref(),
                                     &provider,
                                     pause_per_backspace_ms,
+                                    pause_per_char_ms,
                                     lt_fallback,
                                 ),
                             }
@@ -470,6 +495,7 @@ fn run_daemon() {
                             default_provider_id = new_config.providers.default;
                             smart_provider_id = new_config.providers.smart;
                             pause_per_backspace_ms = new_config.behavior.pause_per_backspace_ms;
+                            pause_per_char_ms = new_config.behavior.pause_per_char_ms;
                             lt_fallback = new_config.behavior.fallback_to_languagetool;
                             capture::set_reset_keys(reset_key_config(
                                 &new_config.behavior.reset_keys,
@@ -548,7 +574,7 @@ fn run_daemon() {
 /// Resolve the trigger chord the daemon should bind. `$HYPRCORRECT_CHORD`
 /// overrides the config so tests and ad-hoc dev runs don't have to edit
 /// `config.toml`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn effective_chord(
     config: &hyprcorrect_core::Config,
 ) -> Result<hyprcorrect_core::Chord, hyprcorrect_core::ChordError> {
@@ -557,7 +583,7 @@ fn effective_chord(
     hyprcorrect_core::Chord::parse(&raw)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build_blocklist(config: &hyprcorrect_core::Config) -> std::collections::HashSet<String> {
     config
         .privacy
@@ -569,15 +595,13 @@ fn build_blocklist(config: &hyprcorrect_core::Config) -> std::collections::HashS
 
 /// Convert the core's [`hyprcorrect_core::ResetKeys`] config struct
 /// into the platform's
-/// [`hyprcorrect_platform::linux::capture::ResetKeyConfig`]. They're
+/// [`crate::backend::capture::ResetKeyConfig`]. They're
 /// intentionally separate types — the config one is serializable /
 /// versioned for TOML; the capture one is the runtime view the
 /// classifier reads on every keystroke.
-#[cfg(target_os = "linux")]
-fn reset_key_config(
-    rk: &hyprcorrect_core::ResetKeys,
-) -> hyprcorrect_platform::linux::capture::ResetKeyConfig {
-    hyprcorrect_platform::linux::capture::ResetKeyConfig {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reset_key_config(rk: &hyprcorrect_core::ResetKeys) -> crate::backend::capture::ResetKeyConfig {
+    crate::backend::capture::ResetKeyConfig {
         enter: rk.enter,
         tab: rk.tab,
         escape: rk.escape,
@@ -594,7 +618,7 @@ fn reset_key_config(
 /// Fire-and-forget; if a prefs window is already running, the new
 /// process short-circuits and focuses the existing one (the prefs
 /// entry handles the singleton lock).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_prefs_window() {
     spawn_prefs_window_section(None);
 }
@@ -605,7 +629,7 @@ fn spawn_prefs_window() {
 /// flag to keep the subcommand surface unchanged.
 // Linux-only: both callers (spawn_prefs_window, reprocess_review_with_llm)
 // are Linux-gated, so this would be dead code on other targets.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_prefs_window_section(section: Option<&str>) {
     use std::process::{Command, Stdio};
     let Ok(exe) = std::env::current_exe() else {
@@ -633,7 +657,7 @@ fn spawn_prefs_window_section(section: Option<&str>) {
 /// Collect every action chord into a single slice for `capture::start`'s
 /// suppression list. Chords that aren't bound (sentence/review unbound)
 /// don't show up.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn active_chords(
     word: &hyprcorrect_core::Chord,
     sentence: &Option<hyprcorrect_core::Chord>,
@@ -647,7 +671,7 @@ fn active_chords(
     out
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -675,7 +699,8 @@ fn parse_optional_chord(raw: &str) -> Option<hyprcorrect_core::Chord> {
 /// of the caret — this covers the common case where a held arrow
 /// or a mouse click has drifted the buffer caret a few chars from
 /// the visible cursor.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)] // provider-routing + emit-timing context
 fn fix_last_word(
     buffer: &mut hyprcorrect_core::Buffer,
     default: hyprcorrect_core::ProviderId,
@@ -683,11 +708,12 @@ fn fix_last_word(
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     provider: &hyprcorrect_core::OfflineProvider,
     pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
     lt_fallback: bool,
 ) {
     use std::sync::atomic::Ordering;
 
-    use hyprcorrect_platform::linux::emit;
+    use crate::backend::emit;
 
     let Some(at) = buffer.word_at_caret() else {
         eprintln!("hyprcorrect: word-fix — buffer has no word at caret, trying clipboard fallback");
@@ -711,6 +737,20 @@ fn fix_last_word(
     ) else {
         return;
     };
+    // Guard against a provider (in practice the LLM) returning a
+    // conversational reply instead of the corrected word — emitting that
+    // verbatim would dump a sentence into the user's text.
+    if !is_plausible_word_fix(&plan.original, &plan.fix) {
+        eprintln!(
+            "hyprcorrect: word-fix — {:?} produced an implausible result {:?}; not emitting",
+            plan.provider, plan.fix
+        );
+        notify_warning(
+            "Unexpected reply",
+            "The provider returned a message instead of a word — nothing was changed.",
+        );
+        return;
+    }
     let word_chars = plan.original.chars().count();
     // Compute chars from end-of-line to end of target word. End-
     // anchored emit dodges the held-arrow caret-drift trap the
@@ -728,6 +768,7 @@ fn fix_last_word(
         word_chars,
         &plan.fix,
         pause_per_backspace_ms,
+        pause_per_char_ms,
     ) {
         Ok(()) => {
             buffer.apply_at_word(plan.byte_start, plan.byte_end, &plan.fix);
@@ -735,8 +776,7 @@ fn fix_last_word(
             // the on-screen cursor (both at end of `plan.fix`),
             // so a click-driven "scan the whole buffer" flag is
             // no longer warranted.
-            hyprcorrect_platform::linux::capture::caret_suspect_flag()
-                .store(false, Ordering::Relaxed);
+            crate::backend::capture::caret_suspect_flag().store(false, Ordering::Relaxed);
             notify_info(
                 &format!("Corrected ({})", provider_label(plan.provider)),
                 &format!("{} → \"{}\"", plan.label, plan.fix),
@@ -749,7 +789,7 @@ fn fix_last_word(
 /// Where in the buffer to land an edit and what to type. Built by
 /// [`pick_word_fix`]; consumed by [`fix_last_word`] to drive the
 /// emit + buffer-apply pair.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct WordFixPlan {
     /// The original word being replaced (for the toast and so the
     /// emit knows how many BackSpaces to fire).
@@ -777,7 +817,7 @@ struct WordFixPlan {
 /// the primary word comes back fine. Tuned so a held arrow that
 /// over-or-undershoots by a word or two still lands a fix, but
 /// we don't go fishing for typos halfway across the buffer.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const NEARBY_WORD_MAX_CHARS: i32 = 30;
 
 /// Build a [`WordFixPlan`] for the word the user wants fixed.
@@ -792,7 +832,7 @@ const NEARBY_WORD_MAX_CHARS: i32 = 30;
 /// straight to Spellbook — so the chord never silently no-ops.
 /// Returns `None` after firing the "nothing to do" toast and
 /// logging — callers exit without emitting.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)] // provider-routing context; see also capture.rs
 fn pick_word_fix(
     buffer: &hyprcorrect_core::Buffer,
@@ -806,8 +846,8 @@ fn pick_word_fix(
 ) -> Option<WordFixPlan> {
     use std::sync::atomic::Ordering;
 
+    use crate::backend::capture;
     use hyprcorrect_core::ProviderId;
-    use hyprcorrect_platform::linux::capture;
 
     let sentence = buffer
         .sentence_at_caret()
@@ -950,7 +990,7 @@ fn pick_word_fix(
 /// [`try_languagetool_word_fix`]. The caller turns this into the user
 /// toasts so the wording can reflect whether LanguageTool was the
 /// selected provider or the LLM-miss fallback.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum LtWordOutcome {
     /// LanguageTool produced a fix — here's the emit plan.
     Fixed(WordFixPlan),
@@ -967,7 +1007,7 @@ enum LtWordOutcome {
 /// sentence. Logs its own decisions but leaves user-facing toasts to the
 /// caller. Shared by the `default == LanguageTool` path and the
 /// LLM-miss fallback.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn try_languagetool_word_fix(
     buffer: &hyprcorrect_core::Buffer,
     at: &hyprcorrect_core::WordAtCaret,
@@ -1034,7 +1074,7 @@ fn try_languagetool_word_fix(
 
 /// First spellbook suggestion for `word`, or `None` if the word
 /// isn't flagged.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spellbook_pick(spell: &hyprcorrect_core::OfflineProvider, word: &str) -> Option<String> {
     let correction = spell.check_text(word).into_iter().next()?;
     correction.suggestions.into_iter().next()
@@ -1045,7 +1085,7 @@ fn spellbook_pick(spell: &hyprcorrect_core::OfflineProvider, word: &str) -> Opti
 /// tried) and any word beyond `max_chars` from the caret.
 /// Caller passes `i32::MAX` to scan the entire buffer (used
 /// when a recent mouse click made the caret position unreliable).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scan_nearby_spellbook(
     buffer: &hyprcorrect_core::Buffer,
     primary_word: &str,
@@ -1086,7 +1126,7 @@ fn scan_nearby_spellbook(
 /// re-trigger by the user. `max_chars` is `i32::MAX` for the
 /// post-mouse-click "scan everything" mode, otherwise the normal
 /// ±30-char window around the caret.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scan_nearby_llm(
     buffer: &hyprcorrect_core::Buffer,
     sentence: &str,
@@ -1146,7 +1186,7 @@ fn scan_nearby_llm(
 /// round-trip. Capped by [`MAX_NEARBY_LT_SENTENCES`] *unique*
 /// sentences per chord — sentences are bigger payloads than single
 /// words, so the cap is lower than the old per-word one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scan_nearby_lt(
     buffer: &hyprcorrect_core::Buffer,
     primary_word: &str,
@@ -1207,13 +1247,13 @@ fn scan_nearby_lt(
 /// pass and [`scan_nearby_lt`]. Keyed by the sentence's
 /// `buffer_byte_start` so the same buffer region never gets two
 /// LT round-trips per chord.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SentenceCache {
     entries: std::collections::HashMap<usize, Vec<hyprcorrect_core::Correction>>,
     fetched: usize,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl SentenceCache {
     fn new() -> Self {
         Self {
@@ -1268,7 +1308,7 @@ impl SentenceCache {
 /// `sentence`-relative bytes. Returns `None` when the buffer range
 /// doesn't lie entirely within the sentence — defensive, in practice
 /// nearby words always fall fully inside their containing sentence.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn word_in_sentence_bytes(
     sentence: &hyprcorrect_core::Sentence,
     buffer_start: usize,
@@ -1283,14 +1323,14 @@ fn word_in_sentence_bytes(
 /// The primary edit target derived from `word_at_caret`: the
 /// word's byte range in the buffer. Used to build the plan for
 /// the caret's-actual-word case.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct PrimaryTarget {
     original: String,
     byte_start: usize,
     byte_end: usize,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn primary_target(
     buffer: &hyprcorrect_core::Buffer,
     at: &hyprcorrect_core::WordAtCaret,
@@ -1320,7 +1360,7 @@ fn primary_target(
 /// First LanguageTool suggestion whose match span overlaps
 /// `target` (byte range inside the sentence we sent). Half-open
 /// overlap: `a.start < b.end && b.start < a.end`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn first_overlap_suggestion(
     corrections: &[hyprcorrect_core::Correction],
     target: &std::ops::Range<usize>,
@@ -1335,7 +1375,7 @@ fn first_overlap_suggestion(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn plan_for(
     primary: &PrimaryTarget,
     fix: String,
@@ -1352,7 +1392,7 @@ fn plan_for(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn char_step_left(text: &str, from: usize, steps: usize) -> usize {
     let mut pos = from;
     for _ in 0..steps {
@@ -1371,7 +1411,7 @@ fn char_step_left(text: &str, from: usize, steps: usize) -> usize {
 /// user can confirm exactly which character the daemon thinks
 /// the caret is on, since the TUI's visible cursor block can sit
 /// a position over.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn format_word_with_caret(word: &str, chars_before: usize, chars_after: usize) -> String {
     let chars: Vec<char> = word.chars().collect();
     if chars_after == 0 {
@@ -1394,9 +1434,9 @@ fn format_word_with_caret(word: &str, chars_before: usize, chars_after: usize) -
 /// doesn't work in terminals, and only in apps where
 /// `Ctrl+Shift+Left` selects the previous word. Failures are
 /// logged but never fatal.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fix_via_clipboard(provider: &hyprcorrect_core::OfflineProvider) {
-    use hyprcorrect_platform::linux::clipboard;
+    use crate::backend::clipboard;
     let word = match clipboard::copy_previous_word() {
         Ok(w) => w,
         Err(e) => {
@@ -1433,7 +1473,7 @@ fn fix_via_clipboard(provider: &hyprcorrect_core::OfflineProvider) {
 /// daemon does no emit here — the popup's exit signals back with a
 /// `review-apply` / `review-cancel` action and the apply path below
 /// finishes the job.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_review(
     address: &str,
     buffer: &hyprcorrect_core::Buffer,
@@ -1611,7 +1651,7 @@ fn start_review(
 // Linux-only: invoked solely from the (Linux-gated) daemon dispatch in
 // `run_daemon`, and calls Linux-only helpers (notify_warning,
 // correct_sentence_with_suggestions).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reprocess_review_with_llm(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
@@ -1829,7 +1869,7 @@ fn install_window_rules() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_review_window() {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -1863,13 +1903,14 @@ fn spawn_review_window() {
 /// Honor a `review-apply` signal: emit the proposed correction to the
 /// originating window (the popup already slept ~150 ms after closing
 /// itself, so Hyprland has had a chance to refocus the source).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_review(
     buffers: &mut std::collections::HashMap<String, hyprcorrect_core::Buffer>,
     pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
 ) {
+    use crate::backend::emit;
     use hyprcorrect_core::runtime::{clear_review, read_review_request};
-    use hyprcorrect_platform::linux::emit;
 
     let Ok(Some(req)) = read_review_request() else {
         return;
@@ -1907,6 +1948,7 @@ fn apply_review(
         deletes,
         &insert,
         pause_per_backspace_ms,
+        pause_per_char_ms,
     ) {
         Ok(()) => {
             if let Some(buf) = buffers.get_mut(&req.window_address) {
@@ -1922,7 +1964,7 @@ fn apply_review(
 /// `None` if the user hasn't picked the LLM provider, hasn't set an
 /// API key, or has configured an unsupported backend — all
 /// non-fatal: the daemon just falls back to the offline provider.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmProvider> {
     use hyprcorrect_core::{LlmError, LlmProvider};
     // Build the provider whenever an API key is configured — not only
@@ -1959,7 +2001,7 @@ fn build_llm(config: &hyprcorrect_core::Config) -> Option<hyprcorrect_core::LlmP
 /// enabled, so a disabled LanguageTool short-circuits without noise even
 /// when the fallback toggle is on (the common case). Same non-fatal
 /// contract as `build_llm`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build_languagetool(
     config: &hyprcorrect_core::Config,
 ) -> Option<hyprcorrect_core::LanguageToolProvider> {
@@ -1985,9 +2027,9 @@ fn build_languagetool(
 /// closest match for whatever bar height it draws. `paused=true`
 /// returns a half-alpha variant so the tray dims without needing a
 /// second SVG asset.
-#[cfg(target_os = "linux")]
-fn build_tray_pixmaps(paused: bool) -> Vec<hyprcorrect_platform::linux::tray::IconPixmap> {
-    use hyprcorrect_platform::linux::tray::IconPixmap;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn build_tray_pixmaps(paused: bool) -> Vec<crate::backend::tray::IconPixmap> {
+    use crate::backend::tray::IconPixmap;
     // 22 px is the canonical SNI tray height on most bars; 44 px
     // covers HiDPI / Waybar at 2×.
     const SIZES: &[u32] = &[22, 44];
@@ -2006,7 +2048,8 @@ fn build_tray_pixmaps(paused: bool) -> Vec<hyprcorrect_platform::linux::tray::Ic
 /// the sentence goes through the LLM; otherwise (or on LLM failure)
 /// we fall back to the offline spellbook provider so the trigger
 /// never silently no-ops.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)] // provider-routing + emit-timing context
 fn fix_last_sentence(
     buffer: &mut hyprcorrect_core::Buffer,
     provider: &hyprcorrect_core::OfflineProvider,
@@ -2014,9 +2057,10 @@ fn fix_last_sentence(
     llm: Option<&hyprcorrect_core::LlmProvider>,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
     pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
     lt_fallback: bool,
 ) {
-    use hyprcorrect_platform::linux::emit;
+    use crate::backend::emit;
 
     let Some(at) = buffer.sentence_at_caret() else {
         eprintln!(
@@ -2039,6 +2083,18 @@ fn fix_last_sentence(
         provider,
         lt_fallback,
     );
+    // Guard against the LLM returning a conversational reply instead of
+    // the corrected sentence — emitting it would type a paragraph in.
+    if !is_plausible_correction(&at.sentence, &corrected) {
+        eprintln!(
+            "hyprcorrect: sentence-fix — {used_provider:?} returned an implausible result; not emitting"
+        );
+        notify_warning(
+            "Unexpected reply",
+            "The provider returned a message instead of a correction — nothing was changed.",
+        );
+        return;
+    }
     if corrected == at.sentence {
         eprintln!("hyprcorrect: sentence-fix — provider returned the same text, nothing to emit");
         notify_info(
@@ -2065,6 +2121,7 @@ fn fix_last_sentence(
         deletes,
         &insert,
         pause_per_backspace_ms,
+        pause_per_char_ms,
     ) {
         Ok(()) => {
             buffer.apply_around_caret(backspaces, deletes, &insert);
@@ -2081,7 +2138,7 @@ fn fix_last_sentence(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -2090,12 +2147,68 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Heuristic: does `s` read like a chat reply rather than corrected text?
+/// LLMs sometimes refuse/clarify ("I'd be happy to help…", "Could you
+/// share the sentence?") instead of returning the fix; emitting that
+/// verbatim dumps a paragraph into the user's input.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn looks_conversational(s: &str) -> bool {
+    let lc = s.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "i'd be happy",
+        "i would be happy",
+        "happy to help",
+        "could you",
+        "can you please",
+        "please provide",
+        "please share",
+        "you haven't provided",
+        "you have not provided",
+        "i don't see",
+        "i do not see",
+        "there is no",
+        "it looks like",
+        "i'm sorry",
+        "i am sorry",
+        "as an ai",
+        "i can't",
+        "i cannot",
+        "let me know",
+        "the sentence you",
+        "for me to correct",
+    ];
+    MARKERS.iter().any(|m| lc.contains(m))
+}
+
+/// Whether `candidate` is a plausible *sentence* correction of `original`
+/// — close in length and not a conversational reply. Rejects the
+/// LLM-went-chatty case before it's emitted.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_plausible_correction(original: &str, candidate: &str) -> bool {
+    let o = original.trim().chars().count();
+    let c = candidate.trim().chars().count();
+    // Generous on real growth (added words / punctuation), but a chat
+    // reply balloons well past this.
+    c <= o.max(8) * 3 + 60 && !looks_conversational(candidate)
+}
+
+/// Whether `candidate` is a plausible *single-word* fix of `original` —
+/// one token, not conversational, not wildly longer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_plausible_word_fix(original: &str, candidate: &str) -> bool {
+    let c = candidate.trim();
+    !c.is_empty()
+        && !c.chars().any(char::is_whitespace)
+        && c.chars().count() <= original.chars().count().max(4) * 3 + 12
+        && !looks_conversational(c)
+}
+
 /// The LLM smart path is unavailable (call failed, no key, or an unwired
 /// backend). Prefer LanguageTool when it's configured; only drop to the
 /// offline spellbook when LanguageTool isn't configured (or also fails).
 /// Keeps the smart path useful for users who run a local LanguageTool but
 /// haven't readied an LLM provider.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn llm_unavailable_fallback(
     text: &str,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
@@ -2120,7 +2233,7 @@ fn llm_unavailable_fallback(
 
 /// [`llm_unavailable_fallback`] for the review path: also returns ranked
 /// per-word suggestions for the dropdown.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn llm_unavailable_fallback_with_suggestions(
     text: &str,
     languagetool: Option<&hyprcorrect_core::LanguageToolProvider>,
@@ -2156,7 +2269,7 @@ fn llm_unavailable_fallback_with_suggestions(
 /// actually produced it — fallback paths (e.g. LLM error → spellbook)
 /// report `Spellbook`, not the configured default, so the success
 /// toast can't claim a provider that didn't run.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn correct_sentence(
     text: &str,
     smart: hyprcorrect_core::ProviderId,
@@ -2220,7 +2333,7 @@ fn correct_sentence(
 /// corrected sentence plus alternatives; spellbook/LanguageTool reuse
 /// the ranked lists they already produce. The no-UI quick paths keep
 /// using [`correct_sentence`] (plain, no extra LLM cost).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn correct_sentence_with_suggestions(
     text: &str,
     smart: hyprcorrect_core::ProviderId,
@@ -2246,9 +2359,20 @@ fn correct_sentence_with_suggestions(
     match smart {
         ProviderId::Llm => match llm {
             Some(llm) => match llm.rewrite_with_alternatives(text) {
-                Ok((corrected, alts)) => {
+                Ok((corrected, alts)) if is_plausible_correction(text, &corrected) => {
                     let suggestions = order_alternatives_by_position(&corrected, alts);
                     (corrected, ProviderId::Llm, suggestions)
+                }
+                // A conversational reply, not a correction — don't surface it.
+                Ok(_) => {
+                    eprintln!(
+                        "hyprcorrect: review LLM returned an implausible result — using offline"
+                    );
+                    notify_warning(
+                        "Unexpected reply",
+                        "The LLM returned a message instead of a correction; using the offline result.",
+                    );
+                    llm_unavailable_fallback_with_suggestions(text, lt_after_llm, spell)
                 }
                 Err(e) => {
                     let msg = format!("LLM call failed: {e}");
@@ -2294,7 +2418,7 @@ fn correct_sentence_with_suggestions(
 /// Fire a best-effort desktop notification via `notify-send` so the
 /// user sees provider failures without tailing logs. Silently skips
 /// when `notify-send` (libnotify) isn't installed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn notify_warning(title: &str, body: &str) {
     notify_send("normal", title, body);
 }
@@ -2303,7 +2427,7 @@ fn notify_warning(title: &str, body: &str) {
 /// word the daemon picked for fix-word, since the TUI's rendered
 /// cursor block can read as sitting on a different character than
 /// the buffer caret.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn notify_info(title: &str, body: &str) {
     notify_send("low", title, body);
 }
@@ -2312,7 +2436,7 @@ fn notify_info(title: &str, body: &str) {
 /// Source-of-truth lookup so the toast can't disagree with the code
 /// path that ran — `WordFixPlan::provider` is set at the same return
 /// site as the fix itself.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn provider_label(provider: hyprcorrect_core::ProviderId) -> &'static str {
     use hyprcorrect_core::ProviderId;
     match provider {
@@ -2344,10 +2468,67 @@ fn notify_send(urgency: &str, title: &str, body: &str) {
         .spawn();
 }
 
+// --- macOS platform glue ----------------------------------------------------
+//
+// The shared daemon calls a handful of helpers that are inherently
+// compositor-specific on Linux (focus-follows-mouse pinning, `hyprctl`
+// window rules, `notify-send`). macOS has no equivalent of those concepts,
+// so these siblings provide the same call surface the daemon expects.
+
+/// Desktop toast via `osascript` — dependency-free, no `notify-send`.
+#[cfg(target_os = "macos")]
+fn notify_send(_urgency: &str, title: &str, body: &str) {
+    use std::process::{Command, Stdio};
+    // Escape for the AppleScript string literals.
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"hyprcorrect\" subtitle \"{}\"",
+        esc(body),
+        esc(title),
+    );
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// On macOS there's no focus-follows-mouse to pin: synthetic keystrokes
+/// already land in the frontmost app (the source window). The lock is a
+/// no-op that keeps the shared emit paths' `let _lock = FocusLock::engage()`
+/// guard compiling and meaningful across platforms.
+#[cfg(target_os = "macos")]
+struct FocusLock;
+
+#[cfg(target_os = "macos")]
+impl FocusLock {
+    fn engage() -> Self {
+        FocusLock
+    }
+}
+
+/// No-op on macOS: when the review popup closes, the OS refocuses the
+/// prior app on its own. An explicit activate would need Apple Events
+/// (Automation) permission, deferred to the post-M2 NSPanel review popup.
+#[cfg(target_os = "macos")]
+fn focus_window_by_address(_address: &str) {}
+
+/// No compositor window rules on macOS. The review popup is an ordinary
+/// window for M2; a borderless `NSPanel` is a later refinement.
+#[cfg(target_os = "macos")]
+fn install_window_rules() {}
+
+/// Logical size of the main display, for sizing the review popup.
+#[cfg(target_os = "macos")]
+fn focused_monitor_size() -> (f32, f32) {
+    crate::backend::primary_screen_size()
+}
+
 /// Apply a precomputed list of corrections (from LanguageTool) to
 /// `text`. Sorted right-to-left so byte offsets stay valid through
 /// later replacements.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_correction_list(text: &str, mut corrections: Vec<hyprcorrect_core::Correction>) -> String {
     if corrections.is_empty() {
         return text.to_string();
@@ -2365,7 +2546,7 @@ fn apply_correction_list(text: &str, mut corrections: Vec<hyprcorrect_core::Corr
 /// Run the provider over `text` and apply each correction's top
 /// suggestion to produce a corrected string. Applies right-to-left
 /// so earlier byte offsets stay valid through later replacements.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_corrections(text: &str, provider: &hyprcorrect_core::OfflineProvider) -> String {
     let mut corrections = provider.check_text(text);
     if corrections.is_empty() {
@@ -2386,7 +2567,7 @@ fn apply_corrections(text: &str, provider: &hyprcorrect_core::OfflineProvider) -
 /// (left-to-right) for the review dropdown. The applied fix is
 /// `options[0]`; the rest are backups. Works for spellbook and
 /// LanguageTool corrections alike.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_with_suggestions(
     text: &str,
     mut corrections: Vec<hyprcorrect_core::Correction>,
@@ -2419,7 +2600,7 @@ fn apply_with_suggestions(
 
 /// Order LLM word alternatives by where each word first appears in
 /// `corrected`, so they line up with the popup's left-to-right fields.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn order_alternatives_by_position(
     corrected: &str,
     mut alts: Vec<hyprcorrect_core::runtime::WordSuggestions>,
@@ -2428,11 +2609,11 @@ fn order_alternatives_by_position(
     alts
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_daemon() {
     println!(
-        "hyprcorrect {}: the background daemon is Linux-only so far — \
-         macOS support is milestone M2.",
+        "hyprcorrect {}: the background daemon runs on Linux/Wayland and \
+         macOS. This platform isn't supported yet (Windows is a stub).",
         hyprcorrect_core::version(),
     );
 }
@@ -2441,7 +2622,7 @@ fn not_yet(what: &str, milestone: &str) {
     eprintln!("hyprcorrect: {what} is not implemented yet ({milestone}) — see DESIGN.md");
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use hyprcorrect_core::{Correction, Sentence};
 
