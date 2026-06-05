@@ -2,9 +2,8 @@ name: Release
 run-name: "Release - ${{ github.event.release.tag_name || inputs.tag }}"
 
 # Fires when release-plz publishes a new GitHub Release. Builds every
-# platform artifact (Linux x86_64, Linux aarch64; macOS aarch64 once
-# the macOS packaging skeleton lands in `packaging/macos/`) and uploads
-# them to the same Release. Each job uploads its own artifact via
+# platform artifact (Linux x86_64, Linux aarch64, macOS aarch64 DMG)
+# and uploads them to the same Release. Each job uploads its own artifact via
 # `gh release upload` so a failure in one platform doesn't block the
 # others — the AUR-bin / Flatpak workflows poll for the assets they
 # need.
@@ -221,13 +220,6 @@ jobs:
 
   macos-aarch64:
     name: Build aarch64 .app + DMG
-    # macOS support is M2-deferred per DESIGN.md. The job stays
-    # disabled until packaging/macos/package.sh lands — ported from
-    # vernier when the macOS platform layer is ready. Flip the `if:`
-    # to `true` (or delete it) once packaging is in place.
-    # NOTE: GitHub doesn't allow hashFiles() in job-level `if:`
-    # expressions, so a path-based auto-guard isn't an option here.
-    if: false
     runs-on: macos-latest
     permissions:
       contents: write
@@ -286,13 +278,13 @@ jobs:
         run: ./packaging/macos/package.sh
 
       - name: Verify bundle signature
-        run: codesign --verify --verbose=2 target/macos/Hyprcorrect.app
+        run: codesign --verify --verbose=2 target/macos/HyprCorrect.app
 
       - name: Locate DMG
         id: dmg
         run: |
           VERSION="${{ steps.tag.outputs.version }}"
-          DMG="target/macos/Hyprcorrect-${VERSION}-aarch64.dmg"
+          DMG="target/macos/HyprCorrect-${VERSION}-aarch64.dmg"
           if [ ! -f "$DMG" ]; then
             echo "error: $DMG not found" >&2
             ls -la target/macos/ >&2

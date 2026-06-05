@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>hyprcorrect</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jondkinney.hyprcorrect</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>HyprCorrect</string>
+    <key>CFBundleDisplayName</key>
+    <string>HyprCorrect</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <!-- Accessory app: no Dock icon, no app menu — matching the runtime
+         setActivationPolicy(.accessory). The daemon lives in the menu
+         bar as an NSStatusItem; the prefs window is a separately-spawned
+         subprocess that promotes itself to a foreground application via
+         TransformProcessType so it can take key focus. -->
+    <key>LSUIElement</key>
+    <true/>
+    <!-- Keep App Nap from suspending the daemon (and its CGEventTap)
+         while it sits idle in the background. -->
+    <key>NSAppSleepDisabled</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <!-- Permission strings shown in the system prompts. macOS shows
+         NSInputMonitoringUsageDescription the first time the CGEventTap
+         is armed; Accessibility (for synthesizing the correction
+         keystrokes) has no Info.plist usage string. NSAppleEvents covers
+         the osascript desktop notifications. -->
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>hyprcorrect watches your keystrokes to keep a rolling buffer of recently typed text, so it can fix the last word or sentence in place when you press the trigger chord. The buffer stays in memory and is never written to disk.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>hyprcorrect uses Apple Events to post desktop notifications about correction results.</string>
+</dict>
+</plist>
