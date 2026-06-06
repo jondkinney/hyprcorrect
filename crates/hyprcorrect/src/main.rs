@@ -232,6 +232,15 @@ fn run_daemon() {
         Ok(rx) => rx,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
+            // macOS: instead of forcing a manual restart after the user
+            // grants the capture permission, park here watching for it and
+            // relaunch automatically the moment it lands. The CGEventTap is
+            // latched at process start, so a live grant can't re-arm the
+            // already-running process — only a fresh one can. Never returns.
+            #[cfg(target_os = "macos")]
+            if matches!(e, capture::CaptureError::Permission) {
+                await_capture_permission_then_relaunch();
+            }
             return;
         }
     };
@@ -2523,6 +2532,109 @@ fn install_window_rules() {}
 #[cfg(target_os = "macos")]
 fn focused_monitor_size() -> (f32, f32) {
     crate::backend::primary_screen_size()
+}
+
+/// macOS only: park here until the capture permission is granted, then
+/// relaunch a fresh instance and exit. Called when `capture::start`
+/// reports the Input Monitoring grant is missing. The CGEventTap is
+/// latched at process start — a grant that lands while we're running
+/// can't re-arm the already-running process — so the only way to begin
+/// capturing without a manual restart is to relaunch once the grant
+/// appears. Blocking here (rather than returning) keeps the process
+/// alive: `bootstrap_main` stops the app the moment the worker returns,
+/// and `NSApp.run` on the main thread holds the process up until we exit.
+///
+/// On macOS 13+ the gate flips as soon as the user enables hyprcorrect
+/// under Accessibility (which transitively confers the listen-only tap
+/// privilege), so the app usually never appears in the Input Monitoring
+/// list — watching the actual capture gate, not a specific pane, is what
+/// makes this correct across versions and loop-safe (we only relaunch
+/// when a fresh `start` would actually succeed).
+#[cfg(target_os = "macos")]
+const RELAUNCH_MARKER: &str = "HYPRCORRECT_AUTORELAUNCHED";
+
+#[cfg(target_os = "macos")]
+fn await_capture_permission_then_relaunch() -> ! {
+    use std::time::Duration;
+    // Loop guard: if we are ALREADY a relaunched instance (the marker is set)
+    // and capture STILL can't start, do not relaunch again — that would spin
+    // forever, spamming notifications. Idle quietly with one clear notice.
+    if std::env::var_os(RELAUNCH_MARKER).is_some() {
+        notify_warning(
+            "Permission needed",
+            "hyprcorrect still can't capture after the grant. Make sure it's \
+             enabled under Privacy & Security → Accessibility, then quit and \
+             reopen it.",
+        );
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+    // Fire the real Accessibility prompt up front: on macOS 13+ that single
+    // grant confers both the capture tap and synthetic typing, so it's the
+    // one permission to ask for (Input Monitoring would only cover capture).
+    crate::backend::capture::fire_accessibility_prompt();
+    notify_warning(
+        "Permission needed",
+        "Enable hyprcorrect under System Settings → Privacy & Security → \
+         Accessibility. It starts working automatically once you do — no \
+         restart needed.",
+    );
+    loop {
+        // Gate on AXIsProcessTrusted ALONE. Two empirical findings drive this:
+        //   1. CGPreflightPostEventAccess (emit) reads a FALSE true in this
+        //      running process after only Input Monitoring was granted, so it
+        //      can't gate the relaunch — AXIsProcessTrusted is the honest
+        //      emit signal and flips only on the real Accessibility grant.
+        //   2. CGPreflightListenEventAccess (capture) does NOT pick up the
+        //      macOS 13+ "Accessibility confers Input Monitoring" conferral in
+        //      an ALREADY-running process — it stays cached-false — so we
+        //      can't wait on it either. A FRESH process does get the
+        //      conferral, so once AXIsProcessTrusted is true the relaunched
+        //      daemon's capture::start succeeds and emit works. (On 11–12,
+        //      where the two grants are separate, the user grants Input
+        //      Monitoring too; the relaunched process simply re-parks until
+        //      both are in place.)
+        let trusted = crate::backend::capture::accessibility_granted();
+        eprintln!("hyprcorrect: waiting for Accessibility grant — trusted={trusted}");
+        if trusted {
+            notify_info("Permission granted", "Starting hyprcorrect…");
+            relaunch_self();
+            std::process::exit(0);
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+}
+
+/// macOS only: relaunch a fresh copy of ourselves. From inside a `.app`
+/// bundle, ask Launch Services to open the bundle so the new process gets
+/// its own clean TCC identity; from a bare binary (dev / `cargo run`),
+/// respawn the executable directly. The one-second delay lets THIS process
+/// exit first — otherwise Launch Services reactivates the existing instance
+/// instead of starting a fresh one, and the still-held singleton socket
+/// would reject the newcomer. The trailing `&` detaches the spawner so it
+/// survives our exit (adopted by launchd).
+#[cfg(target_os = "macos")]
+fn relaunch_self() {
+    use std::path::Path;
+    use std::process::Command;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // <bundle>/Contents/MacOS/hyprcorrect → three parents up is the bundle.
+    let bundle = exe
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .filter(|p| p.extension().is_some_and(|e| e == "app"));
+    // Tag the relaunched process with a marker env var so its own watcher
+    // (if capture STILL fails) won't relaunch again and spin. `open --env`
+    // carries it into the bundle; the bare-binary path sets it inline.
+    let cmd = match bundle {
+        Some(b) => format!("(sleep 1 && open --env {RELAUNCH_MARKER}=1 {b:?}) &"),
+        None => format!("(sleep 1 && {RELAUNCH_MARKER}=1 {exe:?}) &"),
+    };
+    let _ = Command::new("sh").arg("-c").arg(cmd).spawn();
 }
 
 /// Apply a precomputed list of corrections (from LanguageTool) to

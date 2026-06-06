@@ -114,14 +114,24 @@ the two TCC permissions below. Rust 1.85+ is required.
 
 Build and run the daemon the same way (`cargo build --release` then
 run `hyprcorrect`); it appears as a menu-bar item, not a Dock app.
-macOS needs two TCC permissions, both promptable from
-*System Settings → Privacy & Security*:
 
-- **Input Monitoring** — for the keystroke-capturing `CGEventTap`. The
-  daemon requests it on first launch; enable hyprcorrect (or, for a
-  `cargo run` dev build, the terminal that launched it) and **restart**
-  it — a freshly granted tap doesn't apply to the running process.
-- **Accessibility** — for synthesizing the correction keystrokes.
+On **macOS 13+ the only permission you grant is Accessibility**
+(*System Settings → Privacy & Security → Accessibility*). That single
+grant covers both halves of what hyprcorrect does — watching keystrokes
+(the capture tap) and typing the correction (synthetic events) — so
+hyprcorrect usually never even appears in the separate Input Monitoring
+list. On launch it fires the Accessibility prompt; just enable
+hyprcorrect there. (On older macOS 11–12 the capture tap needs the
+separate **Input Monitoring** grant as well, since the two aren't
+unified yet.)
+
+Both capabilities are latched at process start, so a grant that lands
+while hyprcorrect is already running can't activate them in place.
+**You don't need to restart it manually, though** — the daemon watches
+for the grant and relaunches itself automatically the moment you enable
+Accessibility (from the `.app` it reopens the bundle; a `cargo run` dev
+build re-spawns the binary). Toggle it on and corrections start working
+within a second or two.
 
 The trigger chord's *Super* is ⌘; the default
 `Ctrl+Shift+Alt+Super+F` is `⌃⇧⌥⌘F`. Because the chord is a Carbon

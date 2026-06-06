@@ -172,6 +172,23 @@ unsafe extern "C" {
 
     /// `kCFRunLoopCommonModes` — a `CFRunLoopMode` (CFString) constant.
     pub(crate) static kCFRunLoopCommonModes: *const c_void;
+
+    /// One-key dictionary builder for the Accessibility prompt option.
+    /// Pass a null allocator for the default. The `*CallBacks` args want
+    /// the ADDRESS of the global callbacks structs (declared opaque
+    /// below), so callers pass `&raw const kCFType…CallBacks`.
+    pub(crate) fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        num_values: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *const c_void;
+
+    pub(crate) static kCFTypeDictionaryKeyCallBacks: c_void;
+    pub(crate) static kCFTypeDictionaryValueCallBacks: c_void;
+    pub(crate) static kCFBooleanTrue: *const c_void;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -180,4 +197,13 @@ unsafe extern "C" {
     /// (Synthetic event posting falls under Accessibility on macOS
     /// 13+.) Returns cached-true within a process after a grant.
     pub(crate) fn AXIsProcessTrusted() -> bool;
+
+    /// Like [`AXIsProcessTrusted`], but with an options dictionary —
+    /// pass `{kAXTrustedCheckOptionPrompt: true}` to show the system
+    /// "would like to control this computer" alert and list the app
+    /// under Accessibility when it isn't already trusted.
+    pub(crate) fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+
+    /// `CFStringRef` key for the prompt option above.
+    pub(crate) static kAXTrustedCheckOptionPrompt: *const c_void;
 }

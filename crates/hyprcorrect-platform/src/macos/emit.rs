@@ -204,11 +204,16 @@ impl Drop for EventSource {
     }
 }
 
-/// Pre-flight Accessibility (post-event) access. On the first denied
-/// call, request it once (registers + prompts) and surface the error so
-/// the daemon can fall back / warn.
+/// Pre-flight for synthetic event posting. `CGEventPost` works under
+/// Accessibility trust on macOS 13+, and `AXIsProcessTrusted` is the
+/// reliable signal for it — the `CGPreflightPostEventAccess` gate is not:
+/// it reads FALSE under an Accessibility-only grant (so corrections
+/// silently couldn't type even though posting would have worked) and a
+/// false TRUE after only Input Monitoring. So accept either signal; only
+/// when BOTH are false do we request the grant and surface the error so
+/// the daemon can warn / fall back.
 fn ensure_post_access() -> Result<(), EmitError> {
-    if unsafe { CGPreflightPostEventAccess() } {
+    if unsafe { AXIsProcessTrusted() } || unsafe { CGPreflightPostEventAccess() } {
         return Ok(());
     }
     static REQUEST_ONCE: Once = Once::new();

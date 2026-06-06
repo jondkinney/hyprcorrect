@@ -67,8 +67,10 @@ impl Default for ResetKeyConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error(
-        "Input Monitoring permission is not granted — open System Settings → \
-         Privacy & Security → Input Monitoring, enable hyprcorrect, then restart it"
+        "capture permission is not granted — enable hyprcorrect under System \
+         Settings → Privacy & Security → Accessibility (it covers capture on \
+         macOS 13+; on 11–12 use Input Monitoring). It starts automatically \
+         once you do — no restart needed."
     )]
     Permission,
     #[error("could not create the CGEventTap (Input Monitoring may be denied)")]
@@ -158,18 +160,72 @@ struct TapContext {
     port: AtomicUsize,
 }
 
+/// True when the process currently holds the Input Monitoring
+/// (ListenEvent) grant the capture tap needs. On macOS 13+ the
+/// Accessibility grant transitively confers this, so it flips true once
+/// the user enables hyprcorrect under Accessibility — even when the app
+/// never appears in the separate Input Monitoring list. The daemon polls
+/// this after a denied [`start`] to auto-relaunch the moment the grant
+/// lands: a tap is latched at process start and can't be re-armed live,
+/// so a fresh process is the only way to activate capture.
+pub fn listen_access_granted() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
+}
+
+/// True when the process is Accessibility-trusted. This is the reliable
+/// gate for synthetic event *posting* (the emit side): the `Post Event`
+/// preflight (`CGPreflightPostEventAccess`) can read true in an
+/// already-running process after only Input Monitoring was granted — a
+/// false positive that makes the daemon relaunch before it can actually
+/// type. `AXIsProcessTrusted` flips true only on the real Accessibility
+/// grant, which on macOS 13+ confers both capture and emit, so it's what
+/// the startup watcher waits on.
+pub fn accessibility_granted() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
+
+/// Show the system Accessibility prompt ("…would like to control this
+/// computer") and list the app under Privacy & Security → Accessibility.
+/// Unlike the `CGRequest*` calls — which silently no-op when their
+/// (unreliable) preflight already reads true — this prompts whenever the
+/// process isn't actually trusted, so it's the dependable way to ask the
+/// user for the one grant that covers both capture and emit.
+pub fn fire_accessibility_prompt() {
+    unsafe {
+        let key = kAXTrustedCheckOptionPrompt;
+        let value = kCFBooleanTrue;
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            &key as *const _,
+            &value as *const _,
+            1,
+            &raw const kCFTypeDictionaryKeyCallBacks,
+            &raw const kCFTypeDictionaryValueCallBacks,
+        );
+        AXIsProcessTrustedWithOptions(options);
+        if !options.is_null() {
+            CFRelease(options);
+        }
+    }
+}
+
 pub fn start(
     chords: &[Chord],
     chord_capture: Arc<ChordCaptureSlot>,
 ) -> Result<Receiver<Key>, CaptureError> {
-    // Input Monitoring pre-flight. If it isn't granted, request it (this
-    // registers hyprcorrect in the System Settings list and prompts) and
-    // ask the user to grant + restart — a freshly-granted tap doesn't
-    // take effect in the already-running process.
-    if !unsafe { CGPreflightListenEventAccess() } {
-        unsafe {
-            CGRequestListenEventAccess();
-        }
+    // Capture pre-flight. Bail with Permission only if the process has
+    // NEITHER the listen-event grant NOR Accessibility trust — because on
+    // macOS 13+ the ListenOnly session tap is created and delivers events
+    // under Accessibility trust even when CGPreflightListenEventAccess still
+    // reads false (that preflight does NOT reflect the transitive
+    // "Accessibility confers Input Monitoring" conferral). Blocking on the
+    // preflight alone made an Accessibility-only grant re-park forever while
+    // the auto-relaunch watcher — which keys on AXIsProcessTrusted — spun in
+    // a loop. We don't call CGRequestListenEventAccess either: it surfaces
+    // the Input Monitoring pane, but the watcher prompts for Accessibility
+    // (the one grant it waits on). If the tap genuinely can't be created
+    // below it surfaces as TapCreation, which doesn't trip the relaunch.
+    if !unsafe { CGPreflightListenEventAccess() } && !accessibility_granted() {
         return Err(CaptureError::Permission);
     }
 
