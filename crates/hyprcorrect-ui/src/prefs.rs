@@ -131,6 +131,11 @@ struct PrefsApp {
     blocklist_entry: String,
     /// Signal the singleton holder thread to shut down on close.
     shutdown_tx: Option<Sender<()>>,
+    /// Set by the singleton accept-loop when another launch attempt (Dock
+    /// click / Spotlight / Raycast) arrives, so the next frame raises this
+    /// window to the front. Starts true on macOS to raise on first open;
+    /// stays false on Linux (focus there is handled via `hyprctl`).
+    raise: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Lazy-loaded app icon for the sidebar (256×256 raster from the
     /// bundled SVG).
     logo: Option<egui::TextureHandle>,
@@ -185,6 +190,13 @@ struct PrefsApp {
     /// Providers panel is visible so a foreign container the user
     /// just started shows up.
     last_status_check: Instant,
+    /// Grace window after (re)starting the container: LanguageTool's JVM
+    /// takes several seconds to answer the port, during which the probe
+    /// reports ContainerRunning (up, but URL silent). While this is set
+    /// and unexpired we show a "Starting…" spinner and probe every second,
+    /// instead of the alarming "port-mapping mismatch" warning — which only
+    /// applies once the window elapses and it's STILL unreachable.
+    lt_warmup_until: Option<Instant>,
     /// In-flight URL+docker probe.
     status_probe: Option<StatusHandle>,
     /// In-flight docker operation (install / start / stop / remove).
@@ -222,6 +234,7 @@ impl PrefsApp {
         saved_llm_keys: BTreeMap<String, String>,
         shutdown_tx: Sender<()>,
         section: Section,
+        raise: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         #[cfg(target_os = "linux")]
         let autostart_enabled = autostart::is_enabled();
@@ -254,6 +267,7 @@ impl PrefsApp {
             status: Status::default(),
             blocklist_entry: String::new(),
             shutdown_tx: Some(shutdown_tx),
+            raise,
             logo: None,
             last_stale_check: Instant::now() - Duration::from_secs(60),
             daemon_stale: false,
@@ -271,6 +285,7 @@ impl PrefsApp {
             folder_pick: None,
             folder_picker_available: tool_in_path("zenity") || tool_in_path("kdialog"),
             last_status_check: Instant::now() - Duration::from_secs(60),
+            lt_warmup_until: None,
             status_probe: None,
             docker_op: None,
             key_status: std::collections::HashMap::new(),
@@ -401,6 +416,10 @@ impl PrefsApp {
             && let Some(result) = handle.poll()
         {
             self.lt_status = Some(result.status);
+            // Server answered → close the warm-up window (back to green).
+            if matches!(self.lt_status, Some(LanguageToolStatus::Reachable { .. })) {
+                self.lt_warmup_until = None;
+            }
             self.lt_ngrams = result.ngrams;
             // Heal a forgotten n-gram folder: the container is serving
             // n-grams but the config never recorded the path (enabled before
@@ -436,7 +455,20 @@ impl PrefsApp {
             // completion — no need to probe in parallel.
             return;
         }
-        if self.last_status_check.elapsed() < Duration::from_secs(5) {
+        // Close an elapsed warm-up window (server never came up — fall back
+        // to the normal cadence and, if still ContainerRunning, the mismatch
+        // warning). While the window is open, probe every second and keep
+        // repainting so a freshly-started server flips to green promptly.
+        if self.lt_warmup_until.is_some_and(|t| Instant::now() >= t) {
+            self.lt_warmup_until = None;
+        }
+        let interval = if self.lt_warmup_until.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        if self.last_status_check.elapsed() < interval {
             return;
         }
         self.last_status_check = Instant::now();
@@ -544,7 +576,9 @@ impl PrefsApp {
                         }
                         OpKind::Start => "LanguageTool started.",
                         OpKind::Stop => "LanguageTool stopped.",
-                        OpKind::Remove => "LanguageTool container removed.",
+                        OpKind::Remove => {
+                            "LanguageTool removed — container and cached image deleted."
+                        }
                         OpKind::EnableNgrams => {
                             self.config.providers.languagetool.enabled = true;
                             "n-grams enabled — container recreated with the dataset."
@@ -567,6 +601,12 @@ impl PrefsApp {
                         self.err(format!("{msg} (but saving config to disk failed: {e})"));
                         return;
                     }
+                    // (Re)started the container — open the warm-up window so
+                    // the UI shows a "Starting…" spinner (not the mismatch
+                    // warning) while LanguageTool's JVM comes up to answer.
+                    if matches!(kind, OpKind::Install | OpKind::Start | OpKind::EnableNgrams) {
+                        self.lt_warmup_until = Some(Instant::now() + Duration::from_secs(45));
+                    }
                     self.ok(msg);
                 }
                 Err(e) => {
@@ -582,7 +622,9 @@ impl PrefsApp {
                 }
             }
         } else {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            // Still running — keep repainting so the progress bar animates
+            // and the pull's layer count updates.
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -786,8 +828,25 @@ fn relaunch_overlay(ctx: &egui::Context, footer: egui::Rect) -> bool {
 
 impl eframe::App for PrefsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Linux/Wayland delivers no momentum scrolling, so kanso simulates
+        // it. macOS sends real momentum + rubber-band scroll events from the
+        // trackpad, which egui consumes directly — running the simulator on
+        // top of those fights the native stream (a two-finger flick pins at
+        // the edge instead of bouncing), so on macOS we skip it and let the
+        // system handle scrolling.
+        #[cfg(not(target_os = "macos"))]
         kanso::scroll::scroll_momentum(ctx);
         apply_style(ctx);
+        // Raise to the front when the singleton accept-loop flags a re-open
+        // (Dock click / Spotlight / Raycast), and on first open. Focus
+        // raises the window; on macOS `activate` also pulls the app above
+        // whatever was frontmost. No-op on Linux (the flag never flips
+        // there — focus is handled by hyprctl in focus_existing_prefs).
+        if self.raise.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            #[cfg(target_os = "macos")]
+            hyprcorrect_platform::macos::activate();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.refresh_stale_check();
         self.poll_docker_op(ctx);
         self.poll_ngram_download(ctx);
@@ -902,7 +961,15 @@ impl eframe::App for PrefsApp {
                         quit_requested = true;
                     }
 
-                    if !self.status.text.is_empty() {
+                    // Hide the footer status while an inline progress bar is
+                    // the source of truth (n-gram download or a docker op) —
+                    // the bar already says what's happening, so a footer echo
+                    // is just noise. The completion/error message still shows
+                    // once the bar clears.
+                    if !self.status.text.is_empty()
+                        && self.docker_op.is_none()
+                        && self.ngram_download.is_none()
+                    {
                         let color = if self.status.is_error {
                             ui.visuals().error_fg_color
                         } else {
@@ -948,29 +1015,41 @@ impl eframe::App for PrefsApp {
                 }),
             )
             .show(ctx, |ui| {
-                // Reset the scroll to the top whenever the section changes, so a
-                // new section always opens at the top instead of inheriting the
-                // prior section's offset (which left a shorter section scrolled
-                // off-screen). Previous section tracked in egui memory.
+                // Open a freshly-selected section at the top instead of
+                // inheriting the prior section's offset. Previous section
+                // tracked in egui memory.
                 let shown_id = ui.make_persistent_id("prefs_section_shown");
-                if ui.data(|d| d.get_temp::<Section>(shown_id)) != Some(self.section) {
-                    kanso::scroll::scroll_view_reset(ui, "prefs_content");
+                let section_changed =
+                    ui.data(|d| d.get_temp::<Section>(shown_id)) != Some(self.section);
+                if section_changed {
                     ui.data_mut(|d| d.insert_temp(shown_id, self.section));
                 }
-                kanso::scroll::scroll_view(ui, "prefs_content", |ui| {
-                    // Scrollbar sits flush at the edge. Reserve only 10px
-                    // here: the solid scrollbar already takes ~10px
-                    // (bar_inner_margin 4 + bar_width 6), so total right
-                    // padding (gap + scrollbar) ≈ 20px, matching the left.
-                    ui.set_max_width((ui.available_width() - 10.0).max(0.0));
-                    match self.section {
-                        Section::Hotkeys => self.hotkeys_panel(ui),
-                        Section::Providers => self.providers_panel(ui),
-                        Section::Behavior => self.behavior_panel(ui),
-                        Section::Privacy => self.privacy_panel(ui),
-                        Section::About => self.about_panel(ui),
+
+                // macOS: a plain egui ScrollArea so the OS's native trackpad
+                // momentum + rubber-band events drive scrolling directly.
+                // kanso's owned-offset fling exists for Linux/Wayland, which
+                // sends NO momentum; on macOS it misreads the OS momentum
+                // stream (no clean "lift") and pins on a flick. Reset to top on
+                // a section change by forcing the offset for that one frame.
+                #[cfg(target_os = "macos")]
+                {
+                    let mut area = egui::ScrollArea::vertical()
+                        .id_salt("prefs_content")
+                        .auto_shrink([false, false]);
+                    if section_changed {
+                        area = area.vertical_scroll_offset(0.0);
                     }
-                });
+                    area.show(ui, |ui| self.render_section(ui));
+                }
+                // Linux/Wayland: kanso's kinetic fling + rubber-band view,
+                // since libinput hands the toolkit no momentum to lean on.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if section_changed {
+                        kanso::scroll::scroll_view_reset(ui, "prefs_content");
+                    }
+                    kanso::scroll::scroll_view(ui, "prefs_content", |ui| self.render_section(ui));
+                }
             });
 
         if quit_requested {
@@ -999,6 +1078,22 @@ impl eframe::App for PrefsApp {
 }
 
 impl PrefsApp {
+    /// Render the body of the currently-selected section. Shared by both
+    /// scroll backends (the macOS native `ScrollArea` and the Linux
+    /// `kanso::scroll::scroll_view`).
+    fn render_section(&mut self, ui: &mut egui::Ui) {
+        // Scrollbar sits flush at the edge; reserve ~10px so the content keeps
+        // a right gap matching the 20px left padding.
+        ui.set_max_width((ui.available_width() - 10.0).max(0.0));
+        match self.section {
+            Section::Hotkeys => self.hotkeys_panel(ui),
+            Section::Providers => self.providers_panel(ui),
+            Section::Behavior => self.behavior_panel(ui),
+            Section::Privacy => self.privacy_panel(ui),
+            Section::About => self.about_panel(ui),
+        }
+    }
+
     fn hotkeys_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Hotkeys");
         ui.add_space(14.0);
@@ -1306,61 +1401,98 @@ impl PrefsApp {
         }
         ui.add_space(4.0);
 
-        let Some(status) = status else {
-            // First-ever probe still in flight — show a neutral
-            // "checking…" message instead of flashing a wrong state.
-            if probe_in_flight {
-                ui.colored_label(
-                    kanso::palette::TEXT_MUTED,
-                    "Checking for a running LanguageTool server…",
-                );
-            }
-            return;
-        };
-
-        match status {
-            LanguageToolStatus::Reachable {
-                managed_container_running,
-            } => {
-                ui.colored_label(kanso::palette::OK, format!("Reachable at {url}"));
-                ui.add_space(8.0);
-                if managed_container_running {
-                    // This is our container — give the user the same
-                    // Stop / Remove controls they had before.
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!op_in_flight, egui::Button::new("Stop"))
-                            .on_hover_text(format!(
-                                "docker stop {}\nLeaves the container in place; \
-                                 Start brings it back.",
-                                docker::CONTAINER
-                            ))
-                            .clicked()
-                        {
-                            self.docker_op = Some(docker::stop());
-                            self.ok(OpKind::Stop.label());
-                        }
-                        if ui
-                            .add_enabled(!op_in_flight, egui::Button::new("Remove").frame(false))
-                            .on_hover_text("Stop and delete the container. The image stays cached.")
-                            .clicked()
-                        {
-                            self.docker_op = Some(docker::remove());
-                            self.ok(OpKind::Remove.label());
-                        }
-                    });
-                } else {
-                    ui.add_space(4.0);
-                    caption(
+        // Status + controls for the managed container. An op in flight shows
+        // a progress bar in place of the buttons (Install runs in two visible
+        // phases — a determinate download bar while pulling, then "Starting…"
+        // as it comes up); the first probe shows "Checking…". Crucially NONE
+        // of these branches return early — the n-gram row below ALWAYS
+        // renders, so clicking Start/Stop/Remove (which swaps this area for a
+        // bar) doesn't shrink the panel and bounce the scroll to the top.
+        if let Some(op) = &self.docker_op {
+            use docker::OpProgress;
+            match op.progress() {
+                OpProgress::Pulling { done, total } if total > 0 => {
+                    kanso::widgets::progress(
                         ui,
-                        "Detected an existing LanguageTool server — hyprcorrect will \
-                         use it as-is. No Docker setup needed.",
+                        done as f32 / total as f32,
+                        &format!("Downloading image… ({done}/{total} layers)"),
                     );
                 }
+                OpProgress::Pulling { .. } => {
+                    kanso::widgets::ProgressBar::indeterminate()
+                        .text("Downloading image…")
+                        .show(ui);
+                }
+                OpProgress::Starting => {
+                    kanso::widgets::ProgressBar::indeterminate()
+                        .text("Starting container…")
+                        .show(ui);
+                }
+                OpProgress::Working => {
+                    kanso::widgets::ProgressBar::indeterminate()
+                        .text(op.kind().label())
+                        .show(ui);
+                }
             }
-            LanguageToolStatus::Unreachable(docker_state) => {
-                self.docker_unreachable_row(ui, &docker_state, &url, op_in_flight);
+        } else if let Some(status) = status {
+            match status {
+                LanguageToolStatus::Reachable {
+                    managed_container_running,
+                } => {
+                    ui.colored_label(kanso::palette::OK, format!("Reachable at {url}"));
+                    ui.add_space(8.0);
+                    if managed_container_running {
+                        // This is our container — give the user the same
+                        // Stop / Remove controls they had before.
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!op_in_flight, egui::Button::new("Stop"))
+                                .on_hover_text(format!(
+                                    "docker stop {}\nLeaves the container in place; \
+                                     Start brings it back.",
+                                    docker::CONTAINER
+                                ))
+                                .clicked()
+                            {
+                                self.docker_op = Some(docker::stop());
+                                self.ok(OpKind::Stop.label());
+                            }
+                            if ui
+                                .add_enabled(
+                                    !op_in_flight,
+                                    egui::Button::new("Remove").frame(false),
+                                )
+                                .on_hover_text(
+                                    "Full uninstall: delete the container AND the cached \
+                                     image. A later Install re-downloads it (~600 MB). Use \
+                                     Stop to keep it for a quick restart.",
+                                )
+                                .clicked()
+                            {
+                                self.docker_op = Some(docker::remove());
+                                self.ok(OpKind::Remove.label());
+                            }
+                        });
+                    } else {
+                        ui.add_space(4.0);
+                        caption(
+                            ui,
+                            "Detected an existing LanguageTool server — hyprcorrect will \
+                             use it as-is. No Docker setup needed.",
+                        );
+                    }
+                }
+                LanguageToolStatus::Unreachable(docker_state) => {
+                    self.docker_unreachable_row(ui, &docker_state, &url, op_in_flight);
+                }
             }
+        } else if probe_in_flight {
+            // First-ever probe still in flight — a neutral "checking…"
+            // message instead of flashing a wrong state.
+            ui.colored_label(
+                kanso::palette::TEXT_MUTED,
+                "Checking for a running LanguageTool server…",
+            );
         }
 
         self.languagetool_ngram_row(ui, &url, op_in_flight);
@@ -1521,7 +1653,6 @@ impl PrefsApp {
             && let Some(d) = base.clone()
         {
             self.ngram_download = Some(crate::ngrams::spawn_ngram_download(d));
-            self.ok("Downloading n-grams…");
         }
         ui.add_space(4.0);
         caption(
@@ -1540,6 +1671,20 @@ impl PrefsApp {
         url: &str,
         op_in_flight: bool,
     ) {
+        // Just-started warm-up: the container is up but LanguageTool's JVM
+        // hasn't bound the port yet. Show a "Starting…" spinner instead of
+        // the alarming "port-mapping mismatch" — that warning is only real
+        // once the warm-up window elapses and it's STILL unreachable.
+        if matches!(state, DockerState::ContainerRunning)
+            && self.lt_warmup_until.is_some_and(|t| Instant::now() < t)
+        {
+            kanso::widgets::ProgressBar::indeterminate()
+                .text("Starting LanguageTool — first launch takes a few seconds…")
+                .show(ui);
+            ui.ctx().request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+
         let (status_text, status_color) = match state {
             DockerState::NotInstalled => (
                 format!(
@@ -1640,7 +1785,10 @@ impl PrefsApp {
                 }
                 if ui
                     .add_enabled(!op_in_flight, egui::Button::new("Remove").frame(false))
-                    .on_hover_text("Delete the container. The image stays cached locally.")
+                    .on_hover_text(
+                        "Full uninstall: delete the container AND the cached image. A \
+                         later Install re-downloads it (~600 MB).",
+                    )
                     .clicked()
                 {
                     self.docker_op = Some(docker::remove());
@@ -3157,11 +3305,43 @@ pub(crate) fn run() {
     // of this process. A separate thread holds it and exits when prefs
     // closes.
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    // Raise-on-reopen flag. True initially on macOS so the window comes to
+    // the front the first frame it opens; stays false on Linux (a second
+    // instance raises us via `hyprctl` in focus_existing_prefs instead).
+    let raise = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cfg!(
+        target_os = "macos"
+    )));
+
+    // macOS: a `hyprcorrect prefs` launched while we're already open
+    // connects to our singleton socket (acquire_singleton's liveness probe)
+    // and exits. Treat each such connection as a "raise me" request —
+    // accept it, flag a raise, and wake the UI. The thread is detached and
+    // dies with the process, so there's nothing to join or signal.
+    #[cfg(target_os = "macos")]
+    let ui_ctx: std::sync::Arc<std::sync::OnceLock<egui::Context>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    #[cfg(target_os = "macos")]
+    {
+        let raise = raise.clone();
+        let ui_ctx = ui_ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("hyprcorrect-prefs-raise".into())
+            .spawn(move || {
+                for _conn in listener.incoming() {
+                    raise.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(ctx) = ui_ctx.get() {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        let _ = shutdown_rx; // detached accept-loop — nothing to signal
+    }
+    // Linux: just hold the socket bound for the process lifetime (the bind
+    // alone marks the path in-use); raising is done by the second instance.
+    #[cfg(not(target_os = "macos"))]
     let listener_thread = std::thread::Builder::new()
         .name("hyprcorrect-prefs-lock".into())
         .spawn(move || {
-            // We don't actually accept connections — the bind alone is
-            // what makes the path appear "in use" to other instances.
             let _ = listener;
             let _ = shutdown_rx.recv();
         })
@@ -3195,11 +3375,11 @@ pub(crate) fn run() {
             // Set our own window/app icon so the app-switcher / Dock
             // shows the hyprcorrect mark instead of egui's default "e".
             .with_icon(app_window_icon())
-            // macOS opens tall enough to show the Hotkeys / Providers
-            // panels without scrolling; Linux/Wayland tiles the window so
-            // its requested open size is moot there.
+            // macOS opens wide + tall enough to show the Hotkeys / Providers
+            // panels comfortably without scrolling; Linux/Wayland tiles the
+            // window so its requested open size is moot there.
             .with_inner_size(if cfg!(target_os = "macos") {
-                [640.0, 822.0]
+                [800.0, 822.0]
             } else {
                 [640.0, 480.0]
             })
@@ -3222,17 +3402,27 @@ pub(crate) fn run() {
                     ..Default::default()
                 },
             );
+            // macOS: hand the egui context to the singleton accept-loop so
+            // a re-open can wake an idle window, and show the Dock icon for
+            // as long as Preferences is open (the daemon stays menu-bar-only).
+            #[cfg(target_os = "macos")]
+            {
+                let _ = ui_ctx.set(cc.egui_ctx.clone());
+                hyprcorrect_platform::macos::show_in_dock();
+            }
             Ok(Box::new(PrefsApp::new(
                 saved,
                 saved_llm_keys,
                 shutdown_tx,
                 initial_section,
+                raise.clone(),
             )))
         }),
     );
 
     // Best-effort cleanup of the socket file.
     let _ = std::fs::remove_file(singleton_path());
+    #[cfg(not(target_os = "macos"))]
     if let Some(handle) = listener_thread {
         let _ = handle.join();
     }

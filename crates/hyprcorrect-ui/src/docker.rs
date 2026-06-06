@@ -127,12 +127,27 @@ pub struct ProbeResult {
 /// `Err(msg)` with the docker stderr or our wrapper error.
 pub type OpResult = Result<(), String>;
 
+/// Live phase of an in-flight op, for the prefs progress bar. Only
+/// [`install`] drives the two image phases; every other op stays
+/// `Working` (rendered as an indeterminate bar with the op's label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpProgress {
+    /// Generic "busy" — no sub-phases.
+    Working,
+    /// Pulling the image. `total` is the layer count once known (0 until
+    /// the first layers are announced), `done` the layers finished.
+    Pulling { done: usize, total: usize },
+    /// Image is local; the container is starting.
+    Starting,
+}
+
 /// Handle to a background docker operation. Drop = forget; the worker
 /// thread runs to completion regardless. Use [`OpHandle::poll`] each
-/// frame to pick up the result.
+/// frame to pick up the result, and [`OpHandle::progress`] for the bar.
 pub struct OpHandle {
     kind: OpKind,
     result: Arc<Mutex<Option<OpResult>>>,
+    progress: Arc<Mutex<OpProgress>>,
 }
 
 impl OpHandle {
@@ -144,6 +159,14 @@ impl OpHandle {
     /// while it's still running.
     pub fn poll(&self) -> Option<OpResult> {
         self.result.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Current phase of the op, for driving the progress bar.
+    pub fn progress(&self) -> OpProgress {
+        self.progress
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(OpProgress::Working)
     }
 }
 
@@ -365,9 +388,87 @@ fn find_container_by_image(image: &str) -> Option<ForeignContainer> {
 /// n-gram data — the directory holding `en/`.
 pub fn install(host_port: u16, ngram_dir: Option<&str>) -> OpHandle {
     let ngram = ngram_dir.map(str::to_string);
-    spawn_op(OpKind::Install, move || {
+    spawn_op(OpKind::Install, move |progress| {
+        // Phase 1: pull the image with live download progress. `docker run`
+        // would pull implicitly, but then there's no progress to surface, so
+        // we pull explicitly first and parse its per-layer output.
+        pull_image(&progress)?;
+        // Phase 2: the image is local — bring the container up.
+        if let Ok(mut g) = progress.lock() {
+            *g = OpProgress::Starting;
+        }
         run_install(host_port, ngram.as_deref())
     })
+}
+
+/// `docker pull IMAGE`, parsing its (non-TTY) per-layer status lines into a
+/// coarse layer-count progress. macOS/Linux docker prints one line per layer
+/// per status transition; we track which layers exist (`Pulling fs layer` /
+/// `Already exists`) and which have finished (`Pull complete` / `Already
+/// exists`) and publish done/total to `progress`. stderr is drained on a
+/// side thread so a full pipe can't deadlock the pull.
+fn pull_image(progress: &Arc<Mutex<OpProgress>>) -> OpResult {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader, Read};
+
+    *progress.lock().unwrap() = OpProgress::Pulling { done: 0, total: 0 };
+    let mut child = Command::new("docker")
+        .args(["pull", IMAGE])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to launch `docker pull`: {e}"))?;
+
+    let stderr_thread = child.stderr.take().map(|mut e| {
+        thread::spawn(move || {
+            let mut s = String::new();
+            let _ = e.read_to_string(&mut s);
+            s
+        })
+    });
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut done: HashSet<String> = HashSet::new();
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            let id = line.split(": ").next().unwrap_or_default().to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if line.ends_with("Pulling fs layer") {
+                seen.insert(id);
+            } else if line.ends_with("Already exists") {
+                seen.insert(id.clone());
+                done.insert(id);
+            } else if line.ends_with("Pull complete") {
+                done.insert(id);
+            } else {
+                continue;
+            }
+            if let Ok(mut g) = progress.lock() {
+                *g = OpProgress::Pulling {
+                    done: done.len(),
+                    total: seen.len().max(done.len()),
+                };
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("docker pull: {e}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = stderr_thread
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    Err(stderr
+        .lines()
+        .last()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("docker pull failed")
+        .to_string())
 }
 
 /// `docker run` the container, optionally with the n-gram data mounted.
@@ -400,7 +501,7 @@ fn run_install(host_port: u16, ngram_dir: Option<&str>) -> OpResult {
 /// and re-runnable to pick up a changed `ngram_dir`.
 pub fn enable_ngrams(host_port: u16, ngram_dir: &str) -> OpHandle {
     let dir = ngram_dir.to_string();
-    spawn_op(OpKind::EnableNgrams, move || {
+    spawn_op(OpKind::EnableNgrams, move |_progress| {
         let _ = run_command("docker", &["rm", "-f", CONTAINER]); // ignore "no such container"
         run_install(host_port, Some(&dir))
     })
@@ -410,7 +511,7 @@ pub fn enable_ngrams(host_port: u16, ngram_dir: &str) -> OpHandle {
 /// mount, then delete the downloaded data folder to reclaim the disk.
 /// `data_dir` is the app's download folder (`config::ngram_data_dir`).
 pub fn remove_ngrams(host_port: u16, data_dir: PathBuf) -> OpHandle {
-    spawn_op(OpKind::RemoveNgrams, move || {
+    spawn_op(OpKind::RemoveNgrams, move |_progress| {
         let _ = run_command("docker", &["rm", "-f", CONTAINER]); // ignore "no such container"
         let recreate = run_install(host_port, None);
         // Delete the data even if the recreate failed — the user asked to
@@ -423,40 +524,54 @@ pub fn remove_ngrams(host_port: u16, data_dir: PathBuf) -> OpHandle {
 
 /// Start an existing stopped container.
 pub fn start() -> OpHandle {
-    spawn_op(OpKind::Start, || {
+    spawn_op(OpKind::Start, |_progress| {
         run_command("docker", &["start", CONTAINER])
     })
 }
 
 /// Stop a running container.
 pub fn stop() -> OpHandle {
-    spawn_op(OpKind::Stop, || run_command("docker", &["stop", CONTAINER]))
+    spawn_op(OpKind::Stop, |_progress| {
+        run_command("docker", &["stop", CONTAINER])
+    })
 }
 
-/// Force-remove the container (whether running or stopped). The image
-/// is left in the local cache so a subsequent re-install is fast.
+/// Full uninstall: force-remove the container (running or stopped) AND
+/// delete the cached image, so a later Install genuinely re-pulls it
+/// (~600 MB). Use [`stop`] instead to keep it around for a fast restart.
 pub fn remove() -> OpHandle {
-    spawn_op(OpKind::Remove, || {
-        run_command("docker", &["rm", "-f", CONTAINER])
+    spawn_op(OpKind::Remove, |_progress| {
+        run_command("docker", &["rm", "-f", CONTAINER])?;
+        // Best-effort: drop the cached image too. Ignore errors — the image
+        // may be shared with another tag/container, or already gone; the
+        // container removal is the part that must succeed.
+        let _ = run_command("docker", &["rmi", IMAGE]);
+        Ok(())
     })
 }
 
 fn spawn_op<F>(kind: OpKind, op: F) -> OpHandle
 where
-    F: FnOnce() -> OpResult + Send + 'static,
+    F: FnOnce(Arc<Mutex<OpProgress>>) -> OpResult + Send + 'static,
 {
     let result = Arc::new(Mutex::new(None));
     let result_for_thread = Arc::clone(&result);
+    let progress = Arc::new(Mutex::new(OpProgress::Working));
+    let progress_for_thread = Arc::clone(&progress);
     thread::Builder::new()
         .name(format!("hyprcorrect-docker-{kind:?}"))
         .spawn(move || {
-            let out = op();
+            let out = op(progress_for_thread);
             if let Ok(mut g) = result_for_thread.lock() {
                 *g = Some(out);
             }
         })
         .ok();
-    OpHandle { kind, result }
+    OpHandle {
+        kind,
+        result,
+        progress,
+    }
 }
 
 fn run_command(program: &str, args: &[&str]) -> OpResult {

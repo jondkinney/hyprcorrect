@@ -129,3 +129,34 @@ pub fn primary_screen_size() -> (f32, f32) {
         (frame.size.width as f32, frame.size.height as f32)
     })
 }
+
+/// Promote this process to a **Regular** app so it gets a Dock icon and
+/// appears in the ⌘-Tab switcher. The daemon stays `.accessory` (menu-bar
+/// only); the prefs subprocess calls this so an open Preferences window
+/// shows in the Dock, then the subprocess exits on close and the icon
+/// clears itself — no toggle to manage. Must run on the main thread; the
+/// eframe/winit UI thread IS the main thread, so call it from there.
+pub fn show_in_dock() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    NSApplication::sharedApplication(mtm)
+        .setActivationPolicy(NSApplicationActivationPolicy::Regular);
+}
+
+/// Bring this app to the foreground — for a fresh prefs window coming up,
+/// or a re-open (Dock click / Spotlight / Raycast) while it's already up.
+/// Pairs with egui's `ViewportCommand::Focus`: that raises the *window*,
+/// this raises the *app* above whatever was frontmost. Main thread only.
+pub fn activate() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // macOS 14+ `activate` supersedes the deprecated
+    // `activateIgnoringOtherApps:`; it always brings the app forward.
+    NSApplication::sharedApplication(mtm).activate();
+}
