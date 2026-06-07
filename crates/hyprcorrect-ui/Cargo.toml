@@ -14,7 +14,9 @@ hyprcorrect-platform.workspace = true
 eframe.workspace = true
 egui.workspace = true
 # Shared egui design system, published to crates.io.
-kanso = "0.1.4"
+# 0.1.5 adds the phase-aware scroll_view used by the macOS rubber-band
+# (slot-gated — identical behaviour on Linux/source builds).
+kanso = "0.1.5"
 resvg.workspace = true
 tiny-skia.workspace = true
 usvg.workspace = true
