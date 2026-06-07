@@ -1025,13 +1025,14 @@ impl eframe::App for PrefsApp {
                     ui.data_mut(|d| d.insert_temp(shown_id, self.section));
                 }
 
-                // macOS: a plain egui ScrollArea so the OS's native trackpad
-                // momentum + rubber-band events drive scrolling directly.
-                // kanso's owned-offset fling exists for Linux/Wayland, which
-                // sends NO momentum; on macOS it misreads the OS momentum
-                // stream (no clean "lift") and pins on a flick. Reset to top on
-                // a section change by forcing the offset for that one frame.
-                #[cfg(target_os = "macos")]
+                // macOS WITHOUT the cohort fork: a plain egui ScrollArea so the
+                // OS's native trackpad momentum drives scrolling. kanso's
+                // owned-offset fling needs the fork's scroll-phase signal to
+                // tell a gesture delta from the OS momentum coast; without it,
+                // it misreads the momentum stream (no clean "lift") and pins on
+                // a flick — so source / `cargo install` builds keep the native
+                // path. Reset to top on a section change by forcing the offset.
+                #[cfg(all(target_os = "macos", not(feature = "cohort-fork")))]
                 {
                     let mut area = egui::ScrollArea::vertical()
                         .id_salt("prefs_content")
@@ -1041,10 +1042,17 @@ impl eframe::App for PrefsApp {
                     }
                     area.show(ui, |ui| self.render_section(ui));
                 }
-                // Linux/Wayland: kanso's kinetic fling + rubber-band view,
-                // since libinput hands the toolkit no momentum to lean on.
-                #[cfg(not(target_os = "macos"))]
+                // kanso's kinetic fling + rubber-band view. Used on Linux/Wayland
+                // always (libinput hands the toolkit no momentum to lean on), and
+                // on macOS in the notarized prebuild, where the cohort egui-winit
+                // fork (`cohort-fork`) publishes the scroll phase so kanso flings
+                // off the real finger lift and drops the OS momentum coast.
+                #[cfg(any(not(target_os = "macos"), feature = "cohort-fork"))]
                 {
+                    // macOS trackpad deltas/cadence differ from libinput, so the
+                    // kinetic feel is dialled in with a macOS tuning profile.
+                    #[cfg(target_os = "macos")]
+                    kanso::scroll::set_scroll_tuning(ui.ctx(), macos_scroll_tuning());
                     if section_changed {
                         kanso::scroll::scroll_view_reset(ui, "prefs_content");
                     }
@@ -3284,6 +3292,25 @@ fn ensure_daemon_running() {
         .spawn();
     if let Err(e) = result {
         eprintln!("hyprcorrect: failed to spawn daemon: {e}");
+    }
+}
+
+/// The kinetic-scroll feel for the macOS prefs window (cohort prebuild only).
+///
+/// kanso's defaults were measured against libinput deltas; macOS trackpad
+/// pixel-deltas and event cadence differ, so the feel is dialled in here and
+/// pushed every frame via [`kanso::scroll::set_scroll_tuning`].
+///
+/// Only `rb_amplitude` deviates from the defaults: macOS carries far more
+/// velocity into the edge than libinput, so the stock `3.0` shot the
+/// over-scroll much too far on a flick. `0.5` lands the bounce where it feels
+/// native — validated on-device in the actual prefs window; every other knob
+/// measured well at its default.
+#[cfg(all(target_os = "macos", feature = "cohort-fork"))]
+fn macos_scroll_tuning() -> kanso::scroll::ScrollTuning {
+    kanso::scroll::ScrollTuning {
+        rb_amplitude: 0.5,
+        ..kanso::scroll::ScrollTuning::default()
     }
 }
 

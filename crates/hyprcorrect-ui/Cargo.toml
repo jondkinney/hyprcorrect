@@ -26,3 +26,13 @@ ureq.workspace = true
 # Downloading + unzipping the LanguageTool n-gram archive in prefs.
 zip.workspace = true
 fs2.workspace = true
+
+[features]
+# Enabled only by the notarized macOS prebuild, which patches in the cohort
+# egui-winit/winit forks that publish the trackpad scroll phase. With it, the
+# macOS prefs window uses kanso's kinetic fling + rubber-band (`scroll_view`)
+# off the real finger lift; without it (source / crates.io builds, which have
+# no fork and so no phase signal) macOS keeps the native egui `ScrollArea`,
+# since kanso's gap-based lift inference pins a flick on macOS. No-op on Linux,
+# which always uses `scroll_view`.
+cohort-fork = []

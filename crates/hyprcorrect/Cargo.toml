@@ -21,3 +21,9 @@ hyprcorrect-ui.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 serde_json.workspace = true
+
+[features]
+# Forwarded to hyprcorrect-ui: the notarized macOS prebuild enables this
+# (alongside the [patch.crates-io] cohort fork pins) so the prefs window gets
+# kanso's kinetic fling + rubber-band scrolling. Off in source/crates.io builds.
+cohort-fork = ["hyprcorrect-ui/cohort-fork"]

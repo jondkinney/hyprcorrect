@@ -1,8 +1,44 @@
 # Plan: rubber-band kinetic scroll for the macOS prefs window
 
-Status: **not started** — picked up in a fresh session.
-Owner context: hyprcorrect prefs (eframe/egui), kanso design system, the
-cohort egui-winit fork.
+Status: **IMPLEMENTED 2026-06-06** (feel validated on-device; release wiring
+pending — see below). Owner context: hyprcorrect prefs (eframe/egui), kanso
+design system, the cohort egui-winit/winit forks.
+
+## What actually shipped (leaner than the plan below)
+
+The plan's central unknown — "does winit expose `momentumPhase`?" — resolved
+in our favour: **winit's macOS backend already reads `momentumPhase()` AND
+`phase()`**, it just *collapses* them into one `TouchPhase`. So no new NSEvent
+reading was needed — only un-collapsing. Implemented as (branches
+`macos-scroll-phase` in each fork; `cohort-fork` feature + `prefs.rs` in
+hyprcorrect):
+
+- **winit-cohort**: new `ScrollMomentumPhase {Gesture,GestureEnded,Momentum,
+  MomentumEnded}` + `WindowEvent::ScrollMomentumPhase`, classified un-collapsed
+  in `scrollWheel:` and emitted alongside the unchanged `MouseWheel`.
+- **egui-winit-cohort**: maps it to a `u8` (`1..=4`) published to egui memory at
+  `SCROLL_PHASE_ID = "egui_scroll_phase"` (mirrors the hold-gesture `bool`).
+- **kanso** `scroll_view`: drops Momentum deltas (guarded `!wheel`), flings off
+  the precise `GestureEnded` lift, gated on the slot being `Some` so Linux is
+  byte-identical. Plus **rest-to-stop**: a zero-delta `Gesture` phase
+  (MayBegin/Began) halts the coast — macOS has no Wayland-style `HoldGesture`.
+- **hyprcorrect**: `cohort-fork` cargo feature switches macOS to `scroll_view`
+  (else native `ScrollArea`); `macos_scroll_tuning()` overrides only
+  `rb_amplitude` 3.0 → **0.5** (macOS carries far more edge velocity than
+  libinput). Tuned live with the kanso gallery sliders.
+
+Captured as skills: `macos-egui-winit-collapses-scroll-momentum-phase` and
+`macos-trackpad-rest-to-stop-is-zero-delta-maybegin`.
+
+**Still pending (gated on push authorization):** the release sequence — push the
+fork branches, cut kanso 0.1.5, bump pins + add the `[patch.crates-io]` step and
+`--features cohort-fork` to the `macos-aarch64` job in `release.yml`. Until then
+the prebuilt DMG stays on the native ScrollArea (no regression, no bounce).
+
+---
+
+_Original plan (superseded by the leaner implementation above), kept for the
+physics/tuning notes:_
 
 ## Goal
 Give the macOS Preferences window the full **kinetic fling + rubber-band
