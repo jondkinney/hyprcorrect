@@ -34,6 +34,20 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.4.1" date="2026-06-07">
+      <description>
+        <p>Added:</p>
+        <ul>
+          <li>kinetic rubber-band scroll in prefs</li>
+          <li>auto-relaunch on Accessibility grant</li>
+          <li>prefs Dock, native scroll, Docker UX</li>
+        </ul>
+        <p>Other:</p>
+        <ul>
+          <li>ship the rubber-band scroll in the prebuild</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-06-05">
       <description>
         <p>Added:</p>
