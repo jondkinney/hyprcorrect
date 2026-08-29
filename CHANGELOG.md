@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/jondkinney/hyprcorrect/compare/v0.4.1...v0.5.0) - 2026-08-29
+
+### Added
+
+- *(omarchy)* add Quickshell bar companion
+- *(corrections)* preserve emoji across sentence fixes
+
+### Fixed
+
+- *(build)* gate Linux-only clap import
+- *(hyprland)* register hotkeys through Lua bindings
+
 ## [0.4.1](https://github.com/jondkinney/hyprcorrect/compare/v0.4.0...v0.4.1) - 2026-06-07
 
 ### Added
