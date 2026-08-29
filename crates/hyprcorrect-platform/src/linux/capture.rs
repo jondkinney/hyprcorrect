@@ -30,7 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use evdev::{Device, EventSummary, KeyCode};
-use hyprcorrect_core::{Chord, Key};
+use hyprcorrect_core::{Chord, Key, ResetKind};
 use xkbcommon::xkb;
 
 use crate::linux::chord_capture::ChordCaptureSlot;
@@ -769,7 +769,7 @@ fn translate(state: &xkb::State, keycode: xkb::Keycode, triggers: &[TriggerSpec]
     // shortcut, not typed text — and it may have moved the caret or
     // edited. Reset.
     if has_action_modifier(state) {
-        return Some(Key::Reset);
+        return Some(Key::Reset(ResetKind::Other));
     }
 
     classify(sym, &state.key_get_utf8(keycode))
@@ -886,26 +886,30 @@ fn is_modifier_keysym(sym: u32) -> bool {
     (0xffe1..=0xffee).contains(&sym)
 }
 
-/// Resolve "does this keysym reset the buffer right now" against
-/// the user's prefs-driven [`ResetKeyConfig`]. Cheap (one RwLock
-/// read) so `classify` can call it on every keystroke.
-fn reset_for_keysym(sym: u32) -> bool {
+/// Resolve "does this keysym reset the buffer right now, and which
+/// [`ResetKind`] is it" against the user's prefs-driven
+/// [`ResetKeyConfig`]. `None` when the key isn't an enabled reset key.
+/// Cheap (one RwLock read) so `classify` can call it on every keystroke.
+fn reset_for_keysym(sym: u32) -> Option<ResetKind> {
     use xkb::keysyms::{
         KEY_Delete, KEY_Down, KEY_Escape, KEY_ISO_Left_Tab, KEY_Insert, KEY_KP_Enter, KEY_Linefeed,
         KEY_Next, KEY_Prior, KEY_Return, KEY_Tab, KEY_Up,
     };
     let cfg = reset_keys();
-    matches!(
-        sym,
-        s if (s == KEY_Return || s == KEY_KP_Enter || s == KEY_Linefeed) && cfg.enter
-    ) || matches!(sym, s if (s == KEY_Tab || s == KEY_ISO_Left_Tab) && cfg.tab)
-        || matches!(sym, s if s == KEY_Escape && cfg.escape)
-        || matches!(sym, s if s == KEY_Up && cfg.up)
-        || matches!(sym, s if s == KEY_Down && cfg.down)
-        || matches!(sym, s if s == KEY_Prior && cfg.page_up)
-        || matches!(sym, s if s == KEY_Next && cfg.page_down)
-        || matches!(sym, s if s == KEY_Delete && cfg.delete)
-        || matches!(sym, s if s == KEY_Insert && cfg.insert)
+    match sym {
+        s if (s == KEY_Return || s == KEY_KP_Enter || s == KEY_Linefeed) && cfg.enter => {
+            Some(ResetKind::Enter)
+        }
+        s if (s == KEY_Tab || s == KEY_ISO_Left_Tab) && cfg.tab => Some(ResetKind::Tab),
+        s if s == KEY_Escape && cfg.escape => Some(ResetKind::Escape),
+        s if s == KEY_Up && cfg.up => Some(ResetKind::Up),
+        s if s == KEY_Down && cfg.down => Some(ResetKind::Down),
+        s if s == KEY_Prior && cfg.page_up => Some(ResetKind::PageUp),
+        s if s == KEY_Next && cfg.page_down => Some(ResetKind::PageDown),
+        s if s == KEY_Delete && cfg.delete => Some(ResetKind::Delete),
+        s if s == KEY_Insert && cfg.insert => Some(ResetKind::Insert),
+        _ => None,
+    }
 }
 
 /// Classify an xkb keysym and the UTF-8 it produces into a buffer
@@ -933,8 +937,8 @@ fn classify(sym: u32, utf8: &str) -> Option<Key> {
         Some(Key::LineStart)
     } else if sym == KEY_End {
         Some(Key::LineEnd)
-    } else if reset_for_keysym(sym) {
-        Some(Key::Reset)
+    } else if let Some(kind) = reset_for_keysym(sym) {
+        Some(Key::Reset(kind))
     } else {
         let mut chars = utf8.chars();
         match (chars.next(), chars.next()) {
@@ -979,8 +983,8 @@ mod tests {
     fn reset_key_classifier_honors_config() {
         // Defaults: Enter/Up reset, Tab/Esc ignored.
         set_reset_keys(ResetKeyConfig::default());
-        assert_eq!(classify(KEY_Return, ""), Some(Key::Reset));
-        assert_eq!(classify(KEY_Up, ""), Some(Key::Reset));
+        assert_eq!(classify(KEY_Return, ""), Some(Key::Reset(ResetKind::Enter)));
+        assert_eq!(classify(KEY_Up, ""), Some(Key::Reset(ResetKind::Up)));
         assert_eq!(classify(KEY_Tab, "\t"), None);
         assert_eq!(classify(KEY_Escape, "\u{1b}"), None);
 
@@ -992,8 +996,11 @@ mod tests {
             escape: true,
             ..Default::default()
         });
-        assert_eq!(classify(KEY_Tab, "\t"), Some(Key::Reset));
-        assert_eq!(classify(KEY_Escape, "\u{1b}"), Some(Key::Reset));
+        assert_eq!(classify(KEY_Tab, "\t"), Some(Key::Reset(ResetKind::Tab)));
+        assert_eq!(
+            classify(KEY_Escape, "\u{1b}"),
+            Some(Key::Reset(ResetKind::Escape))
+        );
         assert_eq!(classify(KEY_Return, ""), None);
 
         // Restore defaults so other tests in this module that

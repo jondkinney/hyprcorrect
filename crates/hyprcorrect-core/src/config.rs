@@ -264,6 +264,15 @@ pub struct Behavior {
     /// popup's suggestion dropdown. Defaults to the bundled offline
     /// dictionary; can be turned off or pointed at an online API.
     pub definitions: DefinitionSource,
+
+    /// Window classes (lowercase, exact match) that render a typed
+    /// `:shortcode:` as an emoji glyph and confirm the autocomplete with
+    /// Enter/Tab — Slack, Discord, Element, and the like. In these apps
+    /// the daemon doesn't let that confirming Enter/Tab clear the buffer;
+    /// it commits the shortcode to a single emoji marker instead, so the
+    /// sentence around the emoji stays correctable. Empty by default —
+    /// the user adds their chat apps via the app picker in Preferences.
+    pub emoji_apps: Vec<String>,
 }
 
 /// Platform default for [`Behavior::pause_per_char_ms`]. macOS injects
@@ -282,6 +291,7 @@ impl Default for Behavior {
             review_starts_in_vim: false,
             fallback_to_languagetool: true,
             definitions: DefinitionSource::Local,
+            emoji_apps: Vec::new(),
         }
     }
 }

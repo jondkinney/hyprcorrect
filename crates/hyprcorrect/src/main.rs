@@ -184,6 +184,7 @@ fn run_daemon() {
     let mut review_chord = parse_optional_chord(&initial_config.hotkeys.review);
     let mut review_llm_chord = parse_optional_chord(&initial_config.hotkeys.review_llm);
     let mut blocklist = build_blocklist(&initial_config);
+    let mut emoji_apps = build_emoji_apps(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
 
     if let Err(e) = hyprcorrect_core::runtime::write_self_pid() {
@@ -364,6 +365,9 @@ fn run_daemon() {
     let mut current_blocked = initial_window
         .as_ref()
         .is_some_and(|f| blocklist.contains(&f.class.to_ascii_lowercase()));
+    let mut current_emoji_app = initial_window
+        .as_ref()
+        .is_some_and(|f| emoji_apps.contains(&f.class.to_ascii_lowercase()));
 
     for event in rx {
         match event {
@@ -372,14 +376,15 @@ fn run_daemon() {
                     && !current_blocked
                     && let Some(addr) = current_address.as_deref()
                 {
-                    buffers.entry(addr.to_string()).or_default().push(key);
+                    let buf = buffers.entry(addr.to_string()).or_default();
+                    feed_key(buf, key, current_emoji_app);
                 }
                 // Any keystroke that resets the buffer (Enter, Tab,
                 // Esc, …) also restores caret-buffer agreement, so
                 // the "buffer caret is suspect, scan the whole
                 // buffer" mode mouse clicks opted us into is no
                 // longer needed.
-                if matches!(key, hyprcorrect_core::Key::Reset) {
+                if matches!(key, hyprcorrect_core::Key::Reset(_)) {
                     capture::caret_suspect_flag().store(false, Ordering::Relaxed);
                 }
             }
@@ -499,6 +504,11 @@ fn run_daemon() {
                             review_llm_chord = new_review_llm_chord;
 
                             blocklist = build_blocklist(&new_config);
+                            emoji_apps = build_emoji_apps(&new_config);
+                            // `current_blocked`/`current_emoji_app` refresh on
+                            // the next focus event (matches the blocklist's
+                            // existing reload behavior); the user refocuses the
+                            // chat app to test, which re-evaluates both.
                             llm = build_llm(&new_config);
                             languagetool = build_languagetool(&new_config);
                             default_provider_id = new_config.providers.default;
@@ -539,7 +549,9 @@ fn run_daemon() {
             }
             DaemonEvent::Signal(hotkey::HotkeyEvent::Shutdown) => break,
             DaemonEvent::Focus(focus::FocusEvent::Focused { address, class }) => {
-                current_blocked = blocklist.contains(&class.to_ascii_lowercase());
+                let class_lc = class.to_ascii_lowercase();
+                current_blocked = blocklist.contains(&class_lc);
+                current_emoji_app = emoji_apps.contains(&class_lc);
                 current_address = Some(address);
             }
             DaemonEvent::Focus(focus::FocusEvent::Closed { address }) => {
@@ -547,6 +559,7 @@ fn run_daemon() {
                 if current_address.as_deref() == Some(address.as_str()) {
                     current_address = None;
                     current_blocked = false;
+                    current_emoji_app = false;
                 }
             }
             DaemonEvent::Tray(tray::TrayEvent::TogglePause) => {
@@ -600,6 +613,57 @@ fn build_blocklist(config: &hyprcorrect_core::Config) -> std::collections::HashS
         .iter()
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// Window classes that render `:shortcode:`s as emoji glyphs (Slack,
+/// Discord, …) — in these the daemon commits an emoji-autocomplete
+/// confirmation into the buffer instead of letting it reset. See
+/// [`hyprcorrect_core::Buffer::accept_emoji_shortcode`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn build_emoji_apps(config: &hyprcorrect_core::Config) -> std::collections::HashSet<String> {
+    config
+        .behavior
+        .emoji_apps
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Feed one captured key into a window's buffer, applying the emoji-app
+/// special case. In an app that renders `:shortcode:`s as glyphs, a
+/// reset key pressed while an in-progress shortcode (`:poo`) sits before
+/// the caret is the user driving the emoji autocomplete — not ending a
+/// sentence — so we commit or preserve the shortcode rather than wiping
+/// the buffer. Everywhere else this is just `buf.push(key)`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn feed_key(buf: &mut hyprcorrect_core::Buffer, key: hyprcorrect_core::Key, emoji_app: bool) {
+    use hyprcorrect_core::{Key, ResetKind};
+    if let Key::Reset(kind) = key
+        && emoji_app
+        && buf.has_emoji_shortcode_tail()
+    {
+        match kind {
+            // Enter/Tab confirm the highlighted emoji: swap the in-
+            // progress shortcode for the one-char marker and keep going.
+            ResetKind::Enter | ResetKind::Tab => {
+                buf.accept_emoji_shortcode();
+            }
+            // Up/Down/PageUp/PageDown navigate the open picker, and Esc
+            // dismisses it (leaving the literal `:shortcode` typed) — the
+            // buffer stays valid either way, so suppress the reset
+            // instead of nuking the half-typed sentence.
+            ResetKind::Up
+            | ResetKind::Down
+            | ResetKind::PageUp
+            | ResetKind::PageDown
+            | ResetKind::Escape => {}
+            // Delete/Insert/Other aren't autocomplete keys — a genuine
+            // context change. Clear the buffer as usual.
+            ResetKind::Delete | ResetKind::Insert | ResetKind::Other => buf.push(key),
+        }
+        return;
+    }
+    buf.push(key);
 }
 
 /// Convert the core's [`hyprcorrect_core::ResetKeys`] config struct
@@ -725,8 +789,27 @@ fn fix_last_word(
     use crate::backend::emit;
 
     let Some(at) = buffer.word_at_caret() else {
-        eprintln!("hyprcorrect: word-fix — buffer has no word at caret, trying clipboard fallback");
-        fix_via_clipboard(provider);
+        // The clipboard fallback (select-previous-word via Ctrl+Shift+Left)
+        // is only safe when the buffer is genuinely *empty* — i.e. focus
+        // moved to a window we didn't just type in. When the buffer is
+        // non-empty but simply has no word at the caret — the caret sits
+        // right after an emoji or other punctuation (e.g. Slack having
+        // rendered a typed `:crazy:` shortcode as a single emoji glyph) —
+        // letting the fallback fire would have it select and overwrite
+        // whatever real text sits next to the emoji, corrupting the field.
+        // In that case there's simply no word to fix: do nothing.
+        if buffer.is_empty() {
+            eprintln!("hyprcorrect: word-fix — empty buffer, trying clipboard fallback");
+            fix_via_clipboard(provider);
+        } else {
+            eprintln!(
+                "hyprcorrect: word-fix — no word at the caret (only punctuation/emoji); nothing to correct"
+            );
+            notify_info(
+                "Nothing to correct",
+                "There's no word at the cursor — only punctuation or an emoji.",
+            );
+        }
         return;
     };
     eprintln!(
@@ -1948,18 +2031,32 @@ fn apply_review(
     let backspaces = req.chars_before_caret + req.trailing.chars().count();
     let deletes = req.chars_after_caret;
     let insert = format!("{}{}", req.corrected, req.trailing);
+    // Plan an emoji-aware emit: the sentence may carry EMOJI_MARKERs
+    // (committed `:shortcode:`s the app rendered as glyphs). The emit
+    // steps over each one instead of deleting/retyping it — we can't
+    // reproduce the user's glyph. With no markers this is the plain
+    // "backspace the region, retype it" edit. `removed` stays all-false
+    // until the review's remove-emoji control lands.
+    let marker_count = req.original.matches(hyprcorrect_core::EMOJI_MARKER).count();
+    let removed = vec![false; marker_count];
+    let ops = hyprcorrect_core::plan_sentence_replacement(
+        &req.original,
+        &req.corrected,
+        req.chars_before_caret,
+        req.chars_after_caret,
+        &req.trailing,
+        &removed,
+    );
     eprintln!(
-        "hyprcorrect: review-apply — {backspaces} backspaces + {deletes} deletes + {:?}",
+        "hyprcorrect: review-apply — {} op(s), {marker_count} emoji preserved; insert {:?}",
+        ops.len(),
         insert
     );
-    match emit::replace_around_caret_with_delay(
-        backspaces,
-        deletes,
-        &insert,
-        pause_per_backspace_ms,
-        pause_per_char_ms,
-    ) {
+    match emit::emit_ops(&ops, pause_per_backspace_ms, pause_per_char_ms) {
         Ok(()) => {
+            // Mirror the edit in the buffer. The buffer holds one marker
+            // char per on-screen emoji glyph, so these char counts line
+            // up with the screen even though the emit mechanism differed.
             if let Some(buf) = buffers.get_mut(&req.window_address) {
                 buf.apply_around_caret(backspaces, deletes, &insert);
             }

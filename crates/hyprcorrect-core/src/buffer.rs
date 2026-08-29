@@ -39,9 +39,43 @@ pub enum Key {
     /// Page Up/Down, focus change, mouse click, or any Ctrl/Alt/
     /// Super shortcut we haven't taught the buffer about. After one
     /// of these the buffer's contents and caret are no longer
-    /// trustworthy, so the buffer clears itself.
-    Reset,
+    /// trustworthy, so the buffer clears itself. The [`ResetKind`]
+    /// records which key caused it so the daemon can special-case
+    /// the ones that confirm/navigate an emoji autocomplete in apps
+    /// that render `:shortcode:`s as glyphs (see
+    /// [`Buffer::accept_emoji_shortcode`]).
+    Reset(ResetKind),
 }
+
+/// Which context-changing key produced a [`Key::Reset`]. Carried so the
+/// daemon can tell an autocomplete *accept* (Enter/Tab) from a *navigate*
+/// (Up/Down/PageUp/PageDown) or *cancel* (Esc) when deciding whether a
+/// keypress in an emoji-rendering app should clear the buffer or commit
+/// an emoji into it instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetKind {
+    Enter,
+    Tab,
+    Escape,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Delete,
+    Insert,
+    /// Any other context-changing input that clears the buffer but is
+    /// never part of an autocomplete interaction — a Ctrl/Alt/Super
+    /// shortcut, a focus change, a mouse click. Always clears.
+    Other,
+}
+
+/// The single-character stand-in the buffer stores where an app rendered
+/// a typed `:shortcode:` as one emoji glyph (U+FFFC OBJECT REPLACEMENT
+/// CHARACTER). It is one char — matching the one glyph on screen, so
+/// backspace/delete counts stay aligned — is treated as a non-word hard
+/// boundary by sentence/word detection (a correction never crosses it),
+/// and is never re-emitted, so the user's real emoji is left untouched.
+pub const EMOJI_MARKER: char = '\u{FFFC}';
 
 /// The word at (or immediately to the left of) the caret, with the
 /// metadata an emit-side replace needs to delete the right characters
@@ -189,11 +223,59 @@ impl Buffer {
             Key::LineEnd => {
                 self.caret = self.text.len();
             }
-            Key::Reset => {
+            Key::Reset(_) => {
                 self.text.clear();
                 self.caret = 0;
             }
         }
+    }
+
+    /// Whether the text immediately before the caret is an in-progress
+    /// emoji shortcode — a `:` followed by one or more shortcode chars
+    /// (alphanumerics, `_`, `+`, `-`) with no closing colon yet, e.g.
+    /// `:poo`. That's the buffer signature of an open `:shortcode`
+    /// autocomplete, so the daemon knows a reset key here is the user
+    /// driving the picker rather than ending a sentence.
+    pub fn has_emoji_shortcode_tail(&self) -> bool {
+        self.shortcode_tail_start().is_some()
+    }
+
+    /// Replace an in-progress emoji shortcode tail (`:poo`) before the
+    /// caret with the single [`EMOJI_MARKER`] char — what we do when the
+    /// user confirms the autocomplete (the app swaps the shortcode for a
+    /// glyph we never see). Returns `false` (leaving the buffer
+    /// untouched) when there's no shortcode tail to commit.
+    pub fn accept_emoji_shortcode(&mut self) -> bool {
+        let Some(start) = self.shortcode_tail_start() else {
+            return false;
+        };
+        let mut marker = [0u8; 4];
+        self.text
+            .replace_range(start..self.caret, EMOJI_MARKER.encode_utf8(&mut marker));
+        self.caret = start + EMOJI_MARKER.len_utf8();
+        true
+    }
+
+    /// Byte offset of the `:` that opens an in-progress shortcode ending
+    /// at the caret, or `None` when the text before the caret isn't a
+    /// `:`-plus-shortcode-chars run.
+    fn shortcode_tail_start(&self) -> Option<usize> {
+        let before = &self.text[..self.caret];
+        let run: usize = before
+            .chars()
+            .rev()
+            .take_while(|&c| is_shortcode_char(c))
+            .map(char::len_utf8)
+            .sum();
+        if run == 0 {
+            return None;
+        }
+        let colon = self.caret - run;
+        // A `:` must sit immediately before the run.
+        if colon == 0 || !self.text[..colon].ends_with(':') {
+            return None;
+        }
+        Some(colon - ':'.len_utf8())
     }
 
     /// Clear the buffer.
@@ -505,8 +587,15 @@ fn make_nearby_word(text: &str, caret: usize, start: usize, end: usize) -> Nearb
 /// when we pick a word to send to the spell-checker/LLM we want it
 /// clean of punctuation, even if the user's editor would consider
 /// the punctuation part of the same nav-word.
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '\''
+}
+
+/// Characters allowed in an emoji `:shortcode:` body (between the
+/// colons) — alphanumerics plus `_`, `+`, `-` so Slack/Discord custom
+/// names like `:thumbs_up:`, `:c++:`, `:my-custom-thing:` are matched.
+fn is_shortcode_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '+' | '-')
 }
 
 /// The "word char" rule for `Ctrl+Left` / `Ctrl+Right` caret
@@ -658,9 +747,52 @@ mod tests {
     fn reset_clears_the_buffer() {
         let mut buf = Buffer::default();
         type_str(&mut buf, "vernuer ");
-        buf.push(Key::Reset);
+        buf.push(Key::Reset(ResetKind::Enter));
         assert!(buf.is_empty());
         assert_eq!(buf.word_at_caret(), None);
+    }
+
+    #[test]
+    fn accept_emoji_shortcode_swaps_the_tail_for_one_marker() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "had a :poo");
+        assert!(buf.has_emoji_shortcode_tail());
+        assert!(buf.accept_emoji_shortcode());
+        // ":poo" (4 chars) collapses to one marker char.
+        assert_eq!(buf.text(), "had a \u{FFFC}");
+        assert_eq!(buf.caret(), buf.text().len());
+        // Continue typing after the committed emoji.
+        type_str(&mut buf, " stuffz");
+        assert_eq!(buf.text(), "had a \u{FFFC} stuffz");
+    }
+
+    #[test]
+    fn accept_emoji_shortcode_noops_without_a_tail() {
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "plain words");
+        assert!(!buf.has_emoji_shortcode_tail());
+        assert!(!buf.accept_emoji_shortcode());
+        assert_eq!(buf.text(), "plain words");
+        // A bare colon, or a colon already closed, isn't an in-progress tail.
+        let mut buf2 = Buffer::default();
+        type_str(&mut buf2, "ratio: ");
+        assert!(!buf2.has_emoji_shortcode_tail());
+    }
+
+    #[test]
+    fn a_committed_emoji_stays_in_the_sentence() {
+        // The marker is carried *inside* the sentence (one char, like the
+        // one on-screen glyph) so the whole line — both halves around the
+        // emoji — is reviewed together; the apply later steps over it.
+        let mut buf = Buffer::default();
+        type_str(&mut buf, "the mixxup we had :poo");
+        buf.accept_emoji_shortcode();
+        type_str(&mut buf, " and stuffz");
+        let at = buf.sentence_at_caret().expect("a sentence at the caret");
+        assert_eq!(at.sentence, "the mixxup we had \u{FFFC} and stuffz");
+        // The marker is one char and a non-word boundary, so the words on
+        // either side stay distinct.
+        assert!(at.sentence.contains(EMOJI_MARKER));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hyprcorrect_core::{Chord, Key};
+use hyprcorrect_core::{Chord, Key, ResetKind};
 
 use super::chord_capture::ChordCaptureSlot;
 use super::ffi::*;
@@ -401,7 +401,7 @@ unsafe extern "C" fn tap_callback(
     //    shortcut, which we treat as a reset since it may edit text).
     if m.command || m.ctrl {
         // ⌘V paste, ⌘Z undo, ⌘A select-all… caret/text may have moved.
-        let _ = ctx.tx.send(Key::Reset);
+        let _ = ctx.tx.send(Key::Reset(ResetKind::Other));
         return event;
     }
     if let Some(c) = typed_char(event) {
@@ -453,7 +453,7 @@ fn classify(keycode: u16, m: &Mods) -> Option<Key> {
     Some(match keycode {
         // ⌥⌫ / ⌘⌫ delete a whole word / to line-start — more than the
         // buffer's one-char pop can track, so reset instead of desyncing.
-        0x33 if m.alt || m.command => Key::Reset,
+        0x33 if m.alt || m.command => Key::Reset(ResetKind::Other),
         0x33 => Key::Backspace, // ⌫
         0x7B => {
             // Left: ⌥ = word, ⌘ = line start, else char.
@@ -476,15 +476,15 @@ fn classify(keycode: u16, m: &Mods) -> Option<Key> {
         }
         0x73 => Key::LineStart, // Home
         0x77 => Key::LineEnd,   // End
-        0x7E if cfg.up => Key::Reset,
-        0x7D if cfg.down => Key::Reset,
-        0x74 if cfg.page_up => Key::Reset,
-        0x79 if cfg.page_down => Key::Reset,
-        0x24 | 0x4C if cfg.enter => Key::Reset, // Return / keypad Enter
-        0x30 if cfg.tab => Key::Reset,
-        0x35 if cfg.escape => Key::Reset,
-        0x75 if cfg.delete => Key::Reset, // forward delete
-        0x72 if cfg.insert => Key::Reset, // Help/Insert
+        0x7E if cfg.up => Key::Reset(ResetKind::Up),
+        0x7D if cfg.down => Key::Reset(ResetKind::Down),
+        0x74 if cfg.page_up => Key::Reset(ResetKind::PageUp),
+        0x79 if cfg.page_down => Key::Reset(ResetKind::PageDown),
+        0x24 | 0x4C if cfg.enter => Key::Reset(ResetKind::Enter), // Return / keypad Enter
+        0x30 if cfg.tab => Key::Reset(ResetKind::Tab),
+        0x35 if cfg.escape => Key::Reset(ResetKind::Escape),
+        0x75 if cfg.delete => Key::Reset(ResetKind::Delete), // forward delete
+        0x72 if cfg.insert => Key::Reset(ResetKind::Insert), // Help/Insert
         // Bare arrows/page/enter/etc. with their reset toggle off, or any
         // other keycode: not a buffer-control key.
         0x7E | 0x7D | 0x74 | 0x79 | 0x24 | 0x4C | 0x30 | 0x35 | 0x75 | 0x72 => return None,

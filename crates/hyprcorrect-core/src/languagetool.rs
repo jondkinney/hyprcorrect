@@ -89,6 +89,19 @@ fn parse_matches(json: &serde_json::Value, text: &str) -> Vec<Correction> {
     let Some(matches) = json["matches"].as_array() else {
         return Vec::new();
     };
+    // LanguageTool reports `offset`/`length` in CHARACTERS, not bytes
+    // (Java string positions — UTF-16 units, which equal Unicode
+    // codepoints for the BMP, covering ordinary text plus the emoji
+    // marker U+FFFC). Build a char-index → byte-offset map once so we can
+    // translate each match; treating the char offsets as byte offsets
+    // mis-applied every correction after the first multi-byte char (an
+    // accent, the marker, …).
+    let char_to_byte: Vec<usize> = text
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let last_char = char_to_byte.len() - 1; // == text.chars().count()
     let mut out = Vec::with_capacity(matches.len());
     for m in matches {
         let offset = match m["offset"].as_u64() {
@@ -102,10 +115,11 @@ fn parse_matches(json: &serde_json::Value, text: &str) -> Vec<Correction> {
         if length == 0 {
             continue;
         }
-        let end = offset.saturating_add(length);
-        if end > text.len() || !text.is_char_boundary(offset) || !text.is_char_boundary(end) {
+        let char_end = offset.saturating_add(length);
+        if char_end > last_char {
             continue;
         }
+        let (start, end) = (char_to_byte[offset], char_to_byte[char_end]);
         let suggestions: Vec<String> = m["replacements"]
             .as_array()
             .into_iter()
@@ -116,8 +130,8 @@ fn parse_matches(json: &serde_json::Value, text: &str) -> Vec<Correction> {
             continue;
         }
         out.push(Correction {
-            span: offset..end,
-            original: text[offset..end].to_string(),
+            span: start..end,
+            original: text[start..end].to_string(),
             suggestions,
         });
     }
@@ -164,6 +178,28 @@ mod tests {
                 .unwrap();
         let cs = parse_matches(&json, "the");
         assert!(cs.is_empty());
+    }
+
+    #[test]
+    fn character_offsets_map_past_multibyte_chars() {
+        // LanguageTool counts in characters. With the emoji marker (3
+        // bytes) before the flagged word, char offset 9 != byte offset
+        // 11 — the correction must still land on "wrold", not 2 bytes off.
+        let text = "the \u{FFFC} helo wrold";
+        // chars: t(0)h(1)e(2) (3)￼(4) (5)h(6)e(7)l(8)o(9) (10)w(11)...
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"matches":[
+                {"offset":6,"length":4,"replacements":[{"value":"hello"}]},
+                {"offset":11,"length":5,"replacements":[{"value":"world"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let cs = parse_matches(&json, text);
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].original, "helo");
+        assert_eq!(cs[1].original, "wrold");
+        // And the byte span is correct so applying it won't panic/garble.
+        assert_eq!(&text[cs[1].span.clone()], "wrold");
     }
 
     #[test]

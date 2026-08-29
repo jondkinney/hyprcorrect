@@ -15,7 +15,9 @@ pub mod replace;
 pub mod runtime;
 pub mod secrets;
 
-pub use buffer::{Buffer, Key, NearbyWord, Sentence, SentenceAtCaret, WordAtCaret};
+pub use buffer::{
+    Buffer, EMOJI_MARKER, Key, NearbyWord, ResetKind, Sentence, SentenceAtCaret, WordAtCaret,
+};
 pub use chord::{Chord, ChordError};
 pub use config::{
     Behavior, Config, ConfigError, DefinitionSource, Hotkeys, LanguageToolConfig, LlmConfig,
@@ -25,7 +27,7 @@ pub use definitions::{define, define_online};
 pub use languagetool::{LanguageToolError, LanguageToolProvider};
 pub use llm::{LlmError, LlmProvider};
 pub use providers::{Context, Correction, CorrectionProvider, OfflineProvider};
-pub use replace::{Edit, plan_word_replacement};
+pub use replace::{Edit, EmitOp, plan_sentence_replacement, plan_word_replacement};
 
 /// hyprcorrect's version string, surfaced by the CLI and the About pane.
 pub fn version() -> &'static str {

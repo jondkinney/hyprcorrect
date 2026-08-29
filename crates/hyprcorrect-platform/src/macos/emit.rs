@@ -15,6 +15,8 @@ use std::sync::Once;
 use std::thread::sleep;
 use std::time::Duration;
 
+use hyprcorrect_core::EmitOp;
+
 use super::capture;
 use super::ffi::*;
 use super::keymap::{VK_BACKSPACE, VK_E, VK_LEFT, VK_RIGHT};
@@ -76,6 +78,41 @@ pub fn replace_around_caret_with_delay(
         sleep(Duration::from_millis(pause_per_backspace_ms as u64));
     }
     src.type_text(text, pause_per_char_ms);
+    Ok(())
+}
+
+/// Execute an emoji-aware correction plan ([`EmitOp`]s) in order,
+/// stepping over emoji glyphs instead of deleting/retyping them. With no
+/// emoji the plan is just move/backspace/type — same as
+/// [`replace_around_caret_with_delay`].
+pub fn emit_ops(
+    ops: &[EmitOp],
+    pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
+) -> Result<(), EmitError> {
+    capture::wait_mods_clear(Duration::from_millis(MODS_CLEAR_TIMEOUT_MS));
+    let src = EventSource::new()?;
+    for op in ops {
+        match op {
+            EmitOp::MoveRight(n) => {
+                for _ in 0..*n {
+                    src.tap_key(VK_RIGHT, 0);
+                }
+            }
+            EmitOp::MoveLeft(n) => {
+                for _ in 0..*n {
+                    src.tap_key(VK_LEFT, 0);
+                }
+            }
+            EmitOp::Backspace(n) => {
+                for _ in 0..*n {
+                    src.tap_key(VK_BACKSPACE, 0);
+                    sleep(Duration::from_millis(pause_per_backspace_ms as u64));
+                }
+            }
+            EmitOp::Type(t) => src.type_text(t, pause_per_char_ms),
+        }
+    }
     Ok(())
 }
 

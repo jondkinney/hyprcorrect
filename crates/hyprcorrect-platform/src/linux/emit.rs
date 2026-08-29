@@ -9,6 +9,8 @@ use std::io::ErrorKind;
 use std::process::Command;
 use std::time::Duration;
 
+use hyprcorrect_core::EmitOp;
+
 use super::capture;
 
 /// How long we'll wait for the user to release the chord
@@ -228,6 +230,57 @@ pub fn anchored_replace_with_delay(
 /// terminals drop keys under fast bursts — see that const's doc); the
 /// typing burst has no such requirement, so it follows the knob with no
 /// floor.
+/// Execute an emoji-aware correction plan ([`EmitOp`]s) in order: each
+/// caret move / backspace burst is its own `wtype` call with a drain
+/// pause after it, and typed runs go through [`type_text`]. Waits for
+/// the trigger chord to release first, same as
+/// [`replace_around_caret_with_delay`]. With no emoji in the sentence
+/// the plan is just `[MoveRight, Backspace, Type]` — identical to the
+/// plain replace path.
+///
+/// # Errors
+///
+/// Returns [`EmitError`] if `wtype` is missing or exits non-zero.
+pub fn emit_ops(
+    ops: &[EmitOp],
+    pause_per_backspace_ms: u32,
+    pause_per_char_ms: u32,
+) -> Result<(), EmitError> {
+    let _ = capture::wait_mods_clear(Duration::from_millis(MODS_CLEAR_TIMEOUT_MS));
+    for op in ops {
+        match op {
+            EmitOp::MoveRight(n) => {
+                key_burst("Right", *n)?;
+                sleep_ms(pause_per_backspace_ms, *n);
+            }
+            EmitOp::MoveLeft(n) => {
+                key_burst("Left", *n)?;
+                sleep_ms(pause_per_backspace_ms, *n);
+            }
+            EmitOp::Backspace(n) => {
+                key_burst("BackSpace", *n)?;
+                sleep_ms(pause_per_backspace_ms, *n);
+            }
+            EmitOp::Type(t) => type_text(t, pause_per_char_ms)?,
+        }
+    }
+    Ok(())
+}
+
+/// Send `n` presses of a named key (`Right`, `Left`, `BackSpace`) as one
+/// `wtype` burst with the standard inter-key delay.
+fn key_burst(key: &str, n: usize) -> Result<(), EmitError> {
+    if n == 0 {
+        return Ok(());
+    }
+    let mut cmd = Command::new("wtype");
+    cmd.args(["-d", &WTYPE_INTER_KEY_DELAY_MS.to_string()]);
+    for _ in 0..n {
+        cmd.args(["-P", key, "-p", key]);
+    }
+    run(cmd)
+}
+
 fn type_text(text: &str, pause_per_char_ms: u32) -> Result<(), EmitError> {
     let mut first = true;
     for line in text.split('\n') {

@@ -10,6 +10,8 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 
+use crate::buffer;
+
 /// A spelling/typo correction backend.
 #[async_trait]
 pub trait CorrectionProvider: Send + Sync {
@@ -98,6 +100,15 @@ impl OfflineProvider {
     pub fn check_text(&self, text: &str) -> Vec<Correction> {
         let mut corrections = Vec::new();
         for (offset, word) in words(text) {
+            // Only spell-check tokens that actually contain letters.
+            // `words` already splits on word-char boundaries, so emoji,
+            // numbers, and symbols never reach here as part of a word —
+            // but a pure-numeric run ("123") still could, and we don't
+            // want the dictionary "correcting" it into a random letter
+            // the way it did for a bare 😄 before this guard.
+            if !word.chars().any(char::is_alphabetic) {
+                continue;
+            }
             if self.dictionary.check(word) {
                 continue;
             }
@@ -120,18 +131,25 @@ impl CorrectionProvider for OfflineProvider {
     }
 }
 
-/// Iterate the whitespace-delimited words of `text` as
-/// `(byte offset, word)` pairs.
+/// Iterate the words of `text` as `(byte offset, word)` pairs, where a
+/// "word" is a maximal run of [`buffer::is_word_char`] characters
+/// (alphanumerics plus the apostrophe) — the same rule the buffer uses
+/// when picking a word to spell-check. Splitting here rather than on
+/// whitespace keeps punctuation, symbols, and emoji *out* of the token:
+/// `"wrold😄"` yields just `"wrold"` (so the emoji is never flagged as a
+/// misspelling and "corrected" into a stray letter), and `":smile:"`
+/// yields `"smile"`. Offsets and the returned slices land on char
+/// boundaries, so callers can splice corrections back in by byte range.
 fn words(text: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
     for (i, c) in text.char_indices() {
-        if c.is_whitespace() {
-            if let Some(s) = start.take() {
-                out.push((s, &text[s..i]));
+        if buffer::is_word_char(c) {
+            if start.is_none() {
+                start = Some(i);
             }
-        } else if start.is_none() {
-            start = Some(i);
+        } else if let Some(s) = start.take() {
+            out.push((s, &text[s..i]));
         }
     }
     if let Some(s) = start {
@@ -183,6 +201,33 @@ mod tests {
         let corrections = provider().check_text("the quick fakeword");
         assert_eq!(corrections.len(), 1);
         assert_eq!(corrections[0].original, "fakeword");
+    }
+
+    #[test]
+    fn emoji_and_symbols_are_never_flagged() {
+        let p = provider();
+        // A bare emoji is not a word — it must not be "corrected" into a
+        // stray letter (the bug: 😄 was being turned into "e", which
+        // mangled every sentence containing one).
+        assert!(p.check_text("😄").is_empty());
+        assert!(p.check_text("👍 🎉").is_empty());
+        // Pure numbers and symbols are skipped too.
+        assert!(p.check_text("123 !!! :)").is_empty());
+        // A good word with a trailing emoji (no space) is left whole; the
+        // emoji splits off and is ignored, so nothing is flagged.
+        assert!(p.check_text("hello😄").is_empty());
+    }
+
+    #[test]
+    fn a_misspelling_next_to_an_emoji_flags_only_the_word() {
+        let p = provider();
+        let corrections = p.check_text("helo 😄");
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].original, "helo");
+        // The span covers just "helo" and stays on a char boundary — the
+        // multi-byte emoji is excluded, so splicing the fix back in by
+        // byte range can't panic.
+        assert_eq!(&"helo 😄"[corrections[0].span.clone()], "helo");
     }
 
     /// The real bundled en_US dictionary, parsed once for the tests below.
