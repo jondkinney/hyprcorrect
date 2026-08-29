@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(omarchy)* harden companion trust boundary
 - *(security)* harden native I/O boundaries
 - *(filesystem)* enumerate cleanup through directory descriptors
 - *(test)* canonicalize macOS temp roots
