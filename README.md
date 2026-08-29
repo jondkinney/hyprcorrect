@@ -58,7 +58,7 @@ PKGBUILDs live in [`packaging/aur/`](packaging/aur),
 ### From crates.io
 
 ```sh
-cargo install --locked --version 0.5.1 hyprcorrect
+cargo install --locked --version 0.6.0 hyprcorrect
 hyprcorrect install-desktop   # register the icon + launcher entry
 ```
 
