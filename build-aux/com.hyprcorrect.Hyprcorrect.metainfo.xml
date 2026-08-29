@@ -34,6 +34,20 @@
        Version history section on the listing page; the latest
        release is the only one strictly required. -->
   <releases>
+    <release version="0.5.0" date="2026-08-29">
+      <description>
+        <p>Added:</p>
+        <ul>
+          <li>add Quickshell bar companion</li>
+          <li>preserve emoji across sentence fixes</li>
+        </ul>
+        <p>Fixed:</p>
+        <ul>
+          <li>gate Linux-only clap import</li>
+          <li>register hotkeys through Lua bindings</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-06-07">
       <description>
         <p>Added:</p>
