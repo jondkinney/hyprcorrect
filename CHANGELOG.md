@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/jondkinney/hyprcorrect/compare/v0.5.0...v0.6.0) - 2026-08-29
+
+### Fixed
+
+- *(omarchy)* harden companion trust boundary
+- *(security)* harden native I/O boundaries
+- *(filesystem)* enumerate cleanup through directory descriptors
+- *(test)* canonicalize macOS temp roots
+- *(build)* promote openat modes on macOS
+
 ## [0.5.0](https://github.com/jondkinney/hyprcorrect/compare/v0.4.1...v0.5.0) - 2026-08-29
 
 ### Added
