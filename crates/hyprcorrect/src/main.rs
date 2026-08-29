@@ -7,7 +7,9 @@
 //! corrects the last typed word in place when the chord fires.
 //! See `DESIGN.md` at the repository root.
 
-use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(target_os = "linux")]
+use clap::ValueEnum;
+use clap::{Parser, Subcommand};
 
 /// The per-OS platform backend. `crate::backend::{capture, emit, hotkey,
 /// focus, tray, chord_capture, clipboard}` resolve to the Linux or the
