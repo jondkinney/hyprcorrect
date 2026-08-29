@@ -98,6 +98,14 @@ suggestion popup appears on the hotkey. Subcommands
 (`hyprcorrect`, `hyprcorrect --prefs`, `hyprcorrect fix-word`, …) rather
 than `mousehop`'s separate-GUI + IPC split.
 
+On Omarchy, an optional Quickshell bar widget connects through a private
+`0600` Unix socket and receives bounded, plain-text-safe JSON snapshots. The
+live connection is also the ownership signal for the icon: at least one widget
+connection makes the `ksni` item `Passive`; the last disconnect makes it
+`Active` again. Widget actions use fixed `hyprcorrect shell` subcommands for
+pause, provider routing, and Vim review mode. Secrets and complex preferences
+never cross this bridge.
+
 ## Platform layer
 
 Each capability sits behind a common trait in `hyprcorrect-platform`,

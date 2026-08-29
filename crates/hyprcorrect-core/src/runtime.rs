@@ -44,6 +44,11 @@ pub fn chord_socket_path() -> PathBuf {
     runtime_dir().join("hyprcorrect-chord.sock")
 }
 
+/// Path to the private native bridge used by the Omarchy bar companion.
+pub fn companion_socket_path() -> PathBuf {
+    runtime_dir().join("hyprcorrect-companion.sock")
+}
+
 /// Path to the review-request file. The daemon writes the original
 /// sentence + the proposed correction + trailing whitespace + the
 /// originating window's address here when the review chord fires;
@@ -169,6 +174,20 @@ pub fn read_action() -> String {
     std::fs::read_to_string(action_path())
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+/// Atomically publish a fixed daemon action before raising `SIGUSR1`.
+pub fn write_action(action: &str) -> Result<(), PidError> {
+    let path = action_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| PidError::Io(error.to_string()))?;
+    }
+    let temporary = path.with_extension(format!("action.{}", std::process::id()));
+    fs::write(&temporary, action).map_err(|error| PidError::Io(error.to_string()))?;
+    fs::rename(&temporary, &path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        PidError::Io(error.to_string())
+    })
 }
 
 fn runtime_dir() -> PathBuf {

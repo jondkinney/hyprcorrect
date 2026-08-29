@@ -110,6 +110,29 @@ the two TCC permissions below. Rust 1.85+ is required.
    word. The default chord is configurable in *Preferences →
    Hotkeys* (right-click the tray icon → *Open Preferences…*).
 
+### Omarchy bar companion
+
+Omarchy/Quickshell users can install the repository as a native bar widget:
+
+```sh
+omarchy plugin add https://github.com/jondkinney/hyprcorrect.git --enable
+```
+
+The companion requires Hyprcorrect itself to be installed and the daemon to be
+running; it adds no additional system packages. Remove only the bar companion
+without touching Hyprcorrect's config or binary with:
+
+```sh
+omarchy plugin remove io.github.jondkinney.hyprcorrect --yes
+```
+
+While the widget's bounded native bridge is attached, Hyprcorrect marks its
+StatusNotifier tray item passive so only the Quickshell icon is shown. If the
+widget or shell exits, the existing tray icon returns within 500 ms. Left-click
+the bar icon for pause/resume, Default and Smart provider routing, Vim review
+mode, and the current keybindings; middle-click toggles pause and right-click
+opens the full Preferences window.
+
 ### macOS
 
 Build and run the daemon the same way (`cargo build --release` then
@@ -193,10 +216,10 @@ the bind (re-save from Preferences, or restart the daemon).
 `sudo usermod -aG input "$USER"` requires logging out and back in.
 The daemon prints a clear error if it can't read `/dev/input/event*`.
 
-**Tray icon disappears when paused.** The daemon stays SNI-active
-and swaps the icon glyph instead of using the "this isn't
-important" hint that Waybar hides by default — so Pause keeps the
-tray entry visible.
+**Tray icon disappears when paused.** Without the Omarchy companion, the daemon
+stays SNI-active and swaps the icon glyph, so Pause keeps the tray entry visible.
+With the companion attached, the SNI item is intentionally passive because the
+native Quickshell icon has replaced it.
 
 **Provider failed silently.** Provider errors (LLM network failure,
 missing API key, LanguageTool unreachable) raise a desktop

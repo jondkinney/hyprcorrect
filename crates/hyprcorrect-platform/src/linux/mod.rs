@@ -16,6 +16,7 @@
 pub mod capture;
 pub mod chord_capture;
 pub mod clipboard;
+pub mod companion;
 pub mod emit;
 pub mod focus;
 pub mod hotkey;

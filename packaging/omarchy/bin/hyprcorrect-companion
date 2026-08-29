@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+runtime_dir=${XDG_RUNTIME_DIR:-/tmp}
+pid_file="$runtime_dir/hyprcorrect.pid"
+binary=""
+
+if [[ -r $pid_file ]]; then
+  pid=""
+  IFS= read -r -N 32 pid < "$pid_file" || true
+  if [[ $pid =~ ^[0-9]+$ ]]; then
+    candidate=$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)
+    if [[ -n $candidate && -x $candidate ]]; then
+      binary=$candidate
+    fi
+  fi
+fi
+
+if [[ -z $binary ]]; then
+  binary=$(command -v hyprcorrect 2>/dev/null || true)
+fi
+
+if [[ -z $binary || ! -x $binary ]]; then
+  echo "Hyprcorrect is not installed" >&2
+  exit 1
+fi
+
+exec "$binary" shell "$@"

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jondkinney.hyprcorrect",
+  "name": "Hyprcorrect",
+  "version": "1.0.0",
+  "author": "Jon Kinney",
+  "license": "MIT OR Apache-2.0",
+  "description": "Native Omarchy bar controls and live status for Hyprcorrect.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "packaging/omarchy/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Hyprcorrect",
+    "description": "Pause capture, choose correction providers, toggle Vim review mode, and inspect keybindings.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

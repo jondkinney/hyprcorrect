@@ -7,7 +7,7 @@
 //! corrects the last typed word in place when the chord fires.
 //! See `DESIGN.md` at the repository root.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// The per-OS platform backend. `crate::backend::{capture, emit, hotkey,
 /// focus, tray, chord_capture, clipboard}` resolve to the Linux or the
@@ -42,6 +42,40 @@ enum Command {
     /// needed to register a freshly `cargo install`ed binary with
     /// app launchers before its first run.
     InstallDesktop,
+    /// Native controls used by the Omarchy/Quickshell companion.
+    #[cfg(target_os = "linux")]
+    Shell {
+        #[command(subcommand)]
+        command: ShellCommand,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum ShellCommand {
+    /// Stream bounded JSON state while the bar widget is alive.
+    Watch,
+    /// Change the provider used for instant word fixes.
+    SetDefault { provider: ProviderChoice },
+    /// Change the provider used for sentences and review.
+    SetSmart { provider: ProviderChoice },
+    /// Choose whether review opens in Vim mode.
+    SetVim {
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    /// Pause or resume keyboard capture.
+    TogglePause,
+    /// Open the full native Preferences window.
+    OpenPrefs,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, ValueEnum)]
+enum ProviderChoice {
+    Spellbook,
+    Llm,
+    Languagetool,
 }
 
 fn main() {
@@ -68,6 +102,84 @@ fn main() {
         Some(Command::Review) => hyprcorrect_ui::run_review(),
         Some(Command::Prefs) => hyprcorrect_ui::run_preferences(),
         Some(Command::InstallDesktop) => run_install_desktop(),
+        #[cfg(target_os = "linux")]
+        Some(Command::Shell { command }) => run_shell_command(command),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_shell_command(command: ShellCommand) {
+    use hyprcorrect_core::Config;
+
+    let result = match command {
+        ShellCommand::Watch => backend::companion::watch().map_err(|error| error.to_string()),
+        ShellCommand::SetDefault { provider } => update_config(|config| {
+            config.providers.default = provider.into();
+        }),
+        ShellCommand::SetSmart { provider } => update_config(|config| {
+            config.providers.smart = provider.into();
+        }),
+        ShellCommand::SetVim { enabled } => update_config(|config| {
+            config.behavior.review_starts_in_vim = enabled;
+        }),
+        ShellCommand::TogglePause => hyprcorrect_core::runtime::write_action("toggle-pause")
+            .map_err(|error| error.to_string())
+            .and_then(|()| signal_daemon("-USR1")),
+        ShellCommand::OpenPrefs => std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|binary| {
+                std::process::Command::new("uwsm-app")
+                    .arg("--")
+                    .arg(binary)
+                    .arg("prefs")
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }),
+    };
+
+    if let Err(error) = result {
+        let message: String = error
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(180)
+            .collect();
+        eprintln!("hyprcorrect shell: {message}");
+        std::process::exit(1);
+    }
+
+    fn update_config(mut update: impl FnMut(&mut Config)) -> Result<(), String> {
+        let mut config = Config::load().map_err(|error| error.to_string())?;
+        update(&mut config);
+        config.save().map_err(|error| error.to_string())?;
+        signal_daemon("-HUP")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<ProviderChoice> for hyprcorrect_core::ProviderId {
+    fn from(value: ProviderChoice) -> Self {
+        match value {
+            ProviderChoice::Spellbook => Self::Spellbook,
+            ProviderChoice::Llm => Self::Llm,
+            ProviderChoice::Languagetool => Self::LanguageTool,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_daemon(signal: &str) -> Result<(), String> {
+    let pid = hyprcorrect_core::runtime::read_daemon_pid()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the hyprcorrect daemon is not running".to_string())?;
+    let status = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("kill {signal} {pid} exited with {status}"))
     }
 }
 
@@ -143,6 +255,8 @@ fn run_daemon() {
     use std::sync::mpsc;
     use std::thread;
 
+    #[cfg(target_os = "linux")]
+    use crate::backend::companion;
     use crate::backend::{capture, chord_capture, focus, hotkey, tray};
     use hyprcorrect_core::{Buffer, Chord, Config, OfflineProvider};
 
@@ -186,6 +300,8 @@ fn run_daemon() {
     let mut blocklist = build_blocklist(&initial_config);
     let mut emoji_apps = build_emoji_apps(&initial_config);
     let paused = Arc::new(AtomicBool::new(false));
+    #[cfg(target_os = "linux")]
+    let companion_active = Arc::new(AtomicBool::new(false));
 
     if let Err(e) = hyprcorrect_core::runtime::write_self_pid() {
         eprintln!("hyprcorrect: could not write PID file ({e}) — prefs reload won't work");
@@ -286,11 +402,28 @@ fn run_daemon() {
             return;
         }
     };
-    let (tray_handle, tray_rx) = match tray::start(
+    #[cfg(target_os = "linux")]
+    let companion_rx = match companion::start_listener(paused.clone()) {
+        Ok(receiver) => Some(receiver),
+        Err(error) => {
+            eprintln!("hyprcorrect: could not start the Quickshell companion bridge: {error}");
+            None
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let tray_result = tray::start(
+        paused.clone(),
+        companion_active.clone(),
+        build_tray_pixmaps(false),
+        build_tray_pixmaps(true),
+    );
+    #[cfg(target_os = "macos")]
+    let tray_result = tray::start(
         paused.clone(),
         build_tray_pixmaps(false),
         build_tray_pixmaps(true),
-    ) {
+    );
+    let (tray_handle, tray_rx) = match tray_result {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyprcorrect: {e}");
@@ -313,6 +446,8 @@ fn run_daemon() {
         Signal(hotkey::HotkeyEvent),
         Focus(focus::FocusEvent),
         Tray(tray::TrayEvent),
+        #[cfg(target_os = "linux")]
+        Companion(companion::CompanionEvent),
     }
 
     // Merge all four sources into one channel so the main loop can
@@ -358,6 +493,17 @@ fn run_daemon() {
             }
         });
     }
+    #[cfg(target_os = "linux")]
+    if let Some(companion_rx) = companion_rx {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            while let Ok(event) = companion_rx.recv() {
+                if tx.send(DaemonEvent::Companion(event)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     drop(tx); // the forwarder threads now own all senders
 
     let mut buffers: HashMap<String, Buffer> = HashMap::new();
@@ -368,6 +514,8 @@ fn run_daemon() {
     let mut current_emoji_app = initial_window
         .as_ref()
         .is_some_and(|f| emoji_apps.contains(&f.class.to_ascii_lowercase()));
+    #[cfg(target_os = "linux")]
+    let mut companion_count = 0usize;
 
     for event in rx {
         match event {
@@ -397,6 +545,15 @@ fn run_daemon() {
                     "review-cancel" => {
                         hyprcorrect_core::runtime::clear_review();
                     }
+                    "toggle-pause" => {
+                        let was_paused = paused.fetch_xor(true, Ordering::Relaxed);
+                        tray_handle.refresh();
+                        eprintln!(
+                            "hyprcorrect: {}",
+                            if was_paused { "resumed" } else { "paused" }
+                        );
+                    }
+                    "open-prefs" => spawn_prefs_window(),
                     // Re-run the open review through the LLM (or, with no
                     // LLM configured, open Preferences so the user can add
                     // one). Operates on the review file, not the buffer —
@@ -574,6 +731,22 @@ fn run_daemon() {
                 spawn_prefs_window();
             }
             DaemonEvent::Tray(tray::TrayEvent::Quit) => break,
+            #[cfg(target_os = "linux")]
+            DaemonEvent::Companion(companion::CompanionEvent::Connected) => {
+                companion_count = companion_count.saturating_add(1);
+                if companion_count == 1 {
+                    companion_active.store(true, Ordering::Relaxed);
+                    tray_handle.refresh();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            DaemonEvent::Companion(companion::CompanionEvent::Disconnected) => {
+                companion_count = companion_count.saturating_sub(1);
+                if companion_count == 0 {
+                    companion_active.store(false, Ordering::Relaxed);
+                    tray_handle.refresh();
+                }
+            }
         }
     }
     drop(tray_handle); // tear down the SNI service on exit

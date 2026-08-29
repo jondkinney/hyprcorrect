@@ -3,8 +3,10 @@
 //! Publishes a StatusNotifierItem with a small menu: Pause/Resume,
 //! Open Preferences…, Quit. Menu activations arrive on the returned
 //! channel. The pause state is shared with the daemon via an
-//! `Arc<AtomicBool>` — the tray reads it live to choose its icon,
-//! label, and SNI status — and [`TrayHandle::refresh`] pushes a
+//! `Arc<AtomicBool>` — the tray reads it live to choose its icon and
+//! label. A second flag marks the Quickshell companion as attached;
+//! while attached the SNI status becomes `Passive`, allowing the native
+//! bar widget to replace it. [`TrayHandle::refresh`] pushes a
 //! property-change so SNI hosts pick up the new state immediately.
 
 use std::sync::Arc;
@@ -68,6 +70,7 @@ pub struct IconPixmap {
 /// See [`TrayError`].
 pub fn start(
     paused: Arc<AtomicBool>,
+    companion_active: Arc<AtomicBool>,
     active_icon: Vec<IconPixmap>,
     paused_icon: Vec<IconPixmap>,
 ) -> Result<(TrayHandle, Receiver<TrayEvent>), TrayError> {
@@ -77,6 +80,7 @@ pub fn start(
     let tray = HyprcorrectTray {
         events_tx,
         paused,
+        companion_active,
         active_icon,
         paused_icon,
     };
@@ -87,6 +91,7 @@ pub fn start(
 struct HyprcorrectTray {
     events_tx: Sender<TrayEvent>,
     paused: Arc<AtomicBool>,
+    companion_active: Arc<AtomicBool>,
     active_icon: Vec<IconPixmap>,
     paused_icon: Vec<IconPixmap>,
 }
@@ -111,10 +116,13 @@ impl ksni::Tray for HyprcorrectTray {
     }
 
     fn status(&self) -> ksni::Status {
-        // Stay `Active` even while paused — many SNI hosts (Waybar,
-        // for example) hide `Passive` items entirely, which would make
-        // the menu unreachable. Pause is conveyed by the icon swap.
-        ksni::Status::Active
+        if self.companion_active.load(Ordering::Relaxed) {
+            ksni::Status::Passive
+        } else {
+            // Stay `Active` while paused so the fallback menu remains
+            // reachable whenever the Quickshell companion is absent.
+            ksni::Status::Active
+        }
     }
 
     fn icon_name(&self) -> String {
