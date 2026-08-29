@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jondkinney.hyprcorrect",
   "name": "Hyprcorrect",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Jon Kinney",
   "license": "MIT OR Apache-2.0",
   "description": "Native Omarchy bar controls and live status for Hyprcorrect.",

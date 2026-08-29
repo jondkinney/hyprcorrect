@@ -1,29 +1,156 @@
-#!/usr/bin/env bash
+#!/usr/bin/python3
+"""Resolve the running Hyprcorrect binary without trusting runtime paths."""
 
-set -euo pipefail
+import os
+import re
+import stat
+import sys
+import tempfile
 
-runtime_dir=${XDG_RUNTIME_DIR:-/tmp}
-pid_file="$runtime_dir/hyprcorrect.pid"
-binary=""
 
-if [[ -r $pid_file ]]; then
-  pid=""
-  IFS= read -r -N 32 pid < "$pid_file" || true
-  if [[ $pid =~ ^[0-9]+$ ]]; then
-    candidate=$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)
-    if [[ -n $candidate && -x $candidate ]]; then
-      binary=$candidate
-    fi
-  fi
-fi
+MAX_PID_BYTES = 32
+PID_PATTERN = re.compile(rb"[1-9][0-9]*\Z")
 
-if [[ -z $binary ]]; then
-  binary=$(command -v hyprcorrect 2>/dev/null || true)
-fi
+O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+O_PATH = getattr(os, "O_PATH", 0)
 
-if [[ -z $binary || ! -x $binary ]]; then
-  echo "Hyprcorrect is not installed" >&2
-  exit 1
-fi
 
-exec "$binary" shell "$@"
+def fail(message):
+    print(f"hyprcorrect-companion: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def same_snapshot(left, right):
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def runtime_directory():
+    supplied = os.environ.get("XDG_RUNTIME_DIR")
+    if supplied:
+        path = supplied
+    else:
+        path = os.path.join(os.path.realpath(tempfile.gettempdir()), f"hyprcorrect-{os.geteuid()}")
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        fail("runtime directory must be an absolute, normalized path")
+    try:
+        directory_fd = os.open(path, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        fail(f"cannot safely open runtime directory: {error.strerror}")
+    info = os.fstat(directory_fd)
+    if not stat.S_ISDIR(info.st_mode):
+        os.close(directory_fd)
+        fail("runtime directory is not a real directory")
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(directory_fd)
+        fail("runtime directory must be owned by this user with mode 0700")
+    return path, directory_fd
+
+
+def running_binary():
+    runtime = runtime_directory()
+    if runtime is None:
+        return None
+    directory, directory_fd = runtime
+    path = os.path.join(directory, "hyprcorrect.pid")
+    try:
+        fd = os.open(
+            "hyprcorrect.pid",
+            os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        os.close(directory_fd)
+        return None
+    except OSError as error:
+        os.close(directory_fd)
+        fail(f"cannot safely open {path}: {error.strerror}")
+    try:
+        before = os.fstat(fd)
+        mode = stat.S_IMODE(before.st_mode)
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{path} is not a regular file")
+        if before.st_uid != os.geteuid() or mode & 0o077:
+            fail(f"{path} must be owned by this user with mode 0600")
+        if before.st_size > MAX_PID_BYTES:
+            fail(f"{path} is oversized")
+        raw = os.read(fd, MAX_PID_BYTES + 1).strip()
+        after = os.fstat(fd)
+        if not same_snapshot(before, after):
+            fail(f"{path} changed while it was being read")
+    finally:
+        os.close(fd)
+        os.close(directory_fd)
+
+    if not PID_PATTERN.fullmatch(raw):
+        fail(f"{path} does not contain a valid PID")
+    pid = int(raw, 10)
+    process = f"/proc/{pid}"
+    executable_fd = None
+    try:
+        process_info = os.stat(process)
+        comm_fd = os.open(
+            f"{process}/comm",
+            os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+        )
+        try:
+            comm = os.read(comm_fd, 64).strip()
+        finally:
+            os.close(comm_fd)
+        candidate = os.readlink(f"{process}/exe")
+        executable_fd = os.open(f"{process}/exe", O_PATH)
+        candidate_info = os.fstat(executable_fd)
+    except OSError:
+        if executable_fd is not None:
+            os.close(executable_fd)
+        return None
+    if process_info.st_uid != os.geteuid() or comm != b"hyprcorrect":
+        os.close(executable_fd)
+        fail("PID file does not identify this user's Hyprcorrect daemon")
+    if not safe_executable(candidate_info):
+        os.close(executable_fd)
+        return None
+    os.set_inheritable(executable_fd, True)
+    return candidate, executable_fd
+
+
+def safe_executable(info):
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid in (0, os.geteuid())
+        and not stat.S_IMODE(info.st_mode) & 0o022
+        and bool(stat.S_IMODE(info.st_mode) & 0o111)
+    )
+
+
+def main(argv):
+    if not all((O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_PATH)):
+        fail("Linux descriptor-safety flags are unavailable")
+    resolved = running_binary()
+    if resolved is None:
+        fail("the Hyprcorrect daemon is not running")
+    display_path, executable_fd = resolved
+    os.execv(
+        f"/proc/self/fd/{executable_fd}",
+        [display_path, "shell", *argv[1:]],
+    )
+
+
+if __name__ == "__main__":
+    main(sys.argv)

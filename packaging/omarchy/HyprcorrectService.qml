@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "CompanionSanitizer.js" as Sanitizer
 
 Item {
   id: root
@@ -30,49 +31,30 @@ Item {
   }
 
   function cleanText(value, limit) {
-    return String(value || "")
-      .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
-      .substring(0, limit)
+    return Sanitizer.cleanText(value, limit)
   }
 
   function cleanProvider(value) {
-    var provider = cleanText(value, 24)
-    return provider === "spellbook" || provider === "languagetool" || provider === "llm"
-      ? provider
-      : "spellbook"
+    return Sanitizer.cleanProvider(value)
   }
 
   function applySnapshot(rawLine) {
-    var line = String(rawLine || "")
-    if (line.length === 0 || line.length > 8192) {
-      lastError = "Hyprcorrect returned an invalid status frame"
+    var status = Sanitizer.parseSnapshot(rawLine)
+    if (!status.ok) {
+      lastError = status.error
       return
     }
-
-    var status
-    try {
-      status = JSON.parse(line)
-    } catch (error) {
-      lastError = "Hyprcorrect returned unreadable status"
-      return
-    }
-    if (Number(status.schema_version) !== 1) {
-      lastError = "Update Hyprcorrect for this companion version"
-      return
-    }
-
-    var hotkeys = status.hotkeys && typeof status.hotkeys === "object" ? status.hotkeys : ({})
-    paused = status.paused === true
-    reviewStartsInVim = status.review_starts_in_vim === true
-    languagetoolEnabled = status.languagetool_enabled === true
-    llmConfigured = status.llm_configured === true
-    defaultProvider = cleanProvider(status.default_provider)
-    smartProvider = cleanProvider(status.smart_provider)
-    fixWord = cleanText(hotkeys.fix_word, 96)
-    fixSentence = cleanText(hotkeys.fix_sentence, 96)
-    review = cleanText(hotkeys.review, 96)
-    reviewLlm = cleanText(hotkeys.review_llm, 96)
-    lastError = cleanText(status.error, 180)
+    paused = status.paused
+    reviewStartsInVim = status.reviewStartsInVim
+    languagetoolEnabled = status.languagetoolEnabled
+    llmConfigured = status.llmConfigured
+    defaultProvider = status.defaultProvider
+    smartProvider = status.smartProvider
+    fixWord = status.fixWord
+    fixSentence = status.fixSentence
+    review = status.review
+    reviewLlm = status.reviewLlm
+    lastError = status.error
     connected = true
   }
 

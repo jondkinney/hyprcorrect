@@ -12,4 +12,5 @@ Secrets, provider endpoints, LanguageTool installation, hotkey recording,
 reset-key behavior, and per-app privacy intentionally remain in Preferences.
 The QML side only receives bounded status JSON from the native bridge, renders
 external strings as plain text, and invokes fixed native subcommands without
-shell interpolation.
+shell interpolation. The bridge pins and launches the executable belonging to
+the running daemon; it never resolves a fallback command from `PATH`.
