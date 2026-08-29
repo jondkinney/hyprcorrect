@@ -845,7 +845,10 @@ mod tests {
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).unwrap();
         let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let path = std::env::temp_dir().join(format!("hyprcorrect-{name}-{suffix}"));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let path = root.join(format!("hyprcorrect-{name}-{suffix}"));
         fs::create_dir(&path).unwrap();
         path
     }

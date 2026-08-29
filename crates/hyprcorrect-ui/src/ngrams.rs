@@ -383,9 +383,16 @@ fn find_lang_root(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn test_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        root.join(format!("hc-ngram-{name}-{}", std::process::id()))
+    }
+
     #[test]
     fn find_lang_root_at_root_and_one_level_down() {
-        let tmp = std::env::temp_dir().join(format!("hc-ngram-test-{}", std::process::id()));
+        let tmp = test_dir("test");
         let _ = fs::remove_dir_all(&tmp);
 
         // en/ directly under the root.
@@ -411,7 +418,7 @@ mod tests {
 
     #[test]
     fn extract_zip_unpacks_and_then_locates_en() {
-        let tmp = std::env::temp_dir().join(format!("hc-ngram-extract-{}", std::process::id()));
+        let tmp = test_dir("extract");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
@@ -442,7 +449,7 @@ mod tests {
     fn extract_zip_refuses_a_planted_symlink_parent() {
         use std::os::unix::fs::symlink;
 
-        let tmp = std::env::temp_dir().join(format!("hc-ngram-link-{}", std::process::id()));
+        let tmp = test_dir("link");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let zip_path = tmp.join("t.zip");

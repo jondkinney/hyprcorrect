@@ -549,7 +549,10 @@ fix_word = "CTRL+J"
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("hyprcorrect-cfg-{nano}"));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let dir = root.join(format!("hyprcorrect-cfg-{nano}"));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
