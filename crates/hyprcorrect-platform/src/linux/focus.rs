@@ -10,11 +10,17 @@
 //!
 //! See `DESIGN.md` — "The keystroke buffer".
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
+
+const HYPRCTL_OUTPUT_LIMIT: usize = 256 * 1024;
+const EVENT_LINE_LIMIT: usize = 16 * 1024;
+const CLASS_LIMIT: usize = 256;
+const ADDRESS_LIMIT: usize = 32;
 
 /// A focus or window-lifecycle event from Hyprland.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +92,13 @@ fn socket2_path() -> Result<PathBuf, FocusError> {
 /// Query `hyprctl activewindow -j` for the currently focused window.
 /// Returns `None` if the call fails or no window is focused.
 fn query_active_window() -> Option<InitialFocus> {
-    let output = Command::new("hyprctl")
-        .args(["activewindow", "-j"])
-        .output()
-        .ok()?;
+    let output = hyprcorrect_core::bounded_process::output(
+        Command::new("hyprctl").args(["activewindow", "-j"]),
+        Duration::from_secs(3),
+        HYPRCTL_OUTPUT_LIMIT,
+        64 * 1024,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -113,28 +122,51 @@ fn extract_json_string(text: &str, field: &str) -> Option<String> {
     let after_colon = after_key.split_once(':')?.1.trim_start();
     let value = after_colon.strip_prefix('"')?;
     let (s, _) = value.split_once('"')?;
-    Some(s.to_string())
+    let maximum = if field == "address" {
+        ADDRESS_LIMIT
+    } else {
+        CLASS_LIMIT
+    };
+    Some(bounded_external_field(s, maximum))
 }
 
 fn read_events(stream: UnixStream, tx: &Sender<FocusEvent>) {
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
     // The text-form `activewindow>>CLASS,TITLE` event always arrives
     // before its sibling `activewindowv2>>ADDR`; buffer the class and
     // attach it when the address lands.
     let mut last_class: Option<String> = None;
-    for line in reader.lines() {
-        let Ok(line) = line else { return };
+    loop {
+        let mut bytes = Vec::new();
+        let Ok(read) = reader
+            .by_ref()
+            .take(EVENT_LINE_LIMIT as u64 + 2)
+            .read_until(b'\n', &mut bytes)
+        else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        if bytes.last() != Some(&b'\n') || bytes.len() > EVENT_LINE_LIMIT + 1 {
+            return;
+        }
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        let Ok(line) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
         let Some((kind, payload)) = line.split_once(">>") else {
             continue;
         };
         match kind {
             "activewindow" => {
-                last_class = Some(
-                    payload
-                        .split_once(',')
-                        .map_or(payload, |(class, _)| class)
-                        .to_string(),
-                );
+                last_class = Some(bounded_external_field(
+                    payload.split_once(',').map_or(payload, |(class, _)| class),
+                    CLASS_LIMIT,
+                ));
             }
             "activewindowv2" => {
                 let address = normalize_address(payload);
@@ -158,15 +190,36 @@ fn read_events(stream: UnixStream, tx: &Sender<FocusEvent>) {
 /// `hyprctl activewindow -j` (with prefix) and from `.socket2.sock`
 /// events (without prefix) compare equal.
 fn normalize_address(addr: &str) -> String {
-    addr.trim()
+    let cleaned = bounded_external_field(addr, ADDRESS_LIMIT);
+    let trimmed = cleaned.trim();
+    trimmed
         .strip_prefix("0x")
-        .unwrap_or_else(|| addr.trim())
+        .unwrap_or(trimmed)
         .to_ascii_lowercase()
+}
+
+fn bounded_external_field(value: &str, maximum: usize) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+        .take(maximum)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::mpsc;
 
     fn run(lines: &[&str]) -> Vec<FocusEvent> {
@@ -257,5 +310,26 @@ mod tests {
         assert_eq!(normalize_address("0xAbCdEf"), "abcdef");
         assert_eq!(normalize_address("563c9141fe00"), "563c9141fe00");
         assert_eq!(normalize_address("  0x563C9141FE00  "), "563c9141fe00");
+    }
+
+    #[test]
+    fn external_fields_drop_controls_bidi_and_excess_characters() {
+        assert_eq!(
+            bounded_external_field("kitty\n\u{202e}<b>x", 10),
+            "kitty<b>x"
+        );
+        assert_eq!(bounded_external_field("12345", 4), "1234");
+    }
+
+    #[test]
+    fn oversized_event_line_is_rejected_before_parsing() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(&vec![b'x'; EVENT_LINE_LIMIT + 1]).unwrap();
+        writer.write_all(b"\nactivewindowv2>>abc\n").unwrap();
+        drop(writer);
+        let (tx, rx) = mpsc::channel();
+        read_events(reader, &tx);
+        drop(tx);
+        assert!(rx.try_recv().is_err());
     }
 }

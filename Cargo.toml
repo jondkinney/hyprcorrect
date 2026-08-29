@@ -42,6 +42,10 @@ serde_json = "1"
 # Downloading + unzipping the LanguageTool n-gram archive from prefs.
 zip = "2"
 fs2 = "0.4"
+getrandom = "0.3"
+libc = "0.2"
+sha2 = "0.10"
+url = "2"
 
 # Decompressing the bundled WordNet definitions (gzip) at first lookup.
 flate2 = "1"

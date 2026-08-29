@@ -30,13 +30,21 @@ use std::time::Duration;
 /// Container name we own. Predictable so we can check / start / stop
 /// it without persisting a docker ID.
 pub const CONTAINER: &str = "hyprcorrect-languagetool";
-/// Image we pull. Most popular community image; listens on 8010.
-pub const IMAGE: &str = "erikvl87/languagetool";
+/// Reviewed multi-architecture image index. Pinning the digest prevents an
+/// explicit Install from executing whatever a mutable `latest` tag later
+/// points at. The image listens on 8010.
+pub const IMAGE: &str =
+    "erikvl87/languagetool@sha256:ef8fa12cbd485166c9ceeb7139d76d56d07707a624da6bb1fc1fbb5411750527";
 /// Internal port the image binds inside the container.
 const IMAGE_PORT: u16 = 8010;
 /// Probe timeout for the URL check. Short enough that the UI stays
 /// responsive even when the configured URL points at a dead host.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const DOCKER_PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const DOCKER_OUTPUT_LIMIT: usize = 64 * 1024;
+const DOCKER_PULL_LINE_LIMIT: usize = 8 * 1024;
+const DOCKER_PULL_LAYER_LIMIT: usize = 512;
 
 /// Combined status of "is LanguageTool available to hyprcorrect right
 /// now". The URL probe is the authoritative signal — if it passes,
@@ -223,11 +231,11 @@ fn probe_status_blocking(url: &str) -> ProbeResult {
 /// inspecting its env for `langtool_languageModel`. `None` when the
 /// managed container doesn't exist (nothing to inspect).
 fn managed_ngrams() -> Option<bool> {
-    let output = Command::new("docker")
-        .args(["inspect", "--format", "{{json .Config.Env}}", CONTAINER])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let output = run_bounded_command(
+        "docker",
+        &["inspect", "--format", "{{json .Config.Env}}", CONTAINER],
+    )
+    .ok()?;
     if !output.status.success() {
         return None; // no such container
     }
@@ -240,16 +248,16 @@ fn managed_ngrams() -> Option<bool> {
 /// container records it and survives restarts. `None` when the container
 /// or the mount is absent.
 fn managed_ngram_mount() -> Option<String> {
-    let output = Command::new("docker")
-        .args([
+    let output = run_bounded_command(
+        "docker",
+        &[
             "inspect",
             "--format",
             r#"{{range .Mounts}}{{if eq .Destination "/ngrams"}}{{.Source}}{{end}}{{end}}"#,
             CONTAINER,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+        ],
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -285,10 +293,7 @@ fn check_docker_state() -> DockerState {
     // `docker version` is the canonical "is the daemon reachable"
     // probe — it both verifies the binary is on PATH and that we can
     // talk to the socket.
-    let probe = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .stdin(Stdio::null())
-        .output();
+    let probe = run_bounded_command("docker", &["version", "--format", "{{.Server.Version}}"]);
     let probe = match probe {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -334,11 +339,11 @@ fn check_docker_state() -> DockerState {
 /// State string for the first matching container, or `None` when
 /// nothing matches.
 fn inspect_container_state(filter: &str) -> Option<String> {
-    let output = Command::new("docker")
-        .args(["ps", "-a", "--filter", filter, "--format", "{{.State}}"])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let output = run_bounded_command(
+        "docker",
+        &["ps", "-a", "--filter", filter, "--format", "{{.State}}"],
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -356,18 +361,18 @@ struct ForeignContainer {
 /// `ancestor=` is docker's own image-filter — covers any name the
 /// user happens to have given the container.
 fn find_container_by_image(image: &str) -> Option<ForeignContainer> {
-    let output = Command::new("docker")
-        .args([
+    let output = run_bounded_command(
+        "docker",
+        &[
             "ps",
             "-a",
             "--filter",
             &format!("ancestor={image}"),
             "--format",
             "{{.Names}}\t{{.State}}",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+        ],
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -411,6 +416,11 @@ fn pull_image(progress: &Arc<Mutex<OpProgress>>) -> OpResult {
     use std::collections::HashSet;
     use std::io::{BufRead, BufReader, Read};
 
+    enum PullOutput {
+        Line(String),
+        Invalid(String),
+    }
+
     *progress.lock().unwrap() = OpProgress::Pulling { done: 0, total: 0 };
     let mut child = Command::new("docker")
         .args(["pull", IMAGE])
@@ -420,48 +430,137 @@ fn pull_image(progress: &Arc<Mutex<OpProgress>>) -> OpResult {
         .spawn()
         .map_err(|e| format!("failed to launch `docker pull`: {e}"))?;
 
+    let (lines_tx, lines_rx) = std::sync::mpsc::sync_channel(32);
+    let stderr_tx = lines_tx.clone();
     let stderr_thread = child.stderr.take().map(|mut e| {
         thread::spawn(move || {
-            let mut s = String::new();
-            let _ = e.read_to_string(&mut s);
-            s
+            let mut bytes = Vec::new();
+            let _ = (&mut e).take(64 * 1024 + 1).read_to_end(&mut bytes);
+            let overflowed = bytes.len() > 64 * 1024;
+            if overflowed {
+                let _ = stderr_tx.send(PullOutput::Invalid(
+                    "docker pull stderr exceeded its 64 KiB limit".into(),
+                ));
+                bytes.truncate(64 * 1024);
+            }
+            (String::from_utf8_lossy(&bytes).into_owned(), overflowed)
+        })
+    });
+
+    let stdout_thread = child.stdout.take().map(|out| {
+        thread::spawn(move || {
+            let mut reader = BufReader::new(out);
+            loop {
+                let mut bytes = Vec::new();
+                let read = reader
+                    .by_ref()
+                    .take(DOCKER_PULL_LINE_LIMIT as u64 + 2)
+                    .read_until(b'\n', &mut bytes);
+                let read = match read {
+                    Ok(read) => read,
+                    Err(error) => {
+                        let _ = lines_tx.send(PullOutput::Invalid(format!(
+                            "could not read docker pull output: {error}"
+                        )));
+                        break;
+                    }
+                };
+                if read == 0 {
+                    break;
+                }
+                if bytes.last() != Some(&b'\n') || bytes.len() > DOCKER_PULL_LINE_LIMIT + 1 {
+                    let _ = lines_tx.send(PullOutput::Invalid(format!(
+                        "docker pull emitted a line over {DOCKER_PULL_LINE_LIMIT} bytes"
+                    )));
+                    break;
+                }
+                bytes.pop();
+                if bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+                let line = String::from_utf8_lossy(&bytes).into_owned();
+                if lines_tx.send(PullOutput::Line(line)).is_err() {
+                    break;
+                }
+            }
         })
     });
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut done: HashSet<String> = HashSet::new();
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            let id = line.split(": ").next().unwrap_or_default().to_string();
-            if id.is_empty() {
-                continue;
+    let mut layer_ids: HashSet<String> = HashSet::new();
+    let deadline = std::time::Instant::now() + DOCKER_PULL_TIMEOUT;
+    let mut invalid_output = None;
+    let status = loop {
+        match lines_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(PullOutput::Line(line)) => {
+                let id = line.split(": ").next().unwrap_or_default().to_string();
+                if !id.is_empty() {
+                    let pulling = line.ends_with("Pulling fs layer");
+                    let already = line.ends_with("Already exists");
+                    let complete = line.ends_with("Pull complete");
+                    if (pulling || already || complete) && !layer_ids.contains(&id) {
+                        if layer_ids.len() >= DOCKER_PULL_LAYER_LIMIT {
+                            invalid_output = Some(format!(
+                                "docker pull reported over {DOCKER_PULL_LAYER_LIMIT} layers"
+                            ));
+                            let _ = child.kill();
+                            break child.wait().map_err(|e| format!("docker pull: {e}"))?;
+                        }
+                        layer_ids.insert(id.clone());
+                    }
+                    if pulling {
+                        seen.insert(id);
+                    } else if already {
+                        seen.insert(id.clone());
+                        done.insert(id);
+                    } else if complete {
+                        done.insert(id);
+                    }
+                }
+                if let Ok(mut g) = progress.lock() {
+                    *g = OpProgress::Pulling {
+                        done: done.len(),
+                        total: seen.len().max(done.len()),
+                    };
+                }
             }
-            if line.ends_with("Pulling fs layer") {
-                seen.insert(id);
-            } else if line.ends_with("Already exists") {
-                seen.insert(id.clone());
-                done.insert(id);
-            } else if line.ends_with("Pull complete") {
-                done.insert(id);
-            } else {
-                continue;
+            Ok(PullOutput::Invalid(error)) => {
+                invalid_output = Some(error);
+                let _ = child.kill();
+                break child.wait().map_err(|e| format!("docker pull: {e}"))?;
             }
-            if let Ok(mut g) = progress.lock() {
-                *g = OpProgress::Pulling {
-                    done: done.len(),
-                    total: seen.len().max(done.len()),
-                };
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
         }
+        if let Some(status) = child.try_wait().map_err(|e| format!("docker pull: {e}"))? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            invalid_output = Some(format!(
+                "docker pull exceeded {} minutes",
+                DOCKER_PULL_TIMEOUT.as_secs() / 60
+            ));
+            let _ = child.kill();
+            break child.wait().map_err(|e| format!("docker pull: {e}"))?;
+        }
+    };
+    if let Some(handle) = stdout_thread {
+        let _ = handle.join();
+    }
+    let (stderr, stderr_overflowed) = stderr_thread
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    if stderr_overflowed && invalid_output.is_none() {
+        invalid_output = Some("docker pull stderr exceeded its 64 KiB limit".into());
+    }
+    if let Some(error) = invalid_output {
+        return Err(error);
     }
 
-    let status = child.wait().map_err(|e| format!("docker pull: {e}"))?;
     if status.success() {
         return Ok(());
     }
-    let stderr = stderr_thread
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
     Err(stderr
         .lines()
         .last()
@@ -516,7 +615,7 @@ pub fn remove_ngrams(host_port: u16, data_dir: PathBuf) -> OpHandle {
         let recreate = run_install(host_port, None);
         // Delete the data even if the recreate failed — the user asked to
         // remove it; surface the recreate error if there was one.
-        let deleted = std::fs::remove_dir_all(&data_dir);
+        let deleted = hyprcorrect_core::secure_fs::remove_directory_tree(&data_dir);
         recreate?;
         deleted.map_err(|e| format!("deleting {}: {e}", data_dir.display()))
     })
@@ -575,11 +674,8 @@ where
 }
 
 fn run_command(program: &str, args: &[&str]) -> OpResult {
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to launch `{program}`: {e}"))?;
+    let output = run_bounded_command(program, args)
+        .map_err(|e| format!("failed to run `{program}` safely: {e}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -592,6 +688,23 @@ fn run_command(program: &str, args: &[&str]) -> OpResult {
         .unwrap_or("docker command failed")
         .to_string();
     Err(msg)
+}
+
+/// Run a short Docker query/action with independently bounded pipes and a
+/// total deadline. The reader threads announce the sentinel byte immediately,
+/// allowing the parent to kill a producer that keeps writing without exiting.
+fn run_bounded_command(
+    program: &str,
+    args: &[&str],
+) -> std::io::Result<hyprcorrect_core::bounded_process::Output> {
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    hyprcorrect_core::bounded_process::output(
+        &mut command,
+        DOCKER_COMMAND_TIMEOUT,
+        DOCKER_OUTPUT_LIMIT,
+        DOCKER_OUTPUT_LIMIT,
+    )
 }
 
 /// Extract the host port from a configured LanguageTool URL.
@@ -639,5 +752,24 @@ mod tests {
         assert!(host_port_from_url("http://localhost").is_none());
         assert!(host_port_from_url("").is_none());
         assert!(host_port_from_url("not a url").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_accepts_exact_limit_and_kills_a_nonterminating_overflow() {
+        let exact_script = format!("import os; os.write(1, b'x' * {DOCKER_OUTPUT_LIMIT})");
+        let exact = run_bounded_command("/usr/bin/python3", &["-c", &exact_script]).unwrap();
+        assert!(exact.status.success());
+        assert_eq!(exact.stdout.len(), DOCKER_OUTPUT_LIMIT);
+
+        let overflow_script = format!(
+            "import os,time; os.write(1, b'x' * {}); time.sleep(30)",
+            DOCKER_OUTPUT_LIMIT + 1
+        );
+        let started = std::time::Instant::now();
+        let error = run_bounded_command("/usr/bin/python3", &["-c", &overflow_script])
+            .expect_err("sentinel byte must abort the process");
+        assert!(error.to_string().contains("exceeded"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

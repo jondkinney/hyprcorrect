@@ -12,9 +12,10 @@
 //! local-dev sessions working while also being correct once the
 //! AUR package ships `/usr/bin/hyprcorrect`.
 
-use std::fs;
 use std::io;
 use std::path::PathBuf;
+
+use hyprcorrect_core::secure_fs;
 
 /// Where to put the autostart file. Honors `$XDG_CONFIG_HOME` then
 /// falls back to `$HOME/.config`. Returns `None` if neither
@@ -48,29 +49,27 @@ pub fn enable(exec_path: &str) -> io::Result<()> {
             "couldn't resolve $XDG_CONFIG_HOME / $HOME — autostart needs one of them set",
         )
     })?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     // Drop the bundled SVG into the hicolor scalable-apps theme path
     // and reference it by *icon name* (`Icon=hyprcorrect`). Absolute-
     // path `Icon=` values are spec-legal but inconsistently honored
     // by launchers (Walker shows a blank slot for them in 2.16); the
     // theme-name lookup with a properly-placed SVG works everywhere.
     let _ = ensure_user_icon()?;
+    let executable = desktop_quote(exec_path)?;
     let contents = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=hyprcorrect\n\
          GenericName=Spelling corrector\n\
          Comment=Keyboard-driven desktop spelling and typo correction\n\
-         Exec={exec_path}\n\
+         Exec={executable}\n\
          Icon=hyprcorrect\n\
          Terminal=false\n\
          Categories=Utility;TextTools;\n\
          StartupNotify=false\n\
          X-GNOME-Autostart-enabled=true\n"
     );
-    fs::write(path, contents)
+    secure_fs::atomic_write(&path, contents.as_bytes(), 0o600)
 }
 
 /// Best-effort write of the bundled SVG to the hicolor scalable-apps
@@ -92,16 +91,8 @@ pub fn ensure_user_icon() -> io::Result<Option<PathBuf>> {
     let Some(base) = data_home() else {
         return Ok(None);
     };
-    let dir = base.join("icons/hicolor/scalable/apps");
-    if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!(
-            "hyprcorrect: could not create {} ({e}) — launcher will fall back to icon-theme",
-            dir.display()
-        );
-        return Ok(None);
-    }
-    let path = dir.join("hyprcorrect.svg");
-    if let Err(e) = fs::write(&path, crate::icon::app_icon_svg_bytes()) {
+    let path = base.join("icons/hicolor/scalable/apps/hyprcorrect.svg");
+    if let Err(e) = secure_fs::atomic_write(&path, crate::icon::app_icon_svg_bytes(), 0o644) {
         eprintln!(
             "hyprcorrect: could not write {} ({e}) — launcher will fall back to icon-theme",
             path.display()
@@ -133,26 +124,25 @@ pub fn ensure_apps_catalog_entry(exec_path: &str) -> io::Result<Option<PathBuf>>
     let Some(base) = data_home() else {
         return Ok(None);
     };
-    let dir = base.join("applications");
-    fs::create_dir_all(&dir)?;
     // Side-effect: ensure_user_icon places our SVG at the hicolor
     // scalable-apps path that `Icon=hyprcorrect` resolves against.
     let _ = ensure_user_icon()?;
-    let path = dir.join("hyprcorrect.desktop");
+    let path = base.join("applications/hyprcorrect.desktop");
+    let executable = desktop_quote(exec_path)?;
     let contents = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=hyprcorrect\n\
          GenericName=Spelling corrector\n\
          Comment=Keyboard-driven desktop spelling and typo correction\n\
-         Exec={exec_path} prefs\n\
+         Exec={executable} prefs\n\
          Icon=hyprcorrect\n\
          Terminal=false\n\
          Categories=Utility;TextTools;\n\
          Keywords=spell;spellcheck;autocorrect;typo;correction;keyboard;\n\
          StartupNotify=false\n"
     );
-    fs::write(&path, contents)?;
+    secure_fs::atomic_write(&path, contents.as_bytes(), 0o644)?;
     Ok(Some(path))
 }
 
@@ -162,6 +152,35 @@ fn data_home() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
+fn desktop_quote(argument: &str) -> io::Result<String> {
+    if argument.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "desktop executable path contains control characters",
+        ));
+    }
+    let mut escaped = String::with_capacity(argument.len() + 2);
+    escaped.push('"');
+    for character in argument.chars() {
+        if matches!(character, '\\' | '"' | '`' | '$') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped.push('"');
+    Ok(escaped)
 }
 
 /// The user-local application-catalog entry path
@@ -222,8 +241,10 @@ fn try_ensure_first_launch(exec_path: &str) -> io::Result<()> {
     let Some(marker) = first_launch_marker() else {
         return Ok(());
     };
-    if marker.exists() {
-        return Ok(());
+    match secure_fs::read_limited(&marker, 1024) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => return Err(error),
     }
 
     // Install only if nothing already provides the entry — neither an
@@ -236,12 +257,10 @@ fn try_ensure_first_launch(exec_path: &str) -> io::Result<()> {
 
     // Record completion last, so a failed install above is retried on
     // the next launch rather than marked done.
-    if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
+    secure_fs::atomic_write(
         &marker,
-        "hyprcorrect ran its one-time first-launch desktop integration.\n",
+        b"hyprcorrect ran its one-time first-launch desktop integration.\n",
+        0o600,
     )
 }
 
@@ -252,12 +271,10 @@ pub fn mark_install_done() {
     let Some(marker) = first_launch_marker() else {
         return;
     };
-    if let Some(parent) = marker.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(
+    let _ = secure_fs::atomic_write(
         &marker,
-        "hyprcorrect desktop integration installed via install-desktop.\n",
+        b"hyprcorrect desktop integration installed via install-desktop.\n",
+        0o600,
     );
 }
 
@@ -271,9 +288,20 @@ pub fn disable() -> io::Result<()> {
     let Some(path) = path() else {
         return Ok(());
     };
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    secure_fs::remove_file(&path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desktop_quote;
+
+    #[test]
+    fn desktop_exec_path_is_quoted_without_shell_interpolation() {
+        assert_eq!(
+            desktop_quote("/tmp/Hypr Correct/$build`x`").unwrap(),
+            r#""/tmp/Hypr Correct/\$build\`x\`""#
+        );
+        assert!(desktop_quote("/tmp/hyprcorrect\nExec=unsafe").is_err());
+        assert!(desktop_quote("/tmp/hyprcorrect\u{202e}exe").is_err());
     }
 }

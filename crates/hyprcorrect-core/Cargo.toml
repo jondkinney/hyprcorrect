@@ -23,6 +23,10 @@ keyring.workspace = true
 # online definition lookup.
 ureq.workspace = true
 serde_json.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 # Decompress the bundled WordNet definitions at first lookup.
 flate2.workspace = true

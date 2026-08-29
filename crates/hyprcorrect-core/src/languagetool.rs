@@ -14,6 +14,7 @@ use crate::LanguageToolConfig;
 use crate::providers::Correction;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Errors from a LanguageTool check.
 #[derive(Debug, thiserror::Error)]
@@ -78,9 +79,8 @@ impl LanguageToolProvider {
             .post(&self.endpoint)
             .send_form(&[("text", text), ("language", "en-US"), ("level", "picky")])
             .map_err(|e| LanguageToolError::Request(e.to_string()))?;
-        let json: serde_json::Value = response
-            .into_json()
-            .map_err(|e| LanguageToolError::Response(e.to_string()))?;
+        let json = crate::http::json_response(response, MAX_RESPONSE_BYTES)
+            .map_err(LanguageToolError::Response)?;
         Ok(parse_matches(&json, text))
     }
 }
@@ -102,8 +102,8 @@ fn parse_matches(json: &serde_json::Value, text: &str) -> Vec<Correction> {
         .chain(std::iter::once(text.len()))
         .collect();
     let last_char = char_to_byte.len() - 1; // == text.chars().count()
-    let mut out = Vec::with_capacity(matches.len());
-    for m in matches {
+    let mut out = Vec::with_capacity(matches.len().min(4096));
+    for m in matches.iter().take(4096) {
         let offset = match m["offset"].as_u64() {
             Some(n) => n as usize,
             None => continue,
@@ -124,6 +124,7 @@ fn parse_matches(json: &serde_json::Value, text: &str) -> Vec<Correction> {
             .as_array()
             .into_iter()
             .flat_map(|a| a.iter())
+            .take(32)
             .filter_map(|r| r["value"].as_str().map(str::to_string))
             .collect();
         if suggestions.is_empty() {

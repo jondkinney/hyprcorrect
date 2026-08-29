@@ -7,6 +7,7 @@
 //! (LLM API keys) live in the OS keychain — never in config.toml.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -799,7 +800,7 @@ fn relaunch_overlay(ctx: &egui::Context, footer: egui::Rect) -> bool {
             ui.painter().vline(
                 rect.left(),
                 rect.y_range(),
-                egui::Stroke::new(1.0, kanso::palette::WARN),
+                egui::Stroke::new(1.0_f32, kanso::palette::WARN),
             );
             // Swallow any click on the backdrop so the hidden Save/Cancel can't
             // be triggered through it.
@@ -1847,7 +1848,7 @@ impl PrefsApp {
             );
             ui.label(
                 egui::RichText::new(
-                    " image and runs it locally, mapped to the port in your \
+                    " image at the reviewed digest built into this release and runs it locally, mapped to the port in your \
                      URL above. Use this if you don't already self-host \
                      LanguageTool elsewhere.",
                 )
@@ -2449,7 +2450,12 @@ fn pick_folder(initial: Option<&str>) -> Option<String> {
         if let Some(dir) = initial {
             cmd.arg(format!("--filename={}/", dir.trim_end_matches('/')));
         }
-        if let Ok(out) = cmd.output() {
+        if let Ok(out) = hyprcorrect_core::bounded_process::output(
+            &mut cmd,
+            Duration::from_secs(24 * 60 * 60),
+            16 * 1024,
+            64 * 1024,
+        ) {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             return out
                 .status
@@ -2462,7 +2468,12 @@ fn pick_folder(initial: Option<&str>) -> Option<String> {
         let mut cmd = std::process::Command::new("kdialog");
         cmd.arg("--getexistingdirectory");
         cmd.arg(initial.unwrap_or("."));
-        if let Ok(out) = cmd.output() {
+        if let Ok(out) = hyprcorrect_core::bounded_process::output(
+            &mut cmd,
+            Duration::from_secs(24 * 60 * 60),
+            16 * 1024,
+            64 * 1024,
+        ) {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             return out
                 .status
@@ -2524,7 +2535,8 @@ fn key_fingerprint(backend: &str, key: &str) -> String {
 fn load_key_cache() -> std::collections::HashMap<String, bool> {
     let mut m = std::collections::HashMap::new();
     if let Some(p) = key_cache_path()
-        && let Ok(s) = std::fs::read_to_string(p)
+        && let Ok(Some(snapshot)) = hyprcorrect_core::secure_fs::read_limited(&p, 16 * 1024)
+        && let Ok(s) = std::str::from_utf8(&snapshot.bytes)
     {
         for line in s.lines() {
             if let Some((fp, v)) = line.split_once('=') {
@@ -2541,15 +2553,12 @@ fn save_key_cache(cache: &std::collections::HashMap<String, bool>) {
     let Some(path) = key_cache_path() else {
         return;
     };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let body: String = cache
         .iter()
         .take(64)
         .map(|(k, v)| format!("{k}={}\n", u8::from(*v)))
         .collect();
-    let _ = std::fs::write(path, body);
+    let _ = hyprcorrect_core::secure_fs::atomic_write(&path, body.as_bytes(), 0o600);
 }
 
 /// Paint a small filled status dot beside the LLM heading from the
@@ -3070,19 +3079,7 @@ fn daemon_is_stale() -> bool {
 /// SIGTERM the running daemon. The daemon's shutdown handler cleans
 /// up its Hyprland bind, tray, and PID file.
 fn quit_daemon() {
-    let Ok(Some(pid)) = runtime::read_daemon_pid() else {
-        return;
-    };
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
+    let _ = runtime::signal_daemon(runtime::DaemonSignal::Terminate);
 }
 
 /// Quit the running daemon and immediately spawn a fresh one from the
@@ -3128,10 +3125,12 @@ fn relaunch_daemon_now() {
 #[cfg(target_os = "linux")]
 fn list_running_classes() -> Vec<String> {
     {
-        let Ok(output) = std::process::Command::new("hyprctl")
-            .args(["clients", "-j"])
-            .output()
-        else {
+        let Ok(output) = hyprcorrect_core::bounded_process::output(
+            std::process::Command::new("hyprctl").args(["clients", "-j"]),
+            Duration::from_secs(3),
+            4 * 1024 * 1024,
+            64 * 1024,
+        ) else {
             return Vec::new();
         };
         if !output.status.success() {
@@ -3146,7 +3145,7 @@ fn list_running_classes() -> Vec<String> {
         let mut classes: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         let needle = "\"class\"";
-        for chunk in text.split(needle).skip(1) {
+        for chunk in text.split(needle).skip(1).take(4096) {
             let after = chunk
                 .split_once(':')
                 .map(|p| p.1)
@@ -3158,12 +3157,25 @@ fn list_running_classes() -> Vec<String> {
             let Some((value, _)) = rest.split_once('"') else {
                 continue;
             };
+            let value: String = value
+                .chars()
+                .filter(|character| {
+                    !character.is_control()
+                        && !matches!(
+                            character,
+                            '\u{061c}'
+                                | '\u{200e}'
+                                | '\u{200f}'
+                                | '\u{202a}'..='\u{202e}'
+                                | '\u{2066}'..='\u{2069}'
+                        )
+                })
+                .take(256)
+                .collect();
             if value.is_empty() {
                 continue;
             }
-            classes
-                .entry(value.to_ascii_lowercase())
-                .or_insert_with(|| value.to_string());
+            classes.entry(value.to_ascii_lowercase()).or_insert(value);
         }
         let mut out: Vec<String> = classes.into_values().collect();
         out.sort_by_key(|a| a.to_ascii_lowercase());
@@ -3193,23 +3205,16 @@ fn validate(config: &Config) -> Result<(), String> {
 /// `pkill -x hyprcorrect` — the prefs subprocess shares the daemon's
 /// binary name and would receive the signal too.
 fn signal_daemon(signal: &str) {
-    let pid = match runtime::read_daemon_pid() {
-        Ok(Some(pid)) => pid,
-        Ok(None) => return, // no daemon running
-        Err(e) => {
-            eprintln!("hyprcorrect: could not read daemon PID file: {e}");
+    let signal = match signal {
+        "-HUP" => runtime::DaemonSignal::Reload,
+        "-USR2" => runtime::DaemonSignal::ReleaseHotkeys,
+        _ => {
+            eprintln!("hyprcorrect: refusing unsupported daemon signal {signal}");
             return;
         }
     };
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args([signal, &pid.to_string()])
-            .output();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, signal); // Windows: M-later
+    if let Err(error) = runtime::signal_daemon(signal) {
+        eprintln!("hyprcorrect: could not signal daemon: {error}");
     }
 }
 
@@ -3229,33 +3234,69 @@ fn notify_daemon_release() {
 /// the life of the process. If another prefs window is already
 /// running, best-effort ask it to focus and return `None`.
 fn acquire_singleton() -> Option<UnixListener> {
+    if let Err(error) = runtime::ensure_runtime_dir() {
+        eprintln!("hyprcorrect: cannot use preferences runtime socket: {error}");
+        return None;
+    }
     let path = singleton_path();
-    if let Ok(listener) = UnixListener::bind(&path) {
-        return Some(listener);
+    match UnixListener::bind(&path) {
+        Ok(listener) => return secure_singleton(listener, &path),
+        Err(error) if error.kind() != std::io::ErrorKind::AddrInUse => {
+            eprintln!("hyprcorrect: cannot bind preferences socket: {error}");
+            return None;
+        }
+        Err(_) => {}
     }
     // The socket exists. If we can connect, prefs is already running.
     if UnixStream::connect(&path).is_ok() {
         focus_existing_prefs();
         return None;
     }
-    // Stale socket file — remove and try again.
-    let _ = std::fs::remove_file(&path);
-    UnixListener::bind(&path).ok()
+    // Only an owned, private socket may be treated as stale. A regular file,
+    // symlink, foreign owner, or unsafe mode is never removed.
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        eprintln!(
+            "hyprcorrect: refusing unsafe preferences socket {}",
+            path.display()
+        );
+        return None;
+    }
+    hyprcorrect_core::secure_fs::remove_file(&path).ok()?;
+    let listener = UnixListener::bind(&path).ok()?;
+    secure_singleton(listener, &path)
 }
 
 fn singleton_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("hyprcorrect-prefs.sock")
+    runtime::prefs_socket_path()
+}
+
+fn secure_singleton(listener: UnixListener, path: &std::path::Path) -> Option<UnixListener> {
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("hyprcorrect: cannot secure preferences socket: {error}");
+        let _ = hyprcorrect_core::secure_fs::remove_file(path);
+        None
+    } else {
+        Some(listener)
+    }
 }
 
 fn focus_existing_prefs() {
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", &format!("class:{APP_ID}")])
-            .output();
+        let _ = hyprcorrect_core::bounded_process::output(
+            std::process::Command::new("hyprctl").args([
+                "dispatch",
+                "focuswindow",
+                &format!("class:{APP_ID}"),
+            ]),
+            Duration::from_secs(3),
+            64 * 1024,
+            64 * 1024,
+        );
     }
 }
 
@@ -3266,6 +3307,9 @@ fn focus_existing_prefs() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_daemon_running() {
     use hyprcorrect_core::runtime::chord_socket_path;
+    if runtime::ensure_runtime_dir().is_err() {
+        return;
+    }
     if std::os::unix::net::UnixStream::connect(chord_socket_path()).is_ok() {
         return; // daemon up
     }
@@ -3448,7 +3492,7 @@ pub(crate) fn run() {
     );
 
     // Best-effort cleanup of the socket file.
-    let _ = std::fs::remove_file(singleton_path());
+    let _ = hyprcorrect_core::secure_fs::remove_file(&singleton_path());
     #[cfg(not(target_os = "macos"))]
     if let Some(handle) = listener_thread {
         let _ = handle.join();

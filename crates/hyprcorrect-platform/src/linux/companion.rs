@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -33,6 +34,7 @@ pub enum CompanionEvent {
 
 /// Start the daemon side of the companion socket.
 pub fn start_listener(paused: Arc<AtomicBool>) -> io::Result<Receiver<CompanionEvent>> {
+    runtime::ensure_runtime_dir().map_err(io::Error::other)?;
     let path = runtime::companion_socket_path();
     remove_stale_socket(&path)?;
     let listener = UnixListener::bind(&path)?;
@@ -63,13 +65,34 @@ pub fn start_listener(paused: Arc<AtomicBool>) -> io::Result<Receiver<CompanionE
 
 /// Run the stdout-facing side used by Quickshell's bounded `SplitParser`.
 pub fn watch() -> io::Result<()> {
+    runtime::ensure_runtime_dir().map_err(io::Error::other)?;
     let mut stream = UnixStream::connect(runtime::companion_socket_path())?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(b"watch\n")?;
-    let result = io::copy(&mut stream, &mut io::stdout());
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(error),
+    let mut reader = BufReader::new(stream);
+    let mut stdout = io::stdout().lock();
+    loop {
+        let mut frame = Vec::with_capacity(1024);
+        let read = reader
+            .by_ref()
+            .take(SNAPSHOT_LIMIT as u64 + 2)
+            .read_until(b'\n', &mut frame)?;
+        if read == 0 {
+            return Ok(());
+        }
+        if frame.last() != Some(&b'\n') || frame.len() > SNAPSHOT_LIMIT + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "companion status frame exceeded its bound",
+            ));
+        }
+        if let Err(error) = stdout.write_all(&frame).and_then(|()| stdout.flush()) {
+            return if error.kind() == io::ErrorKind::BrokenPipe {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
     }
 }
 
@@ -178,13 +201,21 @@ fn remove_stale_socket(path: &std::path::Path) -> io::Result<()> {
                     format!("refusing to replace non-socket path {}", path.display()),
                 ));
             }
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("refusing unsafe companion socket {}", path.display()),
+                ));
+            }
             if UnixStream::connect(path).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("companion socket already in use: {}", path.display()),
                 ));
             }
-            fs::remove_file(path)
+            hyprcorrect_core::secure_fs::remove_file(path)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),

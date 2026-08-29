@@ -4,16 +4,19 @@
 //! This crate has no GUI or platform dependencies. See `DESIGN.md` at
 //! the repository root for the architecture.
 
+pub mod bounded_process;
 pub mod buffer;
 pub mod chord;
 pub mod config;
 pub mod definitions;
+mod http;
 pub mod languagetool;
 pub mod llm;
 pub mod providers;
 pub mod replace;
 pub mod runtime;
 pub mod secrets;
+pub mod secure_fs;
 
 pub use buffer::{
     Buffer, EMOJI_MARKER, Key, NearbyWord, ResetKind, Sentence, SentenceAtCaret, WordAtCaret,

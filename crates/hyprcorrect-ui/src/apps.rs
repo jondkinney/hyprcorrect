@@ -18,6 +18,16 @@ use std::sync::Arc;
 use eframe::egui;
 
 const ICON_SIZE_PX: u32 = 48;
+#[cfg(target_os = "linux")]
+const MAX_DESKTOP_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_ICON_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_DESKTOP_FILES: usize = 25_000;
+#[cfg(target_os = "linux")]
+const MAX_ICON_CACHE_ENTRIES: usize = 1024;
+#[cfg(target_os = "linux")]
+const MAX_IDENTIFIER_CHARS: usize = 256;
 
 /// Resolved metadata for a single app: what to show in the picker and
 /// what to store in the config blocklist.
@@ -187,7 +197,8 @@ impl AppRegistry {
     /// Build the registry by walking the standard application dirs.
     pub fn discover() -> Self {
         let mut by_identifier: HashMap<String, Arc<DesktopEntry>> = HashMap::new();
-        for dir in desktop_dirs() {
+        let mut desktop_files = 0usize;
+        'directories: for dir in desktop_dirs() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
@@ -196,10 +207,19 @@ impl AppRegistry {
                 if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                     continue;
                 }
-                let Ok(text) = std::fs::read_to_string(&path) else {
+                desktop_files += 1;
+                if desktop_files > MAX_DESKTOP_FILES {
+                    break 'directories;
+                }
+                let Ok(Some(snapshot)) =
+                    hyprcorrect_core::secure_fs::read_limited_trusted(&path, MAX_DESKTOP_BYTES)
+                else {
                     continue;
                 };
-                let Some(parsed) = parse_desktop(&text, &path) else {
+                let Ok(text) = std::str::from_utf8(&snapshot.bytes) else {
+                    continue;
+                };
+                let Some(parsed) = parse_desktop(text, &path) else {
                     continue;
                 };
                 if parsed.no_display {
@@ -226,15 +246,16 @@ impl AppRegistry {
     /// Look up display name + icon for the given identifier. Always
     /// returns something — falls back to the identifier itself.
     pub fn lookup(&mut self, ctx: &egui::Context, identifier: &str) -> AppMeta {
+        let identifier = clean_external_field(identifier, MAX_IDENTIFIER_CHARS);
         let key = identifier.to_ascii_lowercase();
         let entry = self.by_identifier.get(&key).cloned();
         let display_name = entry
             .as_ref()
             .and_then(|e| e.name.clone())
-            .unwrap_or_else(|| identifier.to_string());
+            .unwrap_or_else(|| identifier.clone());
         let icon = self.icon_for(ctx, &key, entry.as_deref());
         AppMeta {
-            identifier: identifier.to_string(),
+            identifier,
             display_name,
             icon,
         }
@@ -255,7 +276,9 @@ impl AppRegistry {
         } else {
             resolve_icon_path(&icon_name, &self.icon_dirs).and_then(|p| load_icon(ctx, &p, key))
         };
-        self.icon_cache.insert(key.to_string(), texture.clone());
+        if self.icon_cache.len() < MAX_ICON_CACHE_ENTRIES {
+            self.icon_cache.insert(key.to_string(), texture.clone());
+        }
         texture
     }
 }
@@ -302,7 +325,10 @@ fn icon_dirs() -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn parse_desktop(text: &str, path: &Path) -> Option<DesktopEntry> {
-    let stem = path.file_stem().and_then(|s| s.to_str())?.to_string();
+    let stem = clean_external_field(path.file_stem().and_then(|s| s.to_str())?, 255);
+    if stem.is_empty() {
+        return None;
+    }
     let mut entry = DesktopEntry {
         stem,
         ..Default::default()
@@ -323,9 +349,13 @@ fn parse_desktop(text: &str, path: &Path) -> Option<DesktopEntry> {
         let key = key.trim();
         let value = value.trim();
         match key {
-            "Name" if entry.name.is_none() => entry.name = Some(value.to_string()),
-            "Icon" => entry.icon = Some(value.to_string()),
-            "StartupWMClass" => entry.wm_class = Some(value.to_string()),
+            "Name" if entry.name.is_none() => {
+                entry.name = Some(clean_external_field(value, 256));
+            }
+            "Icon" => entry.icon = Some(clean_external_field(value, 4096)),
+            "StartupWMClass" => {
+                entry.wm_class = Some(clean_external_field(value, MAX_IDENTIFIER_CHARS));
+            }
             "NoDisplay" if value == "true" => entry.no_display = true,
             _ => {}
         }
@@ -378,7 +408,9 @@ fn resolve_icon_path(icon: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn load_icon(ctx: &egui::Context, path: &Path, cache_key: &str) -> Option<egui::TextureHandle> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = hyprcorrect_core::secure_fs::read_limited_trusted(path, MAX_ICON_BYTES)
+        .ok()??
+        .bytes;
     let rgba = match path.extension().and_then(|e| e.to_str()) {
         Some("svg") => rasterize_svg(&bytes, ICON_SIZE_PX),
         Some("png") => rasterize_png(&bytes, ICON_SIZE_PX),
@@ -403,7 +435,14 @@ fn rasterize_svg(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "linux")]
 fn rasterize_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
-    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     let scaled = img.resize(size, size, image::imageops::FilterType::Lanczos3);
     let rgba = scaled.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
@@ -421,6 +460,25 @@ fn rasterize_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
         canvas[dst_off..dst_off + len].copy_from_slice(&rgba.as_raw()[src_row..src_row + len]);
     }
     Some(canvas)
+}
+
+#[cfg(target_os = "linux")]
+fn clean_external_field(value: &str, maximum: usize) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+        .take(maximum)
+        .collect()
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -453,5 +511,14 @@ NoDisplay=false
         let text = "[Desktop Entry]\nName=Hidden\nNoDisplay=true\n";
         let entry = parse_desktop(text, Path::new("/x/hidden.desktop")).unwrap();
         assert!(entry.no_display);
+    }
+
+    #[test]
+    fn desktop_fields_drop_controls_and_bidi_before_capping() {
+        assert_eq!(
+            clean_external_field("<b>safe</b>\n\u{202e}xyz", 12),
+            "<b>safe</b>x"
+        );
+        assert_eq!(clean_external_field("12345", 4), "1234");
     }
 }

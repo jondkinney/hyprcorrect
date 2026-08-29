@@ -414,7 +414,7 @@ impl ReviewApp {
         let _ = runtime::write_review_request(&req);
         self.ready = false;
         self.reprocessing = true;
-        if let Err(e) = std::fs::write(runtime::action_path(), "review-llm") {
+        if let Err(e) = runtime::write_action("review-llm") {
             eprintln!("hyprcorrect: could not write review-llm action: {e}");
             return;
         }
@@ -1387,7 +1387,7 @@ impl eframe::App for ReviewApp {
             "apply" => "review-apply",
             _ => "review-cancel",
         };
-        if let Err(e) = std::fs::write(runtime::action_path(), action) {
+        if let Err(e) = runtime::write_action(action) {
             eprintln!("hyprcorrect: could not write review action: {e}");
             return;
         }
@@ -1935,7 +1935,7 @@ fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: egui::Colo
         pts.push(egui::pos2(x, y + AMP * phase.sin()));
         x += STEP;
     }
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4, color)));
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4_f32, color)));
 }
 
 /// Render the suggestion list inline, *below* the Proposed card, so the
@@ -1954,7 +1954,10 @@ fn render_suggestion_dropdown(
     egui::Frame::new()
         .fill(egui::Color32::from_gray(30))
         .corner_radius(egui::CornerRadius::same(6))
-        .stroke(egui::Stroke::new(1.0, SQUIGGLE_BLUE.gamma_multiply(0.5)))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            SQUIGGLE_BLUE.gamma_multiply(0.5),
+        ))
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2082,17 +2085,7 @@ fn changed_region(prev: &str, curr: &str) -> (usize, usize, usize) {
 }
 
 fn notify_daemon() {
-    let Ok(Some(pid)) = runtime::read_daemon_pid() else {
-        return;
-    };
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-USR1", &pid.to_string()])
-            .output();
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
+    let _ = runtime::signal_daemon(runtime::DaemonSignal::Trigger);
 }
 
 /// Open Preferences straight to the Providers tab — used when the user asks

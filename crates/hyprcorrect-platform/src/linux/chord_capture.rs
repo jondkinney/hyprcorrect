@@ -31,7 +31,8 @@
 //!                          capture thread (evdev + xkb)
 //! ```
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{
     Arc, Mutex,
@@ -169,14 +170,31 @@ pub const DEFAULT_RECORD_TIMEOUT: Duration = Duration::from_secs(30);
 /// claimed — most commonly a stale socket left behind by a prior
 /// daemon crash; the caller can remove it and retry.
 pub fn start_listener(slot: Arc<ChordCaptureSlot>) -> Result<(), ListenerError> {
+    runtime::ensure_runtime_dir().map_err(|error| ListenerError::Bind(error.to_string()))?;
     let path = runtime::chord_socket_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(ListenerError::Bind(format!(
+                    "refusing unsafe chord socket {}",
+                    path.display()
+                )));
+            }
+            if UnixStream::connect(&path).is_ok() {
+                return Err(ListenerError::Bind("chord socket is already active".into()));
+            }
+            hyprcorrect_core::secure_fs::remove_file(&path)
+                .map_err(|error| ListenerError::Bind(error.to_string()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ListenerError::Bind(error.to_string())),
     }
-    // A previous daemon may have crashed without unlinking the
-    // socket; the next bind would EADDRINUSE forever otherwise.
-    let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).map_err(|e| ListenerError::Bind(e.to_string()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| ListenerError::Bind(error.to_string()))?;
     thread::spawn(move || {
         for incoming in listener.incoming() {
             let Ok(stream) = incoming else {
@@ -244,6 +262,7 @@ impl ChordRecording {
 ///
 /// See [`ClientError`].
 pub fn record_chord() -> Result<ChordRecording, ClientError> {
+    runtime::ensure_runtime_dir().map_err(|error| ClientError::Io(error.to_string()))?;
     let path = runtime::chord_socket_path();
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound
@@ -265,8 +284,9 @@ pub fn record_chord() -> Result<ChordRecording, ClientError> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        let result = match reader.read_line(&mut line) {
-            Ok(_) => parse_reply(line.trim()),
+        let result = match reader.by_ref().take(257).read_line(&mut line) {
+            Ok(_) if line.len() <= 256 && line.ends_with('\n') => parse_reply(line.trim()),
+            Ok(_) => Err(ClientError::Io("daemon reply exceeded its bound".into())),
             Err(e) => Err(ClientError::Io(e.to_string())),
         };
         let _ = tx.send(result);
@@ -294,7 +314,10 @@ fn serve_client(stream: UnixStream, slot: Arc<ChordCaptureSlot>) {
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    if reader.by_ref().take(33).read_line(&mut line).is_err()
+        || line.len() > 32
+        || !line.ends_with('\n')
+    {
         return;
     }
     let request = line.trim();
@@ -307,7 +330,6 @@ fn serve_client(stream: UnixStream, slot: Arc<ChordCaptureSlot>) {
             let watcher_slot = slot.clone();
             let watcher = thread::spawn(move || {
                 let mut sink = [0u8; 16];
-                use std::io::Read;
                 let mut reader = reader;
                 loop {
                     match reader.get_mut().read(&mut sink) {

@@ -341,10 +341,13 @@ impl Default for RepeatConfig {
 fn query_compositor_repeat() -> RepeatConfig {
     let mut cfg = RepeatConfig::default();
     let read = |key: &str| -> Option<i64> {
-        let out = std::process::Command::new("hyprctl")
-            .args(["getoption", "-j", key])
-            .output()
-            .ok()?;
+        let out = hyprcorrect_core::bounded_process::output(
+            std::process::Command::new("hyprctl").args(["getoption", "-j", key]),
+            Duration::from_secs(3),
+            64 * 1024,
+            64 * 1024,
+        )
+        .ok()?;
         if !out.status.success() {
             return None;
         }

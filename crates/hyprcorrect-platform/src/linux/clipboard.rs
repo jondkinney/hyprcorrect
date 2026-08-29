@@ -16,6 +16,10 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
+const CLIPBOARD_LIMIT: usize = 32 * 1024;
+const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
+const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Errors from a clipboard-fallback round trip.
 #[derive(Debug, thiserror::Error)]
 pub enum ClipboardError {
@@ -54,10 +58,13 @@ pub fn copy_previous_word() -> Result<String, ClipboardError> {
     wtype(&["-M", "ctrl", "-k", "c", "-m", "ctrl"])?;
     sleep(Duration::from_millis(80)); // compositor + clipboard manager
 
-    let output = Command::new("wl-paste")
-        .arg("-n") // strip trailing newline
-        .output()
-        .map_err(|e| ClipboardError::Spawn("wl-paste".into(), e.to_string()))?;
+    let output = hyprcorrect_core::bounded_process::output(
+        Command::new("wl-paste").arg("-n"), // strip trailing newline
+        TOOL_TIMEOUT,
+        CLIPBOARD_LIMIT,
+        TOOL_OUTPUT_LIMIT,
+    )
+    .map_err(|e| ClipboardError::Spawn("wl-paste".into(), e.to_string()))?;
     if !output.status.success() {
         return Err(ClipboardError::Exit(
             "wl-paste".into(),
@@ -79,11 +86,13 @@ pub fn copy_previous_word() -> Result<String, ClipboardError> {
 pub fn type_replacement(text: &str) -> Result<(), ClipboardError> {
     // `--` ends wtype's option parsing so a replacement that starts
     // with `-` won't be parsed as a flag.
-    let output = Command::new("wtype")
-        .arg("--")
-        .arg(text)
-        .output()
-        .map_err(|e| ClipboardError::Spawn("wtype".into(), e.to_string()))?;
+    let output = hyprcorrect_core::bounded_process::output(
+        Command::new("wtype").arg("--").arg(text),
+        TOOL_TIMEOUT,
+        TOOL_OUTPUT_LIMIT,
+        TOOL_OUTPUT_LIMIT,
+    )
+    .map_err(|e| ClipboardError::Spawn("wtype".into(), e.to_string()))?;
     if !output.status.success() {
         return Err(ClipboardError::Exit(
             "wtype".into(),
@@ -94,10 +103,13 @@ pub fn type_replacement(text: &str) -> Result<(), ClipboardError> {
 }
 
 fn wtype(args: &[&str]) -> Result<(), ClipboardError> {
-    let output = Command::new("wtype")
-        .args(args)
-        .output()
-        .map_err(|e| ClipboardError::Spawn("wtype".into(), e.to_string()))?;
+    let output = hyprcorrect_core::bounded_process::output(
+        Command::new("wtype").args(args),
+        TOOL_TIMEOUT,
+        TOOL_OUTPUT_LIMIT,
+        TOOL_OUTPUT_LIMIT,
+    )
+    .map_err(|e| ClipboardError::Spawn("wtype".into(), e.to_string()))?;
     if !output.status.success() {
         return Err(ClipboardError::Exit(
             "wtype".into(),

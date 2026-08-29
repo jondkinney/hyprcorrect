@@ -10,11 +10,19 @@
 //! produces a valid [`Config`]. See the "Configuration & GUI" section
 //! of `DESIGN.md`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::fs;
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+
+use crate::secure_fs::{self, ExpectedFile};
+
+/// Configuration is expected to be small; this prevents a replaced file from
+/// consuming unbounded memory or parser work in the daemon and companion.
+const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 
 /// An error loading or saving the config.
 #[derive(Debug, thiserror::Error)]
@@ -379,11 +387,9 @@ impl Config {
     ///
     /// See [`ConfigError`].
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
-        match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(ConfigError::Io(e.to_string())),
-        }
+        let snapshot = secure_fs::read_limited(path, MAX_CONFIG_BYTES)
+            .map_err(|error| ConfigError::Io(error.to_string()))?;
+        Self::parse_snapshot(snapshot.as_ref().map(|snapshot| snapshot.bytes.as_slice()))
     }
 
     /// Save to the OS-conventional path, creating parent dirs as needed.
@@ -401,12 +407,52 @@ impl Config {
     ///
     /// See [`ConfigError`].
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ConfigError::Io(e.to_string()))?;
-        }
         let text =
             toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
-        fs::write(path, text).map_err(|e| ConfigError::Io(e.to_string()))
+        if text.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::Serialize(format!(
+                "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
+            )));
+        }
+        secure_fs::atomic_write(path, text.as_bytes(), 0o600)
+            .map_err(|error| ConfigError::Io(error.to_string()))
+    }
+
+    /// Read, modify, and atomically publish the configuration only if the
+    /// exact source inode remains current for the whole transaction.
+    ///
+    /// This is the mutation path used by short-lived native companions. It
+    /// prevents a pathname replacement between the read and the save from
+    /// redirecting or clobbering an unrelated file.
+    pub fn update(mut update: impl FnMut(&mut Self)) -> Result<(), ConfigError> {
+        let path = Self::path()?;
+        let snapshot = secure_fs::read_limited(&path, MAX_CONFIG_BYTES)
+            .map_err(|error| ConfigError::Io(error.to_string()))?;
+        let expected = snapshot
+            .as_ref()
+            .map(|snapshot| ExpectedFile::Matching(snapshot.identity))
+            .unwrap_or(ExpectedFile::Missing);
+        let mut config =
+            Self::parse_snapshot(snapshot.as_ref().map(|snapshot| snapshot.bytes.as_slice()))?;
+        update(&mut config);
+        let text = toml::to_string_pretty(&config)
+            .map_err(|error| ConfigError::Serialize(error.to_string()))?;
+        if text.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::Serialize(format!(
+                "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
+            )));
+        }
+        secure_fs::atomic_write_checked(&path, text.as_bytes(), 0o600, expected)
+            .map_err(|error| ConfigError::Io(error.to_string()))
+    }
+
+    fn parse_snapshot(bytes: Option<&[u8]>) -> Result<Self, ConfigError> {
+        let Some(bytes) = bytes else {
+            return Ok(Self::default());
+        };
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| ConfigError::Parse(format!("config is not UTF-8: {error}")))?;
+        toml::from_str(text).map_err(|error| ConfigError::Parse(error.to_string()))
     }
 }
 

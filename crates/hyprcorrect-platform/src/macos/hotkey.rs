@@ -276,7 +276,7 @@ unsafe extern "C" fn hotkey_handler(
     let action = super::with_main_state(|s| s.hotkeys.get(&hk_id.id).map(|r| r.action.clone()));
     if let Some(action) = action {
         log::debug!("macos hotkey: fired id={} action='{action}'", hk_id.id);
-        if let Err(e) = std::fs::write(runtime::action_path(), action.as_bytes()) {
+        if let Err(e) = runtime::write_action(&action) {
             log::warn!("macos hotkey: could not write action file: {e}");
         }
         unsafe {

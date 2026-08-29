@@ -72,14 +72,16 @@ pub fn define_online(word: &str) -> Option<String> {
     if word.is_empty() {
         return None;
     }
+    let word: String = word.chars().take(128).collect();
     let url = format!(
         "https://api.dictionaryapi.dev/api/v2/entries/en/{}",
-        urlencode(word)
+        urlencode(&word)
     );
     let agent: ureq::Agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(8))
         .build();
-    let json: serde_json::Value = agent.get(&url).call().ok()?.into_json().ok()?;
+    let response = agent.get(&url).call().ok()?;
+    let json = crate::http::json_response(response, 1024 * 1024).ok()?;
     // Shape: [ { "meanings": [ { "definitions": [ { "definition": "…" } ] } ] } ]
     let def = json
         .get(0)?
@@ -92,7 +94,13 @@ pub fn define_online(word: &str) -> Option<String> {
                 .iter()
                 .find_map(|d| d.get("definition").and_then(serde_json::Value::as_str))
         })?;
-    Some(def.trim().to_string())
+    Some(
+        def.trim()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(1024)
+            .collect(),
+    )
 }
 
 /// Percent-encode a single URL path segment (the looked-up word). Words

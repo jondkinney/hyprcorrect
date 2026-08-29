@@ -26,8 +26,8 @@ Site: <https://hyprcorrect.com>
     en_US dictionary).
   - `languagetool` — POST to a self-hosted LanguageTool server's
     `/v2/check`. Preferences ships a one-click "Install with Docker"
-    convenience that pulls `erikvl87/languagetool` and runs it
-    locally on the port in your URL.
+    convenience that pulls a reviewed `erikvl87/languagetool` image digest
+    and runs it locally on the port in your URL.
   - `llm` — Anthropic Messages API (Haiku by default); the key
     lives in the OS keychain.
 
@@ -49,8 +49,6 @@ Site: <https://hyprcorrect.com>
 yay -S hyprcorrect          # builds from the latest tagged release
 # or
 yay -S hyprcorrect-bin      # prebuilt binary from the GitHub release
-# or
-yay -S hyprcorrect-git      # tracks main
 ```
 
 PKGBUILDs live in [`packaging/aur/`](packaging/aur),
@@ -60,7 +58,7 @@ PKGBUILDs live in [`packaging/aur/`](packaging/aur),
 ### From crates.io
 
 ```sh
-cargo install hyprcorrect
+cargo install --locked --version 0.5.1 hyprcorrect
 hyprcorrect install-desktop   # register the icon + launcher entry
 ```
 
@@ -72,14 +70,11 @@ its **first launch** (once — not on every start), so running the command
 is optional: use it when you want the launcher entry before that first
 run, or to refresh the icon and entry after a rebuild.
 
-### From source
+### Development builds
 
-```sh
-git clone https://github.com/jondkinney/hyprcorrect
-cd hyprcorrect
-cargo build --release
-cargo install --path crates/hyprcorrect
-```
+Moving branches are intentionally not an installation path: they do not bind
+the built bytes to a reviewed release. Contributors should check out a specific
+commit they have reviewed and use Cargo's lockfile for local builds.
 
 On **Linux** you also need the runtime dependencies the AUR packages
 declare: `wtype`, `hyprland`, `libxkbcommon`, `libsecret`, `wayland`,
@@ -135,8 +130,8 @@ opens the full Preferences window.
 
 ### macOS
 
-Build and run the daemon the same way (`cargo build --release` then
-run `hyprcorrect`); it appears as a menu-bar item, not a Dock app.
+Install with the version-pinned Cargo command above, then run `hyprcorrect`;
+it appears as a menu-bar item, not a Dock app.
 
 On **macOS 13+ the only permission you grant is Accessibility**
 (*System Settings → Privacy & Security → Accessibility*). That single

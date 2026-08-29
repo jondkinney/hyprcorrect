@@ -1,7 +1,9 @@
 //! Global trigger via a Hyprland inline keybind + signals.
 //!
 //! At startup the daemon adds an inline Hyprland keybind whose `exec`
-//! reads the daemon's PID file and `kill -USR1`s that PID specifically.
+//! invokes the binary's hidden, validated `shell trigger` command. That
+//! command publishes the action through the descriptor-safe runtime handoff
+//! and signals only an owned process identified as hyprcorrect.
 //! Lua-configured Hyprland sessions use `hyprctl eval` with `hl.bind`;
 //! legacy hyprlang sessions use `hyprctl keyword bind`. Hyprland
 //! intercepts the chord — terminals and other focused apps never see
@@ -26,7 +28,7 @@
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use hyprcorrect_core::{Chord, runtime};
+use hyprcorrect_core::Chord;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 
@@ -57,6 +59,9 @@ pub enum HotkeyEvent {
 /// An error registering the Hyprland keybind or signal handler.
 #[derive(Debug, thiserror::Error)]
 pub enum HotkeyError {
+    /// Could not resolve the daemon executable for the compositor command.
+    #[error("could not resolve the Hyprcorrect executable: {0}")]
+    Executable(String),
     /// `hyprctl` could not bind the trigger chord.
     #[error("hyprctl could not bind the trigger chord: {0}")]
     Hyprctl(String),
@@ -74,11 +79,9 @@ pub enum HotkeyError {
 /// Install the Hyprland inline keybind for the given chord, tagged
 /// with an `action` label ("word", "sentence", "review", …).
 ///
-/// The bind's `exec` writes the action label to the runtime action
-/// file and then `kill -USR1`s the daemon — the daemon reads the
-/// label in its trigger handler to pick which fix to run. Hyprland's
-/// `exec` already wraps the command in `sh -c`, so shell
-/// substitution (`>`, `&&`, `$(...)`) works without extra quoting.
+/// The bind's `exec` invokes this exact executable's validated
+/// `shell trigger` command. That command publishes the fixed action
+/// through the private runtime protocol and signals the verified daemon.
 ///
 /// Idempotent: first unbinds the same chord through the active config
 /// provider so a previous (uncleanly-shut-down) daemon's bind doesn't
@@ -90,7 +93,7 @@ pub enum HotkeyError {
 pub fn install_bind(chord: &Chord, action: &str) -> Result<(), HotkeyError> {
     let provider = config_provider().map_err(HotkeyError::Hyprctl)?;
     let _ = uninstall_bind_with_provider(chord, provider);
-    let command = trigger_command(action);
+    let command = trigger_command(action).map_err(HotkeyError::Executable)?;
 
     match provider {
         ConfigProvider::Lua => {
@@ -143,9 +146,7 @@ fn uninstall_bind_with_provider(chord: &Chord, provider: ConfigProvider) -> Resu
 }
 
 fn config_provider() -> Result<ConfigProvider, String> {
-    let output = Command::new("hyprctl")
-        .args(["status", "-j"])
-        .output()
+    let output = bounded_hyprctl(&["status", "-j"])
         .map_err(|e| format!("invoke `hyprctl status -j`: {e}"))?;
     if !output.status.success() {
         return Err(command_failure("hyprctl status -j", &output));
@@ -167,10 +168,7 @@ fn parse_config_provider(stdout: &[u8]) -> Result<ConfigProvider, String> {
 }
 
 fn run_hyprctl(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("hyprctl")
-        .args(args)
-        .output()
-        .map_err(|e| format!("invoke hyprctl: {e}"))?;
+    let output = bounded_hyprctl(args).map_err(|e| format!("invoke hyprctl: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() || stdout.trim() != "ok" {
         return Err(command_failure(
@@ -181,7 +179,16 @@ fn run_hyprctl(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn command_failure(command: &str, output: &std::process::Output) -> String {
+fn bounded_hyprctl(args: &[&str]) -> std::io::Result<hyprcorrect_core::bounded_process::Output> {
+    hyprcorrect_core::bounded_process::output(
+        Command::new("hyprctl").args(args),
+        std::time::Duration::from_secs(3),
+        64 * 1024,
+        64 * 1024,
+    )
+}
+
+fn command_failure(command: &str, output: &hyprcorrect_core::bounded_process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     format!(
@@ -199,15 +206,16 @@ fn lua_chord(chord: &Chord) -> String {
     }
 }
 
-fn trigger_command(action: &str) -> String {
-    let action_path = runtime::action_path().to_string_lossy().into_owned();
-    let pid_path = runtime::pid_path().to_string_lossy().into_owned();
-    format!(
-        "printf %s {} > {} && kill -USR1 \"$(cat {})\"",
+fn trigger_command(action: &str) -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .into_owned();
+    Ok(format!(
+        "{} shell trigger {}",
+        shell_quote(&executable),
         shell_quote(action),
-        shell_quote(&action_path),
-        shell_quote(&pid_path),
-    )
+    ))
 }
 
 fn action_description(action: &str) -> &str {
@@ -310,5 +318,8 @@ mod tests {
     fn quotes_shell_and_lua_values() {
         assert_eq!(shell_quote("it's"), r#"'it'"'"'s'"#);
         assert_eq!(lua_quote("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+        let command = trigger_command("word").unwrap();
+        assert!(command.ends_with(" shell trigger 'word'"));
+        assert!(!command.starts_with("'hyprcorrect'"));
     }
 }

@@ -68,6 +68,9 @@ enum ShellCommand {
     },
     /// Pause or resume keyboard capture.
     TogglePause,
+    /// Publish one validated hotkey action and notify the running daemon.
+    #[command(hide = true)]
+    Trigger { action: TriggerChoice },
     /// Open the full native Preferences window.
     OpenPrefs,
 }
@@ -78,6 +81,15 @@ enum ProviderChoice {
     Spellbook,
     Llm,
     Languagetool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, ValueEnum)]
+enum TriggerChoice {
+    Word,
+    Sentence,
+    Review,
+    ReviewLlm,
 }
 
 fn main() {
@@ -127,6 +139,9 @@ fn run_shell_command(command: ShellCommand) {
         ShellCommand::TogglePause => hyprcorrect_core::runtime::write_action("toggle-pause")
             .map_err(|error| error.to_string())
             .and_then(|()| signal_daemon("-USR1")),
+        ShellCommand::Trigger { action } => hyprcorrect_core::runtime::write_action(action.name())
+            .map_err(|error| error.to_string())
+            .and_then(|()| signal_daemon("-USR1")),
         ShellCommand::OpenPrefs => std::env::current_exe()
             .map_err(|error| error.to_string())
             .and_then(|binary| {
@@ -151,9 +166,7 @@ fn run_shell_command(command: ShellCommand) {
     }
 
     fn update_config(mut update: impl FnMut(&mut Config)) -> Result<(), String> {
-        let mut config = Config::load().map_err(|error| error.to_string())?;
-        update(&mut config);
-        config.save().map_err(|error| error.to_string())?;
+        Config::update(|config| update(config)).map_err(|error| error.to_string())?;
         signal_daemon("-HUP")
     }
 }
@@ -170,18 +183,29 @@ impl From<ProviderChoice> for hyprcorrect_core::ProviderId {
 }
 
 #[cfg(target_os = "linux")]
+impl TriggerChoice {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Word => "word",
+            Self::Sentence => "sentence",
+            Self::Review => "review",
+            Self::ReviewLlm => "review-llm",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn signal_daemon(signal: &str) -> Result<(), String> {
-    let pid = hyprcorrect_core::runtime::read_daemon_pid()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "the hyprcorrect daemon is not running".to_string())?;
-    let status = std::process::Command::new("kill")
-        .args([signal, &pid.to_string()])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("kill {signal} {pid} exited with {status}"))
+    use hyprcorrect_core::runtime::{self, DaemonSignal};
+
+    let signal = match signal {
+        "-HUP" => DaemonSignal::Reload,
+        "-USR1" => DaemonSignal::Trigger,
+        _ => return Err(format!("refusing unsupported signal {signal}")),
+    };
+    match runtime::signal_daemon(signal).map_err(|error| error.to_string())? {
+        true => Ok(()),
+        false => Err("the hyprcorrect daemon is not running".into()),
     }
 }
 
@@ -1983,8 +2007,7 @@ fn reprocess_review_with_llm(
 /// the popup then uses fixed fallback caps.
 #[cfg(target_os = "linux")]
 fn focused_monitor_size() -> (f32, f32) {
-    use std::process::Command;
-    let Ok(out) = Command::new("hyprctl").args(["monitors", "-j"]).output() else {
+    let Ok(out) = bounded_hyprctl_output(&["monitors", "-j"], 1024 * 1024) else {
         return (0.0, 0.0);
     };
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
@@ -2023,11 +2046,7 @@ fn focused_monitor_size() -> (f32, f32) {
 /// `"1"`). `None` if hyprctl is unavailable or the value can't be parsed.
 #[cfg(target_os = "linux")]
 fn read_follow_mouse() -> Option<String> {
-    use std::process::Command;
-    let out = Command::new("hyprctl")
-        .args(["getoption", "input:follow_mouse", "-j"])
-        .output()
-        .ok()?;
+    let out = bounded_hyprctl_output(&["getoption", "input:follow_mouse", "-j"], 64 * 1024).ok()?;
     let json = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
     json["int"].as_i64().map(|n| n.to_string())
 }
@@ -2035,10 +2054,7 @@ fn read_follow_mouse() -> Option<String> {
 /// Set `input:follow_mouse` via hyprctl. Returns whether it succeeded.
 #[cfg(target_os = "linux")]
 fn set_follow_mouse(value: &str) -> bool {
-    use std::process::Command;
-    Command::new("hyprctl")
-        .args(["keyword", "input:follow_mouse", value])
-        .output()
+    bounded_hyprctl_output(&["keyword", "input:follow_mouse", value], 64 * 1024)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -2048,10 +2064,23 @@ fn set_follow_mouse(value: &str) -> bool {
 /// wants it back. Best-effort; the natural post-popup refocus is the fallback.
 #[cfg(target_os = "linux")]
 fn focus_window_by_address(address: &str) {
-    use std::process::Command;
-    let _ = Command::new("hyprctl")
-        .args(["dispatch", "focuswindow", &format!("address:0x{address}")])
-        .output();
+    let _ = bounded_hyprctl_output(
+        &["dispatch", "focuswindow", &format!("address:0x{address}")],
+        64 * 1024,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_hyprctl_output(
+    args: &[&str],
+    stdout_limit: usize,
+) -> std::io::Result<hyprcorrect_core::bounded_process::Output> {
+    hyprcorrect_core::bounded_process::output(
+        std::process::Command::new("hyprctl").args(args),
+        std::time::Duration::from_secs(3),
+        stdout_limit,
+        64 * 1024,
+    )
 }
 
 /// Pins keyboard focus for the duration of a multi-keystroke emit so a stray
@@ -2099,7 +2128,6 @@ impl Drop for FocusLock {
 /// re-registering the same rule on a daemon restart is a no-op.
 #[cfg(target_os = "linux")]
 fn install_window_rules() {
-    use std::process::Command;
     // Only the transient review popup is floated/centered by us. The prefs
     // window opens *tiled* (no rule), obeying Hyprland's normal tiling; its
     // floating width is capped from inside the app instead — a `maxsize`
@@ -2120,9 +2148,7 @@ fn install_window_rules() {
         format!("float on, match:class {PORTAL_CLASS}"),
         format!("center on, match:class {PORTAL_CLASS}"),
     ] {
-        let result = Command::new("hyprctl")
-            .args(["keyword", "windowrule", &rule])
-            .output();
+        let result = bounded_hyprctl_output(&["keyword", "windowrule", &rule], 64 * 1024);
         match result {
             Ok(output) if !output.status.success() => {
                 eprintln!(
@@ -2884,8 +2910,8 @@ fn await_capture_permission_then_relaunch() -> ! {
 /// respawn the executable directly. The one-second delay lets THIS process
 /// exit first — otherwise Launch Services reactivates the existing instance
 /// instead of starting a fresh one, and the still-held singleton socket
-/// would reject the newcomer. The trailing `&` detaches the spawner so it
-/// survives our exit (adopted by launchd).
+/// would reject the newcomer. The short-lived shell is a separate child and
+/// survives our exit before being adopted by launchd.
 #[cfg(target_os = "macos")]
 fn relaunch_self() {
     use std::path::Path;
@@ -2900,13 +2926,35 @@ fn relaunch_self() {
         .and_then(Path::parent)
         .filter(|p| p.extension().is_some_and(|e| e == "app"));
     // Tag the relaunched process with a marker env var so its own watcher
-    // (if capture STILL fails) won't relaunch again and spin. `open --env`
-    // carries it into the bundle; the bare-binary path sets it inline.
-    let cmd = match bundle {
-        Some(b) => format!("(sleep 1 && open --env {RELAUNCH_MARKER}=1 {b:?}) &"),
-        None => format!("(sleep 1 && {RELAUNCH_MARKER}=1 {exe:?}) &"),
-    };
-    let _ = Command::new("sh").arg("-c").arg(cmd).spawn();
+    // (if capture STILL fails) won't relaunch again and spin. The shell text
+    // is fixed; the executable/bundle path is a positional argv value and is
+    // never interpolated as script text.
+    let mut command = Command::new("/bin/sh");
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match bundle {
+        Some(path) => {
+            command.args([
+                "-c",
+                "sleep 1; exec /usr/bin/open --env \"$1=1\" -- \"$2\"",
+                "hyprcorrect-relaunch",
+                RELAUNCH_MARKER,
+            ]);
+            command.arg(path);
+        }
+        None => {
+            command.args([
+                "-c",
+                "sleep 1; exec /usr/bin/env \"$1=1\" \"$2\"",
+                "hyprcorrect-relaunch",
+                RELAUNCH_MARKER,
+            ]);
+            command.arg(&exe);
+        }
+    }
+    let _ = command.spawn();
 }
 
 /// Apply a precomputed list of corrections (from LanguageTool) to

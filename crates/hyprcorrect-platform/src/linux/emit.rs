@@ -308,7 +308,14 @@ fn sleep_ms(pause_per_backspace_ms: u32, count: usize) {
 }
 
 fn run(mut cmd: Command) -> Result<(), EmitError> {
-    let status = cmd.status().map_err(|e| match e.kind() {
+    let status = hyprcorrect_core::bounded_process::output(
+        &mut cmd,
+        Duration::from_secs(30),
+        64 * 1024,
+        64 * 1024,
+    )
+    .map(|output| output.status)
+    .map_err(|e| match e.kind() {
         ErrorKind::NotFound => EmitError::WtypeMissing,
         _ => EmitError::WtypeFailed,
     })?;

@@ -28,6 +28,12 @@ ureq.workspace = true
 # Downloading + unzipping the LanguageTool n-gram archive in prefs.
 zip.workspace = true
 fs2.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [features]
 # Enabled only by the notarized macOS prebuild, which patches in the cohort

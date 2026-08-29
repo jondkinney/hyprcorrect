@@ -287,15 +287,15 @@ impl LlmProvider {
             "system": system,
             "messages": [{ "role": "user", "content": content }],
         });
-        let json = agent()
+        let response = agent()
             .post(ANTHROPIC_URL)
             .set("x-api-key", &self.api_key)
             .set("anthropic-version", ANTHROPIC_VERSION)
             .set("content-type", "application/json")
             .send_json(body)
-            .map_err(|e| LlmError::Request(e.to_string()))?
-            .into_json::<serde_json::Value>()
-            .map_err(|e| LlmError::Response(e.to_string()))?;
+            .map_err(|e| LlmError::Request(e.to_string()))?;
+        let json =
+            crate::http::json_response(response, 2 * 1024 * 1024).map_err(LlmError::Response)?;
         parse_anthropic_reply(&json)
     }
 
@@ -330,11 +330,11 @@ impl LlmProvider {
         if !self.api_key.is_empty() {
             req = req.set("authorization", &format!("Bearer {}", self.api_key));
         }
-        let json = req
+        let response = req
             .send_json(body)
-            .map_err(|e| LlmError::Request(e.to_string()))?
-            .into_json::<serde_json::Value>()
-            .map_err(|e| LlmError::Response(e.to_string()))?;
+            .map_err(|e| LlmError::Request(e.to_string()))?;
+        let json =
+            crate::http::json_response(response, 2 * 1024 * 1024).map_err(LlmError::Response)?;
         parse_openai_reply(&json)
     }
 
@@ -346,14 +346,14 @@ impl LlmProvider {
             "contents": [{ "parts": [{ "text": content }] }],
             "generationConfig": { "maxOutputTokens": DEFAULT_MAX_TOKENS },
         });
-        let json = agent()
+        let response = agent()
             .post(&url)
             .set("x-goog-api-key", &self.api_key)
             .set("content-type", "application/json")
             .send_json(body)
-            .map_err(|e| LlmError::Request(e.to_string()))?
-            .into_json::<serde_json::Value>()
-            .map_err(|e| LlmError::Response(e.to_string()))?;
+            .map_err(|e| LlmError::Request(e.to_string()))?;
+        let json =
+            crate::http::json_response(response, 2 * 1024 * 1024).map_err(LlmError::Response)?;
         parse_gemini_reply(&json)
     }
 }
