@@ -20,6 +20,7 @@ evdev = "0.13.2"
 xkbcommon = "0.9.0"
 ksni = { version = "0.3", features = ["blocking"] }
 signal-hook = "0.3"
+serde_json.workspace = true
 
 # macOS backend (milestone M2). objc2 stack mirrors the sibling
 # `vernier` project: AppKit for the menu-bar item, Core Graphics for

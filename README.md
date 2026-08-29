@@ -183,7 +183,7 @@ the change without a restart.
 
 **The chord doesn't do anything.** Check the daemon is running:
 `pgrep -ax hyprcorrect`. Check the bind is installed:
-`hyprctl binds | grep hyprcorrect`. If the chord echoes its raw
+`hyprctl binds | grep -i hyprcorrect`. If the chord echoes its raw
 escape sequence (e.g. `^[[102;8u`) into a terminal, Hyprland isn't
 intercepting it — make sure the daemon has been signaled to install
 the bind (re-save from Preferences, or restart the daemon).
@@ -219,8 +219,9 @@ shape — is in [`DESIGN.md`](DESIGN.md). Briefly:
   focus), `hyprcorrect-ui` (platform-independent egui),
   `hyprcorrect` (the binary).
 - Linux: `evdev` capture, `xkbcommon` translation, per-window
-  buffers via Hyprland IPC, `wtype` emit, `hyprctl keyword bind`
-  for the chord (whose `exec` raises `SIGUSR1` on the daemon),
+  buffers via Hyprland IPC, `wtype` emit, `hyprctl eval` + `hl.bind`
+  for Lua configs (with `hyprctl keyword bind` for legacy configs)
+  whose `exec` raises `SIGUSR1` on the daemon,
   `ksni` tray, `keyring` for secrets, egui prefs.
 - macOS mirrors that interface under
   `crates/hyprcorrect-platform/src/macos/`: a listen-only `CGEventTap`

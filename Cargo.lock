@@ -1516,6 +1516,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
+ "serde_json",
  "signal-hook",
  "thiserror 2.0.18",
  "xkbcommon",

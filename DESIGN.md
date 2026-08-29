@@ -107,7 +107,7 @@ with a per-OS backend:
 |---|---|---|---|
 | Key capture (observe-only) | `evdev` `/dev/input` + `xkbcommon` for keycode→char | `CGEventTap` (listen) | `WH_KEYBOARD_LL` |
 | Synthetic input | `virtual-keyboard-v1` protocol (wtype-style) | `CGEvent` + unicode string | `SendInput` |
-| Global hotkey | Hyprland `hyprctl keyword bind` + `SIGUSR1` (today); `ashpd` GlobalShortcuts portal once compositor auto-bind matures | `RegisterEventHotKey` (Carbon) | `RegisterHotKey` |
+| Global hotkey | Hyprland `hyprctl eval` + `hl.bind` for Lua configs, `hyprctl keyword bind` for legacy configs, then `SIGUSR1`; `ashpd` GlobalShortcuts portal once compositor auto-bind matures | `RegisterEventHotKey` (Carbon) | `RegisterHotKey` |
 | Focused app | Hyprland IPC (`activewindow`) | `NSWorkspace.frontmostApplication` | `GetForegroundWindow` |
 | Tray / menu bar | `ksni` | `NSStatusItem` | — |
 
@@ -123,8 +123,9 @@ Notes:
   compositors. `ydotool`/uinput is a documented fallback for non-wlroots.
   `enigo` is evaluated as a single cross-platform emulation crate; if its
   Wayland path is insufficient we keep the direct protocol impl.
-- **Hotkeys:** on Hyprland today the daemon adds an inline
-  `hyprctl keyword bind` whose `exec` raises `SIGUSR1` on itself —
+- **Hotkeys:** on Hyprland today the daemon adds an inline `hl.bind`
+  through `hyprctl eval` (or `hyprctl keyword bind` on legacy configs)
+  whose `exec` raises `SIGUSR1` on itself —
   Hyprland intercepts the chord so terminals never see it, and the
   daemon manages its own keybind (no `hyprland.conf` edit required).
   The `ashpd` GlobalShortcuts portal is the planned cross-compositor
