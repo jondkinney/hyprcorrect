@@ -105,7 +105,7 @@ pub fn remove_directory_tree(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 mod imp {
     use super::{ExpectedFile, File, FileIdentity, Path, Read, Snapshot, Write, io};
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CStr, CString, OsStr};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -411,22 +411,15 @@ mod imp {
                 "directory tree exceeded the removal depth limit",
             ));
         }
-        #[cfg(target_os = "linux")]
-        let descriptor_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
-        #[cfg(not(target_os = "linux"))]
-        let descriptor_path = format!("/dev/fd/{}", directory.as_raw_fd());
-        for entry in std::fs::read_dir(descriptor_path)? {
-            let entry = entry?;
-            *entries = entries.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "directory entry count overflow")
-            })?;
-            if *entries > MAX_REMOVAL_ENTRIES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory tree exceeded the removal entry limit",
-                ));
-            }
-            let name = c_string(&entry.file_name())?;
+        let remaining = MAX_REMOVAL_ENTRIES.checked_sub(*entries).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory tree exceeded the removal entry limit",
+            )
+        })?;
+        let names = directory_entry_names(directory, remaining)?;
+        *entries += names.len();
+        for name in names {
             let stat = stat_at(directory, &name)?;
             if stat.st_uid != unsafe { libc::geteuid() } {
                 return Err(io::Error::new(
@@ -451,6 +444,53 @@ mod imp {
             }
         }
         directory.sync_all()
+    }
+
+    /// Enumerate through a duplicate of the already-validated directory
+    /// descriptor. Unlike reopening `/dev/fd/<n>`, this works on macOS and
+    /// cannot be redirected by replacing a pathname during cleanup.
+    fn directory_entry_names(directory: &File, maximum: usize) -> io::Result<Vec<CString>> {
+        let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(error);
+        }
+
+        let result = (|| {
+            let mut names = Vec::new();
+            loop {
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    break;
+                }
+                let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if names.len() == maximum {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory tree exceeded the removal entry limit",
+                    ));
+                }
+                names.push(CString::new(bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "directory entry contains NUL")
+                })?);
+            }
+            Ok(names)
+        })();
+        let close_result = unsafe { libc::closedir(stream) };
+        if close_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        result
     }
 
     fn open_parent(
